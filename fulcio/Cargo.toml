@@ -1,7 +1,7 @@
 [package]
 name        = "swe_justsign_fulcio"
 version     = "0.1.0"
-description = "Fulcio client for justsign — OIDC token → CSR → short-lived cert chain. Empty stub for v0; content lands in subsequent slices."
+description = "Fulcio client for justsign — OIDC token → CSR → short-lived cert chain. v0: CSR construction, PEM chain parse, mock + blocking HTTP client."
 readme      = "../README.md"
 keywords    = ["sigstore", "fulcio", "oidc", "x509", "ca"]
 categories  = ["cryptography", "authentication"]
@@ -19,6 +19,41 @@ path = "src/lib.rs"
 [dependencies]
 thiserror = { workspace = true }
 spec      = { workspace = true }
+
+# X.509 (CSR construction + cert chain parsing) — single RustCrypto
+# stack. `x509-cert` covers both the CertReq builder and the X.509
+# leaf decode, so we don't need a second parser like `x509-parser`.
+x509-cert = { version = "0.2", default-features = false, features = ["std", "builder", "pem"] }
+der       = { version = "0.7", default-features = false, features = ["std", "oid"] }
+const-oid = { version = "0.9", default-features = false }
+
+# ECDSA P-256 for keys + DER-encoded signatures used by the CSR
+# builder. `pkcs8` lets us round-trip keys; `pem` lets us emit PEM.
+p256      = { version = "0.13", default-features = false, features = ["std", "ecdsa", "pkcs8", "pem"] }
+
+# SHA-256 OID for the ECDSA-with-SHA256 algorithm identifier
+# x509-cert's CertReq builder needs (`DynSignatureAlgorithmIdentifier`
+# only impls when `sha2::OidSha256: AssociatedOid`, which the `oid`
+# feature provides). Using `sha2` directly via x509-cert's re-export
+# is fragile; pin the dep explicitly.
+sha2      = { version = "0.10", default-features = false, features = ["oid"] }
+
+# PEM split for the cert chain Fulcio returns.
+pem       = { version = "3", default-features = false, features = ["std"] }
+
+# Blocking HTTP — keeps the v0 surface synchronous.
+reqwest    = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+
+# Deterministic RNG used to materialise the canned mock cert chain
+# the first time `MockFulcioClient::new()` is called. ChaCha20 is
+# pure-Rust and tiny — adds no transitive C deps.
+rand_chacha = { version = "0.3", default-features = false }
+rand_core   = { version = "0.6", default-features = false }
+
+# `LazyLock` is 1.80+, MSRV here is 1.75 — use `once_cell` instead.
+once_cell  = { version = "1", default-features = false, features = ["std"] }
 
 [lints]
 workspace = true
