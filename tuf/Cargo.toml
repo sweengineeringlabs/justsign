@@ -1,7 +1,7 @@
 [package]
 name        = "swe_justsign_tuf"
 version     = "0.1.0"
-description = "TUF metadata fetcher + verifier for justsign — establishes Sigstore root of trust. Empty stub for v0."
+description = "TUF metadata fetcher + verifier for justsign — establishes Sigstore root of trust. v0: parse + threshold-verify a self-signed TUF root.json."
 readme      = "../README.md"
 keywords    = ["sigstore", "tuf", "trust", "root", "metadata"]
 categories  = ["cryptography", "authentication"]
@@ -17,8 +17,16 @@ name = "tuf"
 path = "src/lib.rs"
 
 [dependencies]
-thiserror = { workspace = true }
-spec      = { workspace = true }
+thiserror     = { workspace = true }
+serde         = { workspace = true }
+serde_json    = { workspace = true }
+spec          = { workspace = true }
+ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
+hex           = { version = "0.4", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+ed25519-dalek = { version = "2", default-features = false, features = ["std", "rand_core"] }
+rand_core     = { version = "0.6", features = ["std"] }
 
 [lints]
 workspace = true
