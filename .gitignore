@@ -1,0 +1,8 @@
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# cargo-fuzz outputs (sub-project at fuzz/, lands later).
+fuzz/target/
+fuzz/corpus/
+fuzz/artifacts/

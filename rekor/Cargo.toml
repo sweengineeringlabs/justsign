@@ -1,0 +1,24 @@
+[package]
+name        = "swe_justsign_rekor"
+version     = "0.1.0"
+description = "Rekor client for justsign — submit + Merkle inclusion-proof verification. Independent: works with static keys too."
+readme      = "../README.md"
+keywords    = ["sigstore", "rekor", "transparency", "merkle", "log"]
+categories  = ["cryptography", "data-structures"]
+edition.workspace      = true
+license.workspace      = true
+repository.workspace   = true
+homepage.workspace     = true
+authors.workspace      = true
+rust-version.workspace = true
+
+[lib]
+name = "rekor"
+path = "src/lib.rs"
+
+[dependencies]
+thiserror = { workspace = true }
+spec      = { workspace = true }
+
+[lints]
+workspace = true

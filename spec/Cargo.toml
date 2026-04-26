@@ -1,0 +1,26 @@
+[package]
+name        = "swe_justsign_spec"
+version     = "0.1.0"
+description = "Wire formats for Sigstore-shaped signing — DSSE envelope, in-toto attestation, Sigstore bundle JSON, Rekor entries. Pure structs + serde, no IO."
+readme      = "../README.md"
+keywords    = ["sigstore", "cosign", "dsse", "in-toto", "signing"]
+categories  = ["cryptography", "encoding", "parser-implementations"]
+edition.workspace      = true
+license.workspace      = true
+repository.workspace   = true
+homepage.workspace     = true
+authors.workspace      = true
+rust-version.workspace = true
+
+[lib]
+name = "spec"
+path = "src/lib.rs"
+
+[dependencies]
+thiserror  = { workspace = true }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+base64     = { workspace = true }
+
+[lints]
+workspace = true

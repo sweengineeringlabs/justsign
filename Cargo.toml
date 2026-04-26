@@ -1,0 +1,29 @@
+[workspace]
+resolver = "2"
+members = ["spec", "fulcio", "tuf", "rekor", "sign", "cli"]
+
+[workspace.package]
+edition      = "2021"
+license      = "Apache-2.0"
+repository   = "https://github.com/sweengineeringlabs/justsign"
+homepage     = "https://github.com/sweengineeringlabs/justsign"
+authors      = ["SWE Engineering Labs"]
+rust-version = "1.75"
+
+[workspace.dependencies]
+# `version` is required next to `path` so `cargo publish` can resolve
+# the dep against crates.io after stripping the path entry.
+spec   = { path = "spec",   package = "swe_justsign_spec",   version = "0.1.0" }
+fulcio = { path = "fulcio", package = "swe_justsign_fulcio", version = "0.1.0" }
+tuf    = { path = "tuf",    package = "swe_justsign_tuf",    version = "0.1.0" }
+rekor  = { path = "rekor",  package = "swe_justsign_rekor",  version = "0.1.0" }
+sign   = { path = "sign",   package = "swe_justsign_sign",   version = "0.1.0" }
+
+# External
+thiserror  = "2"
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64     = "0.22"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"

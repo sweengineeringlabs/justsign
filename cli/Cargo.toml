@@ -1,0 +1,27 @@
+[package]
+name        = "swe_justsign_cli"
+version     = "0.1.0"
+description = "justsign — operator CLI on top of swe_justsign_sign. cosign-equivalent surface in pure Rust."
+readme      = "../README.md"
+keywords    = ["sigstore", "cosign", "cli", "signing", "attestation"]
+categories  = ["cryptography", "command-line-utilities"]
+edition.workspace      = true
+license.workspace      = true
+repository.workspace   = true
+homepage.workspace     = true
+authors.workspace      = true
+rust-version.workspace = true
+
+[[bin]]
+name = "justsign"
+path = "src/main.rs"
+
+[lib]
+name = "cli"
+path = "src/lib.rs"
+
+[dependencies]
+sign = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,24 @@
+[package]
+name        = "swe_justsign_tuf"
+version     = "0.1.0"
+description = "TUF metadata fetcher + verifier for justsign — establishes Sigstore root of trust. Empty stub for v0."
+readme      = "../README.md"
+keywords    = ["sigstore", "tuf", "trust", "root", "metadata"]
+categories  = ["cryptography", "authentication"]
+edition.workspace      = true
+license.workspace      = true
+repository.workspace   = true
+homepage.workspace     = true
+authors.workspace      = true
+rust-version.workspace = true
+
+[lib]
+name = "tuf"
+path = "src/lib.rs"
+
+[dependencies]
+thiserror = { workspace = true }
+spec      = { workspace = true }
+
+[lints]
+workspace = true
