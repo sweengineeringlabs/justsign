@@ -17,8 +17,11 @@ name = "rekor"
 path = "src/lib.rs"
 
 [dependencies]
-thiserror = { workspace = true }
-spec      = { workspace = true }
+thiserror  = { workspace = true }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+base64     = { workspace = true }
+sha2       = "0.10"
 
 [lints]
 workspace = true

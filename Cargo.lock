@@ -1198,7 +1198,10 @@ dependencies = [
 name = "swe_justsign_rekor"
 version = "0.1.0"
 dependencies = [
- "swe_justsign_spec",
+ "base64",
+ "serde",
+ "serde_json",
+ "sha2",
  "thiserror",
 ]
 
