@@ -446,37 +446,104 @@ mod tests {
         }
     }
 
-    /// Live integration test against Sigstore's staging Fulcio.
+    /// Skip-pass integration test: hits Sigstore's staging Fulcio
+    /// at `https://fulcio.sigstage.dev/api/v2/signingCert` and
+    /// performs a full CSR -> signed-chain round trip.
     ///
-    /// **This is `#[ignore]`d.** It only runs when both:
-    /// 1. you pass `--ignored` to cargo test, and
-    /// 2. `JUSTSIGN_FULCIO_STAGING=1` is set in the environment.
+    /// The test is **always-on** (no `#[ignore]`). It returns early
+    /// with a `SKIP: ...` log line — equivalent to a pass — when
+    /// either:
     ///
-    /// Activating it for real also requires a valid OIDC ID token
-    /// from a Sigstore-trusted issuer (Google / GitHub / etc.) in
-    /// `JUSTSIGN_FULCIO_OIDC_TOKEN`. Without it the test exits in
-    /// skip-pass mode — compiles, links, prints SKIP, returns
-    /// cleanly — so CI on `cargo test -- --ignored` doesn't fail
-    /// just because no human is around to mint a token.
+    /// * `JUSTSIGN_FULCIO_STAGING` is unset or not exactly `"1"`, or
+    /// * `JUSTSIGN_OIDC_TOKEN` is unset or empty.
+    ///
+    /// When both are set, it constructs an `HttpFulcioClient` against
+    /// staging, generates a fresh ECDSA P-256 keypair, builds a CSR
+    /// for `dev@example.com`, submits the CSR + OIDC token, and
+    /// asserts that the returned chain is non-empty, that it parsed
+    /// (we hold `CertChain` so `parse_chain` already succeeded), and
+    /// that the leaf carries a `SubjectAltName` extension.
+    ///
+    /// **Bug class caught:** wire-format drift between our CSR + JSON
+    /// request shape and Fulcio's actual API. The unit suite proves
+    /// our local encoding is internally consistent; only a live call
+    /// can surface upstream changes — a renamed JSON field, a header
+    /// that became required, a CSR shape Fulcio decided to reject.
+    /// Driving this on every CI run would burn staging quota, so it
+    /// only runs in the dedicated `staging` workflow (manual dispatch).
+    ///
+    /// Mirrors the e2fsck skip-pass pattern from `justext4`: the test
+    /// always compiles + links + executes, but no-ops cleanly when
+    /// the environment to drive it isn't present. That keeps the
+    /// default `cargo test --workspace` green on machines without
+    /// network access or a staging-trusted OIDC issuer.
     #[test]
-    #[ignore = "live network; requires JUSTSIGN_FULCIO_STAGING=1 + valid OIDC token"]
-    fn test_http_client_against_sigstore_staging_skip_pass() {
-        if std::env::var("JUSTSIGN_FULCIO_STAGING").as_deref() != Ok("1") {
-            eprintln!("SKIP: JUSTSIGN_FULCIO_STAGING not set — staging Fulcio test skipped");
-            return;
+    fn test_http_fulcio_client_signs_cert_against_staging() {
+        // Skip-pass gate 1: staging opt-in flag.
+        match std::env::var("JUSTSIGN_FULCIO_STAGING").as_deref() {
+            Ok("1") => {}
+            _ => {
+                eprintln!(
+                    "SKIP: JUSTSIGN_FULCIO_STAGING != 1 — staging Fulcio integration test skipped"
+                );
+                return;
+            }
         }
-        let token = match std::env::var("JUSTSIGN_FULCIO_OIDC_TOKEN") {
+
+        // Skip-pass gate 2: caller-supplied OIDC token. We can't
+        // mint one without a human (or a CI-side identity token
+        // exchange that's out of scope for v0), so unset = SKIP.
+        let token = match std::env::var("JUSTSIGN_OIDC_TOKEN") {
             Ok(t) if !t.is_empty() => t,
             _ => {
-                eprintln!("SKIP: JUSTSIGN_FULCIO_OIDC_TOKEN not set — cannot mint staging cert");
+                eprintln!("SKIP: JUSTSIGN_OIDC_TOKEN unset or empty — cannot mint staging cert");
                 return;
             }
         };
 
-        let key = seeded_key();
-        let csr = build_csr(&key, "dev@example.com").expect("csr");
-        let client = HttpFulcioClient::new("https://fulcio.sigstage.dev").expect("client");
-        let chain = client.sign_csr(&csr, &token).expect("staging sign_csr");
-        assert!(!chain.certs.is_empty(), "staging chain must be non-empty");
+        // Fresh, non-deterministic keypair: a real wire test should
+        // not reuse the same private key every run. Seed with a
+        // value derived from the OS RNG via ChaCha to keep the dep
+        // surface unchanged (no new crates, per issue #1 constraints).
+        let mut seed = [0u8; 32];
+        getrandom_seed(&mut seed);
+        let mut rng = ChaCha20Rng::from_seed(seed);
+        let key = SigningKey::random(&mut rng);
+
+        let csr = build_csr(&key, "dev@example.com").expect("build_csr");
+        let client =
+            HttpFulcioClient::new("https://fulcio.sigstage.dev").expect("HttpFulcioClient::new");
+
+        let chain = client
+            .sign_csr(&csr, &token)
+            .expect("staging sign_csr round trip");
+
+        // Wire-shape assertions. Each one would catch a different
+        // class of upstream drift.
+        assert!(
+            !chain.certs.is_empty(),
+            "staging Fulcio returned an empty chain — wire-format drift suspected"
+        );
+        assert!(
+            chain.raw_pem.contains("-----BEGIN CERTIFICATE-----"),
+            "staging response did not carry PEM cert blocks"
+        );
+        // Fulcio always issues leaf certs with a SAN binding the
+        // OIDC subject. Missing SAN = CA changed its issuance shape
+        // and our consumers (sign / verify) will break.
+        assert!(
+            chain.leaf().san.is_some(),
+            "staging leaf cert is missing SubjectAltName extension"
+        );
+    }
+
+    /// Fill `out` with OS randomness without adding a `getrandom`
+    /// dep: `p256` already pulls `rand_core::OsRng` transitively via
+    /// the `ecdsa` feature, so we route through it. Kept private to
+    /// the test module so the production surface is unchanged.
+    fn getrandom_seed(out: &mut [u8; 32]) {
+        use rand_core::RngCore;
+        let mut rng = rand_core::OsRng;
+        rng.fill_bytes(out);
     }
 }

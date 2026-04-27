@@ -1,0 +1,33 @@
+# Manual-dispatch workflow that drives the skip-pass staging
+# integration test against `fulcio.sigstage.dev`.
+#
+# Why manual-only:
+#   * Staging Fulcio enforces rate quotas — a per-push run would
+#     burn budget shared with the wider Sigstore community.
+#   * The test SKIPs without `JUSTSIGN_OIDC_TOKEN`, so even forks
+#     that lack the secret won't fail; they will simply log a
+#     `SKIP: ...` line and return clean. That keeps the workflow
+#     safe to expose without leaking the token to PR runs.
+#
+# To run: GitHub UI -> Actions -> "CI (staging)" -> Run workflow.
+
+name: CI (staging)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: cargo test (staging)
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: always
+      RUSTFLAGS: -D warnings
+      JUSTSIGN_FULCIO_STAGING: "1"
+      JUSTSIGN_OIDC_TOKEN: ${{ secrets.JUSTSIGN_OIDC_TOKEN }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test (staging skip-pass)
+        run: cargo test -p swe_justsign_fulcio test_http_fulcio_client_signs_cert_against_staging -- --nocapture
