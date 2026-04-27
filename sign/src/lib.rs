@@ -58,8 +58,17 @@ use rekor::{HashedRekord, HashedRekordHash, LogEntry, PublicKey, RekorClient};
 use sha2::{Digest, Sha256};
 use spec::{
     Bundle, BundleContent, Checkpoint, Envelope, HashOutput, InclusionProof, KindVersion,
-    Signature as DsseSignature, TlogEntry, VerificationMaterial, SIGSTORE_BUNDLE_V0_3_MEDIA_TYPE,
+    Signature as DsseSignature, Statement, Subject, TlogEntry, VerificationMaterial,
+    IN_TOTO_STATEMENT_V1_TYPE, SIGSTORE_BUNDLE_V0_3_MEDIA_TYPE,
 };
+use std::collections::BTreeMap;
+
+/// DSSE `payload_type` value carried by every in-toto attestation
+/// bundle. The Sigstore bundle spec, the in-toto Statement v1 spec,
+/// and cosign all pin this exact string — verifiers route on it to
+/// distinguish "this DSSE wraps an attestation Statement" from
+/// "this DSSE wraps an arbitrary blob".
+pub const IN_TOTO_PAYLOAD_TYPE: &str = "application/vnd.in-toto+json";
 
 /// Sign `payload` with the given [`Signer`] and return a
 /// [`spec::Bundle`].
@@ -350,6 +359,175 @@ fn hex_lower(bytes: &[u8]) -> String {
         out.push(HEX[(b & 0x0f) as usize] as char);
     }
     out
+}
+
+/// Result of [`verify_attestation`] — the load-bearing pieces of a
+/// successfully-verified in-toto Statement.
+///
+/// Returned (instead of just `Ok(())`) so callers don't have to
+/// re-decode the DSSE payload to act on the predicate. Cosign's
+/// `cosign verify-attestation` follows the same shape.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedAttestation {
+    /// Subjects the Statement makes claims about. Order is preserved
+    /// from the wire form — predicate types like SLSA Provenance can
+    /// reference subjects by index.
+    pub subjects: Vec<Subject>,
+
+    /// `predicateType` URI from the verified Statement. Verifiers
+    /// usually already know this (they just supplied
+    /// `expected_predicate_type`) but returning it here keeps the
+    /// caller's error-path code simple — they can log or echo it
+    /// without reparsing.
+    pub predicate_type: String,
+
+    /// Predicate body. Opaque per this crate; per-predicate-type
+    /// crates (SLSA Provenance, SPDX, custom) parse it.
+    pub predicate: serde_json::Value,
+}
+
+/// Build an in-toto Statement v1 about `(subject_name,
+/// subject_digest_algo, subject_digest_hex)` with the given
+/// `predicate_type` + `predicate`, wrap it in a DSSE envelope tagged
+/// `application/vnd.in-toto+json`, sign with `signer`, and return
+/// the resulting [`spec::Bundle`].
+///
+/// This is the attestation analogue of [`sign_blob`]. It exists so
+/// callers don't have to hand-roll the Statement → JSON → DSSE →
+/// Bundle wrapping; they hand in the semantic pieces (what is the
+/// subject, what predicate are you asserting) and get back a
+/// verifiable bundle.
+///
+/// Single-subject by design: 99% of attestations name exactly one
+/// subject. Multi-subject attestations (multi-arch manifest lists,
+/// SBOMs covering several artifacts) can build the `Statement`
+/// directly and call [`sign_blob`] with `IN_TOTO_PAYLOAD_TYPE`.
+///
+/// Errors surface via [`SignError`] — `StatementEncode` for
+/// Statement-JSON failures, the same variants as `sign_blob`
+/// otherwise.
+pub fn attest(
+    subject_name: &str,
+    subject_digest_algo: &str,
+    subject_digest_hex: &str,
+    predicate_type: &str,
+    predicate: serde_json::Value,
+    signer: &dyn Signer,
+    rekor: Option<&dyn RekorClient>,
+) -> Result<Bundle, SignError> {
+    let mut digest = BTreeMap::new();
+    digest.insert(
+        subject_digest_algo.to_string(),
+        subject_digest_hex.to_string(),
+    );
+    let stmt = Statement {
+        _type: IN_TOTO_STATEMENT_V1_TYPE.to_string(),
+        subject: vec![Subject {
+            name: subject_name.to_string(),
+            digest,
+        }],
+        predicate_type: predicate_type.to_string(),
+        predicate,
+    };
+    // `?` lifts `StatementEncodeError` via the `From` impl on
+    // `SignError`. A failure here means the predicate Value was
+    // un-serialisable — extremely rare in practice, but typed.
+    let payload = stmt.encode_json()?;
+    sign_blob(&payload, IN_TOTO_PAYLOAD_TYPE, signer, rekor)
+}
+
+/// Verify a [`spec::Bundle`] previously produced by [`attest`] (or
+/// any Sigstore signer that follows the same wire shape).
+///
+/// Steps, in order:
+///
+/// 1. Run [`verify_blob`] — establishes the DSSE signature is valid
+///    against `trusted_keys` and (if `rekor` is `Some`) that every
+///    embedded `tlog_entry`'s inclusion proof verifies.
+/// 2. Reject if the envelope's `payload_type` isn't
+///    [`IN_TOTO_PAYLOAD_TYPE`] — the bundle has a valid signature
+///    but it's NOT an attestation; it's some other DSSE payload.
+/// 3. Decode the envelope's `payload` as an in-toto Statement v1
+///    (the spec crate enforces `_type` matches).
+/// 4. Reject if `expected_predicate_type` doesn't match the
+///    Statement's `predicateType`.
+/// 5. If `expected_subject_digest = Some((algo, hex))`, scan every
+///    subject in the Statement for a `digest` entry mapping
+///    `algo → hex`. Accept if ANY subject matches. This mirrors
+///    cosign's "match any subject" rule: an attestation that names
+///    multiple artifacts is still valid for the artifact you care
+///    about as long as that artifact appears once.
+///
+/// `expected_subject_digest = None` skips step 5 — useful when the
+/// caller is enumerating subjects (e.g. listing every artifact
+/// covered by an SBOM) instead of pinning one.
+///
+/// v0 takes raw `VerifyingKey`s. Keyless verification (Fulcio cert
+/// chain → ephemeral key) composes one layer up: derive the keys
+/// from the chain, then call this function.
+pub fn verify_attestation(
+    bundle: &Bundle,
+    trusted_keys: &[VerifyingKey],
+    expected_predicate_type: &str,
+    expected_subject_digest: Option<(&str, &str)>,
+    rekor: Option<&dyn RekorClient>,
+) -> Result<VerifiedAttestation, VerifyError> {
+    // 1. Signature + (optional) tlog inclusion. Fail fast — no
+    //    point decoding the payload of a bundle whose signature
+    //    didn't validate.
+    verify_blob(bundle, trusted_keys, rekor)?;
+
+    // 2. Pull the DSSE envelope. `verify_blob` already rejected the
+    //    `MessageSignature` arm, so this match is total in practice
+    //    — but we re-check to keep the borrow local and the error
+    //    path explicit.
+    let envelope = match &bundle.content {
+        BundleContent::DsseEnvelope(env) => env,
+        BundleContent::MessageSignature(_) => return Err(VerifyError::EnvelopeMissing),
+    };
+
+    if envelope.payload_type != IN_TOTO_PAYLOAD_TYPE {
+        return Err(VerifyError::WrongPayloadType {
+            expected: IN_TOTO_PAYLOAD_TYPE.to_string(),
+            found: envelope.payload_type.clone(),
+        });
+    }
+
+    // 3. Decode the in-toto Statement. `?` lifts
+    //    `StatementDecodeError` via `From`.
+    let statement = Statement::decode_json(&envelope.payload)?;
+
+    // 4. Predicate-type gate. Done as a string compare — predicate
+    //    types are URIs, so case + trailing slashes matter. We
+    //    don't normalise; cosign doesn't either.
+    if statement.predicate_type != expected_predicate_type {
+        return Err(VerifyError::WrongPredicateType {
+            expected: expected_predicate_type.to_string(),
+            found: statement.predicate_type,
+        });
+    }
+
+    // 5. Subject-digest gate (optional). Cosign-style "match any
+    //    subject" semantics: accept if ANY subject in the Statement
+    //    carries a `digest[algo] == hex` entry. A multi-subject
+    //    attestation covering [A, B, C] is still valid for B.
+    if let Some((algo, hex)) = expected_subject_digest {
+        let any_match = statement
+            .subject
+            .iter()
+            .any(|s| s.digest.get(algo).map(String::as_str) == Some(hex));
+        if !any_match {
+            return Err(VerifyError::SubjectMismatch {
+                expected_digest: format!("{algo}:{hex}"),
+            });
+        }
+    }
+
+    Ok(VerifiedAttestation {
+        subjects: statement.subject,
+        predicate_type: statement.predicate_type,
+        predicate: statement.predicate,
+    })
 }
 
 // ---------------------------------------------------------------
@@ -1399,5 +1577,256 @@ mod tests {
         )
         .unwrap();
         assert_eq!(verified.subject_digest, subject_digest);
+    }
+
+    // ── Attestation API (issue #7) ───────────────────────────────
+
+    /// Constants reused across the attestation tests to keep the
+    /// "what the test asserts" close to the assertion. Hex is
+    /// lowercase 64 chars (sha256-shaped) but unrelated to the
+    /// bytes signed — Statement validation doesn't recompute it.
+    const PREDICATE_TYPE_PROVENANCE_V1: &str = "https://slsa.dev/provenance/v1";
+    const PREDICATE_TYPE_SPDX: &str = "https://spdx.dev/Document";
+    const SUBJECT_NAME: &str = "pkg:oci/example@sha256:abc";
+    const DIGEST_X: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const DIGEST_Y: &str = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+
+    /// `attest` round-trips through `verify_attestation`: build a
+    /// Statement, sign with a real ECDSA key, verify with the
+    /// matching public key — predicate body and subject come back
+    /// intact.
+    ///
+    /// Bug it catches: any drift between the encoder used by
+    /// `attest` and the decoder used by `verify_attestation` (e.g.
+    /// `predicateType` casing, subject digest map ordering) would
+    /// surface as a Statement-decode failure or a predicate-Value
+    /// mismatch on the returned struct.
+    #[test]
+    fn test_attest_then_verify_attestation_round_trips() {
+        let mut rng = ChaCha20Rng::from_seed([0xA0; 32]);
+        let sk = SigningKey::random(&mut rng);
+        let vk = *sk.verifying_key();
+        let signer = EcdsaP256Signer::new(sk, Some("attest-key".into()));
+
+        let predicate = serde_json::json!({ "foo": "bar" });
+        let bundle = attest(
+            SUBJECT_NAME,
+            "sha256",
+            DIGEST_X,
+            PREDICATE_TYPE_PROVENANCE_V1,
+            predicate.clone(),
+            &signer,
+            None,
+        )
+        .unwrap();
+
+        // Bundle wraps the in-toto payload type, not text/plain.
+        if let BundleContent::DsseEnvelope(env) = &bundle.content {
+            assert_eq!(env.payload_type, IN_TOTO_PAYLOAD_TYPE);
+        } else {
+            panic!("expected DSSE envelope content");
+        }
+
+        let verified = verify_attestation(
+            &bundle,
+            &[vk],
+            PREDICATE_TYPE_PROVENANCE_V1,
+            Some(("sha256", DIGEST_X)),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(verified.predicate_type, PREDICATE_TYPE_PROVENANCE_V1);
+        assert_eq!(verified.predicate, predicate);
+        assert_eq!(verified.subjects.len(), 1);
+        assert_eq!(verified.subjects[0].name, SUBJECT_NAME);
+        assert_eq!(
+            verified.subjects[0].digest.get("sha256"),
+            Some(&DIGEST_X.to_string())
+        );
+    }
+
+    /// Verifier expecting predicate type B refuses an attestation
+    /// signed with predicate type A — even when the signature is
+    /// otherwise valid.
+    ///
+    /// Bug it catches: a verifier that ignored
+    /// `expected_predicate_type` (or compared the wrong field, e.g.
+    /// `payload_type` instead of `predicateType`) would happily
+    /// accept an SPDX SBOM where a SLSA Provenance was required.
+    #[test]
+    fn test_verify_attestation_rejects_wrong_predicate_type() {
+        let mut rng = ChaCha20Rng::from_seed([0xA1; 32]);
+        let sk = SigningKey::random(&mut rng);
+        let vk = *sk.verifying_key();
+        let signer = EcdsaP256Signer::new(sk, None);
+
+        let bundle = attest(
+            SUBJECT_NAME,
+            "sha256",
+            DIGEST_X,
+            PREDICATE_TYPE_PROVENANCE_V1,
+            serde_json::json!({}),
+            &signer,
+            None,
+        )
+        .unwrap();
+
+        let err = verify_attestation(&bundle, &[vk], PREDICATE_TYPE_SPDX, None, None).unwrap_err();
+        match err {
+            VerifyError::WrongPredicateType { expected, found } => {
+                assert_eq!(expected, PREDICATE_TYPE_SPDX);
+                assert_eq!(found, PREDICATE_TYPE_PROVENANCE_V1);
+            }
+            other => panic!("expected WrongPredicateType, got {other:?}"),
+        }
+    }
+
+    /// Verifier expecting digest Y on the subject refuses an
+    /// attestation that names digest X.
+    ///
+    /// Bug it catches: a verifier that always accepted the first
+    /// subject without comparing its digest to the expected value
+    /// would let an attacker swap in an attestation about a
+    /// different artifact and still pass policy.
+    #[test]
+    fn test_verify_attestation_rejects_subject_digest_mismatch() {
+        let mut rng = ChaCha20Rng::from_seed([0xA2; 32]);
+        let sk = SigningKey::random(&mut rng);
+        let vk = *sk.verifying_key();
+        let signer = EcdsaP256Signer::new(sk, None);
+
+        let bundle = attest(
+            SUBJECT_NAME,
+            "sha256",
+            DIGEST_X,
+            PREDICATE_TYPE_PROVENANCE_V1,
+            serde_json::json!({}),
+            &signer,
+            None,
+        )
+        .unwrap();
+
+        let err = verify_attestation(
+            &bundle,
+            &[vk],
+            PREDICATE_TYPE_PROVENANCE_V1,
+            Some(("sha256", DIGEST_Y)),
+            None,
+        )
+        .unwrap_err();
+        match err {
+            VerifyError::SubjectMismatch { expected_digest } => {
+                assert_eq!(expected_digest, format!("sha256:{DIGEST_Y}"));
+            }
+            other => panic!("expected SubjectMismatch, got {other:?}"),
+        }
+    }
+
+    /// Passing `None` for `expected_subject_digest` skips the
+    /// subject check entirely — useful when the caller is
+    /// enumerating subjects rather than pinning one.
+    ///
+    /// Bug it catches: a verifier that defaulted "no expectation"
+    /// to "must match nothing" (returning `SubjectMismatch` on a
+    /// `None` input) would force every caller to pass a digest
+    /// even when they just want to read the predicate body.
+    #[test]
+    fn test_verify_attestation_with_subject_check_disabled() {
+        let mut rng = ChaCha20Rng::from_seed([0xA3; 32]);
+        let sk = SigningKey::random(&mut rng);
+        let vk = *sk.verifying_key();
+        let signer = EcdsaP256Signer::new(sk, None);
+
+        let bundle = attest(
+            SUBJECT_NAME,
+            "sha256",
+            DIGEST_X,
+            PREDICATE_TYPE_PROVENANCE_V1,
+            serde_json::json!({ "ok": true }),
+            &signer,
+            None,
+        )
+        .unwrap();
+
+        let verified = verify_attestation(&bundle, &[vk], PREDICATE_TYPE_PROVENANCE_V1, None, None)
+            .expect("None subject_digest must skip the check");
+        assert_eq!(verified.subjects.len(), 1);
+        assert_eq!(verified.predicate, serde_json::json!({ "ok": true }));
+    }
+
+    /// `verify_attestation` rejects a bundle whose DSSE
+    /// `payload_type` is NOT `application/vnd.in-toto+json` — the
+    /// signature is valid but the payload isn't an attestation.
+    ///
+    /// Bug it catches: a verifier that decoded the payload as a
+    /// Statement without first checking the wrapper type would
+    /// mis-categorise a non-attestation blob with attestation-
+    /// shaped JSON content (or fail with a confusing decode error
+    /// instead of a clear "wrong payload type" signal).
+    #[test]
+    fn test_verify_attestation_rejects_payload_type_mismatch() {
+        let mut rng = ChaCha20Rng::from_seed([0xA4; 32]);
+        let sk = SigningKey::random(&mut rng);
+        let vk = *sk.verifying_key();
+        let signer = EcdsaP256Signer::new(sk, None);
+
+        // Sign a non-attestation blob.
+        let bundle = sign_blob(b"hello world", "text/plain", &signer, None).unwrap();
+
+        let err = verify_attestation(&bundle, &[vk], PREDICATE_TYPE_PROVENANCE_V1, None, None)
+            .unwrap_err();
+        match err {
+            VerifyError::WrongPayloadType { expected, found } => {
+                assert_eq!(expected, IN_TOTO_PAYLOAD_TYPE);
+                assert_eq!(found, "text/plain");
+            }
+            other => panic!("expected WrongPayloadType, got {other:?}"),
+        }
+    }
+
+    /// `attest` with a Rekor client embeds a single `tlog_entries`
+    /// entry whose inclusion proof verifies — same behaviour as
+    /// `sign_blob`'s rekor path, but exercised end-to-end through
+    /// the attestation verifier.
+    ///
+    /// Bug it catches: an `attest` implementation that called
+    /// `sign_blob` with the wrong rekor argument (e.g. always
+    /// `None`, or shadowed by a local `let rekor = None`) would
+    /// emit an unwitnessed bundle even when the caller asked for
+    /// transparency.
+    #[test]
+    fn test_attest_with_rekor_attaches_tlog_entry() {
+        let mut rng = ChaCha20Rng::from_seed([0xA5; 32]);
+        let sk = SigningKey::random(&mut rng);
+        let vk = *sk.verifying_key();
+        let signer = EcdsaP256Signer::new(sk, None);
+        let client = MockRekorClient::new();
+
+        let bundle = attest(
+            SUBJECT_NAME,
+            "sha256",
+            DIGEST_X,
+            PREDICATE_TYPE_PROVENANCE_V1,
+            serde_json::json!({ "witnessed": true }),
+            &signer,
+            Some(&client),
+        )
+        .unwrap();
+
+        assert_eq!(bundle.verification_material.tlog_entries.len(), 1);
+        let tlog = &bundle.verification_material.tlog_entries[0];
+        assert_eq!(tlog.kind_version.kind, "hashedrekord");
+
+        // Full verification exercises sig + proof + Statement
+        // decode + predicate-type + subject-digest.
+        verify_attestation(
+            &bundle,
+            &[vk],
+            PREDICATE_TYPE_PROVENANCE_V1,
+            Some(("sha256", DIGEST_X)),
+            Some(&client),
+        )
+        .expect("attestation with rekor must verify end-to-end");
     }
 }

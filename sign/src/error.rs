@@ -9,7 +9,7 @@
 //! on it (retry, drop the bundle, escalate, log).
 
 use rekor::RekorError;
-use spec::{BundleDecodeError, BundleEncodeError};
+use spec::{BundleDecodeError, BundleEncodeError, StatementDecodeError, StatementEncodeError};
 
 /// Failure surface of [`crate::sign_blob`].
 ///
@@ -52,6 +52,15 @@ pub enum SignError {
     /// distinguishable in callers.
     #[error("oci: {0}")]
     Oci(#[from] OciError),
+
+    /// Internal: in-toto Statement JSON serialisation failed.
+    /// Surfaced by [`crate::attest`] when the predicate `Value` can't
+    /// be serialised (e.g. it contains a non-UTF-8 string handed in
+    /// via `serde_json::Value::String` — possible only via unsafe
+    /// construction). Kept as a typed variant so caller code can
+    /// distinguish a malformed-predicate bug from a signer failure.
+    #[error("statement encode: {0}")]
+    StatementEncode(#[from] StatementEncodeError),
 }
 
 /// Failure surface of [`crate::verify_blob`].
@@ -166,6 +175,56 @@ pub enum VerifyError {
         /// Digest computed from the bundle bytes the caller provided.
         computed_bundle_digest: String,
     },
+
+    /// Bundle's DSSE envelope `payload_type` doesn't match what the
+    /// verifier expected. Surfaced by [`crate::verify_attestation`]
+    /// when the bundle wraps a non-attestation payload (e.g. a raw
+    /// blob with `payload_type = "text/plain"` instead of
+    /// `application/vnd.in-toto+json`).
+    ///
+    /// Held as its own variant — distinct from "signature didn't
+    /// validate" — because it's a *category* mismatch: the signer
+    /// wrapped the wrong kind of thing, not the wrong bytes.
+    #[error("payload type mismatch: expected {expected:?}, found {found:?}")]
+    WrongPayloadType {
+        /// payload_type the verifier required.
+        expected: String,
+        /// payload_type the bundle actually carried.
+        found: String,
+    },
+
+    /// Decoded in-toto Statement's `predicateType` doesn't match the
+    /// caller's expected predicate type. Surfaced by
+    /// [`crate::verify_attestation`].
+    ///
+    /// Distinct from `WrongPayloadType` because the DSSE wrapping IS
+    /// in-toto — the predicate inside is just the wrong kind (e.g.
+    /// SLSA Provenance v0.2 vs v1, or Provenance vs SPDX).
+    #[error("predicate type mismatch: expected {expected:?}, found {found:?}")]
+    WrongPredicateType {
+        /// predicate_type the verifier required.
+        expected: String,
+        /// predicate_type the Statement actually carried.
+        found: String,
+    },
+
+    /// Caller pinned an expected `(algo, hex)` digest for the subject
+    /// they care about, but no subject in the Statement carries that
+    /// (algo, hex) pair. Matches cosign's "any subject" semantics:
+    /// an attestation may name multiple subjects (a multi-arch
+    /// manifest list, an SBOM covering several artifacts), and the
+    /// verifier accepts the bundle as long as ONE subject matches.
+    #[error("no subject matches expected digest: {expected_digest}")]
+    SubjectMismatch {
+        /// `"<algo>:<hex>"` formatted digest the verifier required.
+        expected_digest: String,
+    },
+
+    /// Decoded DSSE payload was not a valid in-toto Statement v1.
+    /// Wraps the spec-crate decode error so callers can route on its
+    /// inner variants (wrong `_type`, malformed JSON, etc.).
+    #[error("statement decode: {0}")]
+    StatementDecode(#[from] StatementDecodeError),
 }
 
 /// Failure surface of [`crate::oci`] manifest construction +
