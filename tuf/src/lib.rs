@@ -32,7 +32,7 @@
 //!
 //! # Bootstrap
 //!
-//! Per ADR `docs/2-architecture/adr_001_sigstore_tuf_bootstrap.md`,
+//! Per ADR `docs/3-design/adr/001-sigstore-tuf-bootstrap.md`,
 //! the Sigstore production TUF root is bundled into the library at
 //! build time (see [`embedded`]). [`TufClient::sigstore`] uses the
 //! bundled root by default; [`TufClient::with_initial_root_bytes`]

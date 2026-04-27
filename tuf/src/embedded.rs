@@ -5,7 +5,7 @@
 //! via [`include_bytes!`].
 //!
 //! The decision to bundle (option (a) per ADR
-//! `docs/2-architecture/adr_001_sigstore_tuf_bootstrap.md`) is the
+//! `docs/3-design/adr/001-sigstore-tuf-bootstrap.md`) is the
 //! v0 bootstrap policy: zero-config trust establishment, with chained
 //! root walking ([`crate::client::TufClient::fetch_root`]) handling
 //! Sigstore's signed rotations transparently. Operators who need to
