@@ -17,6 +17,7 @@
 
 pub mod dsse;
 pub mod in_toto;
+pub mod sbom;
 pub mod sigstore_bundle;
 pub mod slsa;
 
@@ -27,6 +28,8 @@ pub use dsse::{
 pub use in_toto::{
     Statement, StatementDecodeError, StatementEncodeError, Subject, IN_TOTO_STATEMENT_V1_TYPE,
 };
+
+pub use sbom::{CYCLONEDX_BOM_V1_5_PREDICATE_TYPE, SPDX_DOCUMENT_V2_3_PREDICATE_TYPE};
 
 pub use sigstore_bundle::{
     Bundle, BundleContent, BundleDecodeError, BundleEncodeError, Certificate, Checkpoint,

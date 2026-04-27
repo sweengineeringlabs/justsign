@@ -46,15 +46,18 @@ pub use tuf;
 pub mod cert_chain;
 mod error;
 pub mod oci;
+pub mod sbom;
 mod signer;
 pub mod slsa;
 
 pub use error::{OciError, SignError, VerifyError};
+pub use sbom::{sign_cyclonedx, sign_spdx, verify_cyclonedx, verify_spdx};
 pub use signer::{EcdsaP256Signer, MockSigner, Signer, SignerError};
 pub use slsa::{
     sign_slsa_provenance, verify_slsa_provenance, VerifiedSlsaProvenance,
     SLSA_PROVENANCE_V1_PREDICATE_TYPE,
 };
+pub use spec::{CYCLONEDX_BOM_V1_5_PREDICATE_TYPE, SPDX_DOCUMENT_V2_3_PREDICATE_TYPE};
 
 use p256::ecdsa::signature::Verifier as _;
 use p256::ecdsa::{Signature as P256Signature, VerifyingKey};
