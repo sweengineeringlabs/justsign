@@ -43,6 +43,7 @@ pub use rekor;
 pub use spec;
 pub use tuf;
 
+pub mod cert_chain;
 mod error;
 mod signer;
 
@@ -348,6 +349,346 @@ fn hex_lower(bytes: &[u8]) -> String {
         out.push(HEX[(b & 0x0f) as usize] as char);
     }
     out
+}
+
+// ───────────────────────────────────────────────────────────────────
+// Keyless verification (issue #5). v0 takes the trust roots from the
+// caller directly; v1 will drive them out of a TUF-validated trust
+// bundle (see issues #3, #4). The function lives here rather than in
+// `cert_chain.rs` because it composes the chain walk with the DSSE
+// verify and SAN policy — three concerns the chain module deliberately
+// does NOT know about.
+// ───────────────────────────────────────────────────────────────────
+
+/// Verify a Sigstore-keyless [`spec::Bundle`] against caller-supplied
+/// trust anchors.
+///
+/// Pipeline:
+///
+/// 1. Pull `bundle.verification_material.certificate.certificates` —
+///    a `Vec<Vec<u8>>` of DER-encoded certs, leaf at index 0. If it's
+///    `None` or empty, fail with [`VerifyError::EmptyCertChain`].
+/// 2. Hand the chain + `trust_anchors_der` to
+///    [`cert_chain::verify_chain`]. The chain is accepted iff every
+///    intra-chain signature verifies AND the topmost cert terminates
+///    at a trust anchor (either the same DER, or signed by one).
+///    On success this returns the leaf's `VerifyingKey`.
+/// 3. If `expected_san` is `Some`, extract SAN entries from the leaf
+///    via [`cert_chain::extract_san`] and require an EXACT-string
+///    match against one of them. v0 does not pattern-match.
+/// 4. Dispatch the rest of verification to the existing [`verify_blob`]
+///    logic, using the leaf's verifying key as the (single) trusted
+///    key. This re-uses the DSSE-only / Rekor-optional posture from
+///    the v0 verifier so we don't duplicate signature-shape logic.
+///
+/// # Errors
+///
+/// * [`VerifyError::EmptyCertChain`] — bundle has no cert chain.
+/// * [`VerifyError::ChainBroken`] — chain walk rejected the chain.
+/// * [`VerifyError::SanMismatch`] — `expected_san` not found in leaf.
+///   [`cert_chain::ChainError::Decode`] surfacing as `ChainBroken`
+///   here means the leaf cert was malformed when SAN extraction tried
+///   to re-decode it; that's a chain problem, not a SAN problem.
+/// * [`VerifyError::SignatureInvalid`] / [`VerifyError::EnvelopeMissing`] /
+///   [`VerifyError::NoTlogEntry`] / [`VerifyError::RekorVerify`] —
+///   inherited from [`verify_blob`].
+///
+/// # Open issues for v1
+///
+/// * Expiry — [`VerifyError::CertExpired`] is defined but not
+///   produced. Wiring a clock SPI is its own slice.
+/// * SAN pattern matching (issuer-prefix matching, regex on URIs,
+///   etc.) — v0 is exact-string only.
+/// * SCT / Rekor inclusion-time-vs-cert-validity binding.
+pub fn verify_blob_keyless(
+    bundle: &Bundle,
+    trust_anchors_der: &[Vec<u8>],
+    expected_san: Option<&str>,
+    rekor: Option<&dyn RekorClient>,
+) -> Result<(), VerifyError> {
+    // 1. Pull the cert chain out of the bundle. The wire shape uses
+    //    `Option<Certificate>` where `Certificate.certificates` is a
+    //    `Vec<Vec<u8>>` — an Option that's `Some` but inner is empty
+    //    is malformed but possible; treat it as the same failure as
+    //    `None`.
+    let chain_der: &[Vec<u8>] = match &bundle.verification_material.certificate {
+        Some(cert) if !cert.certificates.is_empty() => &cert.certificates,
+        _ => return Err(VerifyError::EmptyCertChain),
+    };
+
+    // 2. Walk the chain → leaf VerifyingKey. ChainError flows up via
+    //    `From` impl on VerifyError::ChainBroken.
+    let leaf_vk = cert_chain::verify_chain(chain_der, trust_anchors_der)?;
+
+    // 3. SAN policy check. The leaf is at index 0 by Sigstore wire
+    //    convention; `verify_chain` already validated that index
+    //    decodes, so `extract_san` should only fail if the SAN
+    //    extension itself is malformed (vanishingly rare for a cert
+    //    that already verified, but typed surface is in place).
+    if let Some(expected) = expected_san {
+        let actual = cert_chain::extract_san(&chain_der[0])?;
+        if !actual.iter().any(|entry| entry == expected) {
+            return Err(VerifyError::SanMismatch {
+                expected: expected.to_string(),
+                actual,
+            });
+        }
+    }
+
+    // 4. Hand off to the existing v0 verifier, using the leaf's key
+    //    as the single trusted key. `verify_blob` enforces:
+    //      - DSSE envelope variant (not message-signature),
+    //      - at least one envelope signature validates against the
+    //        leaf's key,
+    //      - if `rekor` is Some, every tlog entry's inclusion proof
+    //        re-verifies against its claimed root.
+    verify_blob(bundle, &[leaf_vk], rekor)
+}
+
+#[cfg(test)]
+mod keyless_tests {
+    use super::*;
+    use crate::cert_chain::ChainError;
+    use p256::ecdsa::{Signature, SigningKey};
+    use p256::pkcs8::DecodePrivateKey;
+    use rcgen::{
+        BasicConstraints, CertificateParams, DnType, IsCa, KeyPair, KeyUsagePurpose, SanType,
+        PKCS_ECDSA_P256_SHA256,
+    };
+    use signature::Signer as _;
+    use spec::Certificate as SpecCertificate;
+
+    /// Three-level synthetic chain bundled with the leaf's signing
+    /// key, so the caller can sign a real bundle whose DSSE
+    /// signature actually verifies under the cert chain's leaf.
+    struct KeylessFixture {
+        /// Leaf (index 0), intermediate (index 1) DER bytes.
+        chain_der: Vec<Vec<u8>>,
+        /// Root DER — passed to `verify_blob_keyless` as a trust
+        /// anchor.
+        root_der: Vec<u8>,
+        /// Real P-256 signing key whose public part is in the leaf
+        /// cert. Used to actually sign DSSE PAE bytes.
+        leaf_signing_key: SigningKey,
+        /// Email SAN burned into the leaf — for the SAN-policy test.
+        leaf_email: String,
+    }
+
+    /// Build a real chain whose leaf carries a P-256 key that we
+    /// also retain (so we can sign with it). Mirrors the structure
+    /// `cert_chain::tests::build_three_level_chain` produces, but
+    /// extracts the leaf signing key as a `p256::ecdsa::SigningKey`
+    /// so the caller can produce a real DSSE signature.
+    fn build_keyless_fixture() -> KeylessFixture {
+        let root_kp = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("root kp");
+        let mut root_params = CertificateParams::new(Vec::<String>::new()).expect("root params");
+        root_params
+            .distinguished_name
+            .push(DnType::CommonName, "keyless-root");
+        root_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        root_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+        let root_cert = root_params.self_signed(&root_kp).expect("root self-sign");
+        let root_der = root_cert.der().to_vec();
+
+        let intermediate_kp =
+            KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("intermediate kp");
+        let mut intermediate_params =
+            CertificateParams::new(Vec::<String>::new()).expect("intermediate params");
+        intermediate_params
+            .distinguished_name
+            .push(DnType::CommonName, "keyless-intermediate");
+        intermediate_params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
+        intermediate_params.key_usages =
+            vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+        let intermediate_cert = intermediate_params
+            .signed_by(&intermediate_kp, &root_cert, &root_kp)
+            .expect("intermediate sign");
+        let intermediate_der = intermediate_cert.der().to_vec();
+
+        let leaf_kp = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("leaf kp");
+        // Re-import the leaf keypair as a p256 SigningKey so we can
+        // produce DSSE signatures verifiable under the leaf cert's
+        // SubjectPublicKeyInfo. rcgen's KeyPair holds PKCS#8 DER.
+        let leaf_pkcs8_der = leaf_kp.serialize_der();
+        let leaf_signing_key =
+            SigningKey::from_pkcs8_der(&leaf_pkcs8_der).expect("leaf PKCS#8 → p256 SigningKey");
+
+        let leaf_email = "keyless-test@example.com".to_string();
+        let mut leaf_params = CertificateParams::new(Vec::<String>::new()).expect("leaf params");
+        leaf_params
+            .distinguished_name
+            .push(DnType::CommonName, "keyless-leaf");
+        leaf_params.is_ca = IsCa::NoCa;
+        leaf_params.subject_alt_names = vec![SanType::Rfc822Name(
+            leaf_email.clone().try_into().expect("email IA5"),
+        )];
+        let leaf_cert = leaf_params
+            .signed_by(&leaf_kp, &intermediate_cert, &intermediate_kp)
+            .expect("leaf sign");
+        let leaf_der = leaf_cert.der().to_vec();
+
+        KeylessFixture {
+            chain_der: vec![leaf_der, intermediate_der],
+            root_der,
+            leaf_signing_key,
+            leaf_email,
+        }
+    }
+
+    /// Build a bundle whose `verification_material.certificate`
+    /// holds the synthetic chain and whose DSSE envelope is signed
+    /// by the leaf's signing key. The simplest path: sign with an
+    /// `EcdsaP256Signer` wrapping the leaf key, then patch the
+    /// resulting bundle to attach the chain.
+    fn sign_with_chain(payload: &[u8], fx: &KeylessFixture) -> Bundle {
+        // Produce the bundle via the v0 sign path so PAE / signature
+        // shape is byte-identical to what `verify_blob` expects.
+        // Cloning the SigningKey isn't allowed, so re-import.
+        let signing_key_clone =
+            SigningKey::from_bytes(&fx.leaf_signing_key.to_bytes()).expect("re-import leaf key");
+        let signer = EcdsaP256Signer::new(signing_key_clone, Some("leaf".into()));
+        let mut bundle = sign_blob(payload, "text/plain", &signer, None).expect("sign_blob");
+
+        // Patch in the synthetic cert chain.
+        bundle.verification_material.certificate = Some(SpecCertificate {
+            certificates: fx.chain_der.clone(),
+        });
+        bundle
+    }
+
+    /// Bug it catches: a verifier that never wires the leaf VK into
+    /// the DSSE check (e.g. trusted_keys = [] with no leaf bound)
+    /// would silently fail every keyless verification. Or a verifier
+    /// that wires the WRONG key (intermediate, root) would pass
+    /// signatures it shouldn't be able to. Sign with the real leaf
+    /// key, verify must succeed.
+    #[test]
+    fn test_verify_blob_keyless_round_trips_through_real_chain() {
+        let fx = build_keyless_fixture();
+        let bundle = sign_with_chain(b"keyless payload", &fx);
+
+        verify_blob_keyless(&bundle, std::slice::from_ref(&fx.root_der), None, None)
+            .expect("real keyless chain must verify");
+    }
+
+    /// Bug it catches: a verifier that ignored `expected_san` and
+    /// returned Ok regardless. Pass a SAN that DOESN'T match — must
+    /// reject with `SanMismatch`.
+    #[test]
+    fn test_verify_blob_keyless_rejects_san_mismatch() {
+        let fx = build_keyless_fixture();
+        let bundle = sign_with_chain(b"keyless payload", &fx);
+
+        let err = verify_blob_keyless(
+            &bundle,
+            std::slice::from_ref(&fx.root_der),
+            Some("not-the-real-email@evil.example"),
+            None,
+        )
+        .expect_err("SAN mismatch must reject");
+
+        match err {
+            VerifyError::SanMismatch { expected, actual } => {
+                assert_eq!(expected, "not-the-real-email@evil.example");
+                assert!(
+                    actual.iter().any(|e| e == &fx.leaf_email),
+                    "actual SAN list must include the leaf's email — got {actual:?}"
+                );
+            }
+            other => panic!("expected SanMismatch, got {other:?}"),
+        }
+    }
+
+    /// Bug it catches: a verifier that accepted a chain even when
+    /// the trust anchors don't include the issuer of the chain's
+    /// topmost cert. Build a real bundle, pass an UNRELATED root.
+    /// Must reject with `ChainBroken(RootNotTrusted)`.
+    #[test]
+    fn test_verify_blob_keyless_rejects_unrelated_trust_anchor() {
+        let fx = build_keyless_fixture();
+        let unrelated = build_keyless_fixture();
+        let bundle = sign_with_chain(b"keyless payload", &fx);
+
+        let err = verify_blob_keyless(&bundle, &[unrelated.root_der], None, None)
+            .expect_err("unrelated anchor must reject");
+
+        match err {
+            VerifyError::ChainBroken(ChainError::RootNotTrusted { .. }) => {}
+            other => panic!("expected ChainBroken(RootNotTrusted), got {other:?}"),
+        }
+    }
+
+    /// Bug it catches: a verifier that didn't error on a bundle
+    /// missing the cert chain entirely (e.g. a v0 non-keyless
+    /// bundle being fed to the keyless path). Must surface
+    /// `EmptyCertChain` distinctly so caller can route on it.
+    #[test]
+    fn test_verify_blob_keyless_rejects_bundle_with_no_certificate() {
+        let fx = build_keyless_fixture();
+        // Same fixture, same payload — but DON'T patch in the chain.
+        // The bundle leaves `verification_material.certificate = None`.
+        let signing_key_clone =
+            SigningKey::from_bytes(&fx.leaf_signing_key.to_bytes()).expect("re-import leaf key");
+        let signer = EcdsaP256Signer::new(signing_key_clone, None);
+        let bundle = sign_blob(b"no-chain payload", "text/plain", &signer, None).unwrap();
+        assert!(bundle.verification_material.certificate.is_none());
+
+        let err = verify_blob_keyless(&bundle, &[fx.root_der], None, None)
+            .expect_err("missing chain must reject");
+        assert!(
+            matches!(err, VerifyError::EmptyCertChain),
+            "expected EmptyCertChain, got {err:?}"
+        );
+    }
+
+    /// Bug it catches: a verifier that walks the chain successfully
+    /// but skips the DSSE-against-leaf-key step — i.e. it returned
+    /// Ok the moment the chain validated, regardless of whether the
+    /// envelope's signature actually came from the leaf's private
+    /// key. We sign the envelope with a DIFFERENT keypair, attach
+    /// the legitimate chain, and require rejection.
+    #[test]
+    fn test_verify_blob_keyless_rejects_signature_from_wrong_key() {
+        let fx = build_keyless_fixture();
+
+        // Sign with a fresh, unrelated signing key.
+        let unrelated_signer = EcdsaP256Signer::new(
+            SigningKey::from_bytes(&[0x33u8; 32].into()).expect("scalar"),
+            None,
+        );
+        let mut bundle =
+            sign_blob(b"sneaky payload", "text/plain", &unrelated_signer, None).unwrap();
+        // Stitch the legitimate chain in. If the verifier short-
+        // circuits on chain success, this will pass — and that's
+        // exactly the bug we want to catch.
+        bundle.verification_material.certificate = Some(SpecCertificate {
+            certificates: fx.chain_der.clone(),
+        });
+
+        let err = verify_blob_keyless(&bundle, &[fx.root_der], None, None)
+            .expect_err("wrong-key DSSE must reject");
+        assert!(
+            matches!(err, VerifyError::SignatureInvalid { .. }),
+            "expected SignatureInvalid, got {err:?}"
+        );
+    }
+
+    /// Sanity check on the helper: a `Signature` import that fails
+    /// would silently produce wrong test fixtures. Pin it.
+    #[test]
+    fn test_keyless_fixture_leaf_signs_verifiably() {
+        let fx = build_keyless_fixture();
+        let msg = b"sanity";
+        let sig: Signature = fx.leaf_signing_key.sign(msg);
+        // Re-extract the verifying key the same way verify_chain
+        // does, and confirm it agrees with the signature we just
+        // produced.
+        let leaf_vk = cert_chain::verify_chain(&fx.chain_der, std::slice::from_ref(&fx.root_der))
+            .expect("chain verify");
+        leaf_vk
+            .verify(msg, &sig)
+            .expect("signature from leaf signing key must verify under leaf VK");
+    }
 }
 
 #[cfg(test)]

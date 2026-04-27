@@ -31,11 +31,25 @@ p256      = { version = "0.13", default-features = false, features = ["std", "ec
 signature = { version = "2", default-features = false, features = ["std"] }
 sha2      = { version = "0.10", default-features = false, features = ["std"] }
 
+# X.509 cert chain walking for keyless verification (Fulcio leaf →
+# intermediate(s) → caller-supplied trust anchor). Version pinned
+# to the same value `swe_justsign_fulcio` uses so cargo resolves a
+# single copy.
+x509-cert = { version = "0.2", default-features = false, features = ["std", "pem"] }
+der       = { version = "0.7", default-features = false, features = ["std", "oid"] }
+const-oid = { version = "0.9", default-features = false }
+spki      = { version = "0.7", default-features = false, features = ["std"] }
+
 [dev-dependencies]
 # Deterministic RNG so the ECDSA round-trip test produces a stable
 # keypair across runs. Same crate fulcio uses for the same reason.
 rand_chacha = { version = "0.3", default-features = false }
 rand_core   = { version = "0.6", default-features = false }
+
+# Synthesises self-signed root + intermediate + leaf P-256 certs for
+# the cert-chain unit tests. Test-only; never compiled into the
+# library or downstream crates.
+rcgen       = { version = "0.13", default-features = false, features = ["pem", "crypto", "ring"] }
 
 [lints]
 workspace = true
