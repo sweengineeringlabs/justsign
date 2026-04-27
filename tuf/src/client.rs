@@ -26,21 +26,35 @@
 //! the trust chain never inverts (a fetched-but-unverified role is
 //! never used to validate anything).
 //!
+//! # Bootstrap
+//!
+//! Per ADR `docs/2-architecture/adr_001_sigstore_tuf_bootstrap.md`,
+//! [`TufClient::sigstore`] uses the Sigstore production root that is
+//! baked into the binary at build time (see [`crate::embedded`]). For
+//! air-gapped deployments, custom mirrors, or operators who refuse
+//! the bundled root for policy reasons,
+//! [`TufClient::with_initial_root_bytes`] accepts a caller-supplied
+//! root as bytes; both constructors run a runtime expiry guard that
+//! returns [`TufError::EmbeddedRootExpired`] if the supplied root has
+//! already passed its `expires` timestamp on the current clock.
+//!
 //! # What's NOT here
 //!
-//! - **Bootstrap.** The caller supplies the trusted initial root.
-//!   Baking a Sigstore root into the binary is a separate
-//!   attack-surface decision tracked in a follow-up issue.
 //! - **Delegated targets.** [`crate::types::Targets::delegations`]
 //!   is preserved as raw JSON; walking delegations is post-v0.
-//! - **Online keys.** v0 supports Ed25519-only roots, mirroring the
-//!   verifier's constraint (see [`crate::root`] crate-level docs).
+//! - **Online keys.** v0 supports Ed25519-only roots for signature
+//!   verification, mirroring the verifier's constraint (see
+//!   [`crate::root`] crate-level docs). The bundled Sigstore v14 root
+//!   uses ECDSA P-256 keys; a live chain walk against it will
+//!   currently surface [`TufError::UnsupportedKeyType`] from the
+//!   verifier path -- bundling lets us land the bootstrap policy
+//!   ahead of the ECDSA verifier work.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use crate::expiry::is_expired;
+use crate::expiry::{format_rfc3339_utc, is_expired};
 use crate::root::{verify_role, Root, TufError};
 use crate::span::parse_with_signed_span;
 use crate::types::{Signed, Snapshot, Targets, Timestamp};
@@ -69,6 +83,14 @@ const SIGSTAGE_URL: &str = "https://tuf-repo-cdn.sigstage.dev";
 /// `TufClient` is reusable across calls; the underlying
 /// [`reqwest::blocking::Client`] is built once. Caching is on-disk
 /// at `cache_dir`.
+///
+/// A `TufClient` MAY carry an embedded "initial root" — the trusted
+/// bootstrap document a chained-root walk starts from. Constructors
+/// that accept a root ([`Self::sigstore`],
+/// [`Self::with_initial_root_bytes`]) populate this; the bare-bones
+/// [`Self::new`] / [`Self::sigstage`] constructors leave it `None`
+/// and require callers to supply a root explicitly to
+/// [`Self::fetch_root`].
 #[derive(Debug)]
 pub struct TufClient {
     base_url: String,
@@ -78,6 +100,11 @@ pub struct TufClient {
     /// dependence on expiry checks. Default `None` → use
     /// `SystemTime::now()`.
     now_override: Option<SystemTime>,
+    /// Trusted bootstrap root document the chained-root walk starts
+    /// from. Populated by [`Self::sigstore`] and
+    /// [`Self::with_initial_root_bytes`]. `None` for clients built
+    /// via [`Self::new`] / [`Self::sigstage`].
+    initial_root: Option<Root>,
 }
 
 impl TufClient {
@@ -109,24 +136,107 @@ impl TufClient {
             cache_dir,
             http,
             now_override: None,
+            initial_root: None,
         })
     }
 
     /// Build a client against the production Sigstore TUF mirror
-    /// (<https://tuf-repo-cdn.sigstore.dev>).
+    /// (<https://tuf-repo-cdn.sigstore.dev>) using the bundled
+    /// production root as the bootstrap.
+    ///
+    /// The bundled root ([`crate::embedded::SIGSTORE_PRODUCTION_ROOT_BYTES`])
+    /// is parsed and runtime-expiry-checked at this point. If the
+    /// embedded asset has already expired on the system clock, the
+    /// constructor returns [`TufError::EmbeddedRootExpired`] -- the
+    /// chain walker can usually catch up by chained-root-walking
+    /// forward, but only after a successful bootstrap.
     ///
     /// `cache_dir` is required because the workspace does not depend
     /// on `dirs` and we refuse to silently spread cached signing-trust
     /// state across an unspecified filesystem location.
+    ///
+    /// To override the bundled root (air-gapped deploys, custom
+    /// mirrors, security-paranoid pipelines that audit the root
+    /// out-of-band), use [`Self::with_initial_root_bytes`].
     pub fn sigstore(cache_dir: impl Into<PathBuf>) -> Result<Self, TufError> {
-        Self::new(SIGSTORE_PROD_URL, cache_dir)
+        Self::with_initial_root_bytes(
+            crate::embedded::SIGSTORE_PRODUCTION_ROOT_BYTES,
+            SIGSTORE_PROD_URL,
+            cache_dir,
+        )
+    }
+
+    /// Build a client preloaded with a caller-supplied initial root.
+    ///
+    /// The escape hatch for callers that need to bootstrap from
+    /// something other than the bundled Sigstore production root --
+    /// air-gapped deployments, custom mirrors, or security-paranoid
+    /// pipelines that audit the root out-of-band before passing the
+    /// bytes in.
+    ///
+    /// `root_bytes` is the raw JSON of a TUF root metadata envelope
+    /// (`{"signed": {...}, "signatures": [...]}`); the constructor:
+    ///
+    /// 1. Parses it via the typed [`Root`] deserialiser. Garbage in
+    ///    surfaces as [`TufError::Json`].
+    /// 2. Rejects an already-expired root with
+    ///    [`TufError::EmbeddedRootExpired`]. This is distinct from
+    ///    [`TufError::Expired`] (which fires after a network fetch);
+    ///    the bootstrap-time variant lets operators route on it
+    ///    cleanly.
+    /// 3. Stores the parsed root as the bootstrap that
+    ///    [`Self::fetch_root_from_bootstrap`] will walk from.
+    ///
+    /// Note: the constructor does not signature-verify the supplied
+    /// root. Per TUF spec the bootstrap root IS the trust anchor; if
+    /// the operator supplies an attacker-controlled root, every
+    /// downstream verification trusts the attacker. The caller is
+    /// responsible for verifying the bytes out-of-band before calling
+    /// this constructor.
+    pub fn with_initial_root_bytes(
+        root_bytes: &[u8],
+        base_url: impl Into<String>,
+        cache_dir: impl Into<PathBuf>,
+    ) -> Result<Self, TufError> {
+        let mut client = Self::new(base_url, cache_dir)?;
+        let root = parse_initial_root(root_bytes)?;
+        check_initial_root_not_expired(&root, client.now())?;
+        client.initial_root = Some(root);
+        Ok(client)
     }
 
     /// Build a client against the Sigstore staging mirror
     /// (<https://tuf-repo-cdn.sigstage.dev>). Used by the skip-pass
-    /// integration test; not for production verification.
+    /// integration test; not for production verification. Does not
+    /// preload an initial root -- the staging root is not bundled.
     pub fn sigstage(cache_dir: impl Into<PathBuf>) -> Result<Self, TufError> {
         Self::new(SIGSTAGE_URL, cache_dir)
+    }
+
+    /// Reference to the trusted bootstrap root the client was
+    /// preloaded with, if any. Populated by [`Self::sigstore`] and
+    /// [`Self::with_initial_root_bytes`]; `None` for clients built
+    /// via [`Self::new`] / [`Self::sigstage`].
+    pub fn bootstrap_root(&self) -> Option<&Root> {
+        self.initial_root.as_ref()
+    }
+
+    /// Walk the root chain starting from the bootstrap root the
+    /// client was preloaded with.
+    ///
+    /// Convenience wrapper for [`Self::fetch_root`] that uses the
+    /// stored bootstrap. Returns [`TufError::MissingRole`] (with
+    /// `role: "root"`) if the client was built without a bootstrap
+    /// root (i.e. via [`Self::new`] / [`Self::sigstage`]) -- those
+    /// callers must use the explicit [`Self::fetch_root`] path.
+    pub fn fetch_root_from_bootstrap(&self) -> Result<Root, TufError> {
+        let root = self.initial_root.as_ref().ok_or(TufError::MissingRole {
+            role: "root (no bootstrap configured; use TufClient::sigstore or \
+                   TufClient::with_initial_root_bytes, or call fetch_root with \
+                   an explicit initial root)"
+                .to_string(),
+        })?;
+        self.fetch_root(root)
     }
 
     /// Test-only: pin the `now` reference [`is_expired`] uses. Lets
@@ -401,6 +511,45 @@ impl TufClient {
     pub fn cache_dir(&self) -> &Path {
         &self.cache_dir
     }
+}
+
+/// Parse a `{signed, signatures}` envelope and return just the typed
+/// [`Root`] body. Used by [`TufClient::with_initial_root_bytes`] +
+/// [`TufClient::sigstore`] to extract the bootstrap root from raw
+/// wire bytes (or the embedded asset). Errors flow as
+/// [`TufError::Json`] for the usual reason: anything malformed at
+/// this depth is a JSON shape problem, not an envelope-level concern.
+fn parse_initial_root(bytes: &[u8]) -> Result<Root, TufError> {
+    let v: serde_json::Value = serde_json::from_slice(bytes)?;
+    let signed = v.get("signed").cloned().ok_or_else(|| {
+        // Construct a synthesised serde_json::Error so this funnels
+        // into TufError::Json without a new variant for an extremely
+        // narrow failure mode.
+        TufError::Json(<serde_json::Error as serde::de::Error>::custom(
+            "initial root envelope is missing top-level `signed` field",
+        ))
+    })?;
+    let root: Root = serde_json::from_value(signed)?;
+    Ok(root)
+}
+
+/// Runtime expiry guard for an initial trust root. Component 3 of
+/// issue #27. Distinct from the post-fetch `is_expired` -> `Expired`
+/// path: this fires before any network traffic, on the bootstrap
+/// material itself, so operators can route on the difference.
+fn check_initial_root_not_expired(root: &Root, now: SystemTime) -> Result<(), TufError> {
+    if is_expired(&root.expires, now)? {
+        let now_iso8601 =
+            format_rfc3339_utc(now).unwrap_or_else(|_| "<clock-before-epoch>".to_string());
+        return Err(TufError::EmbeddedRootExpired {
+            expired_at: root.expires.clone(),
+            now_iso8601,
+            hint: "upgrade swe_justsign_tuf or pass a fresh root via \
+                 TufClient::with_initial_root_bytes"
+                .to_string(),
+        });
+    }
+    Ok(())
 }
 
 /// Sanitise a TUF metadata path to a safe filename for the cache.
@@ -1575,5 +1724,186 @@ mod tests {
             }
             let _ = fs::remove_dir_all(&dir);
         }
+    }
+
+    // ─── bundled-root bootstrap tests (issue #27) ───────────────
+
+    /// Build a `{signed, signatures}` envelope wrapping the typed
+    /// [`Root`] body verbatim. Used by the bootstrap-bytes tests
+    /// below to construct a synthetic initial root with a controlled
+    /// expiry timestamp. Signatures are not produced because
+    /// [`TufClient::with_initial_root_bytes`] does not signature-check
+    /// the bootstrap (the bootstrap IS the trust anchor).
+    fn envelope_bytes_for(root: &Root) -> Vec<u8> {
+        let signed = serde_json::to_value(root).unwrap();
+        let env = json!({
+            "signed": signed,
+            "signatures": [],
+        });
+        serde_json::to_vec(&env).unwrap()
+    }
+
+    /// `TufClient::sigstore` succeeds without any operator action --
+    /// the bundled embedded root is the bootstrap.
+    ///
+    /// Bug it catches: a regression where the embedded asset path or
+    /// the runtime expiry guard blocks the zero-config path. Without
+    /// this test, the only signal that bundling actually works is the
+    /// downstream live integration test, which is gated behind an
+    /// env var.
+    #[test]
+    fn test_sigstore_constructor_uses_embedded_root_without_operator_action() {
+        let dir = unique_temp_dir("sigstore_ctor_uses_embedded");
+        let client = TufClient::sigstore(&dir).expect(
+            "sigstore() must succeed using the bundled root; if this fails check the \
+             embedded asset's expires field and the runtime expiry guard",
+        );
+        let bootstrap = client
+            .bootstrap_root()
+            .expect("sigstore() must populate bootstrap_root() from the embedded asset");
+        assert_eq!(
+            bootstrap.type_field, "root",
+            "bootstrap root _type must be \"root\""
+        );
+        assert_eq!(
+            bootstrap.version,
+            crate::embedded::SIGSTORE_PRODUCTION_ROOT_VERSION,
+            "bootstrap root version must match SIGSTORE_PRODUCTION_ROOT_VERSION"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `TufClient::with_initial_root_bytes` accepts a synthesised
+    /// well-formed root and exposes it via [`TufClient::bootstrap_root`].
+    ///
+    /// Bug it catches: a constructor that silently drops the supplied
+    /// bytes (e.g. only respecting the embedded path) would defeat
+    /// the air-gapped escape hatch. Operators of locked-down systems
+    /// MUST be able to supply their own root.
+    #[test]
+    fn test_with_initial_root_bytes_accepts_valid_root() {
+        let dir = unique_temp_dir("override_valid");
+        let (synthetic_root, _sks) = build_test_root(1, 1, 7, "2099-01-01T00:00:00Z");
+        let bytes = envelope_bytes_for(&synthetic_root);
+
+        let client = TufClient::with_initial_root_bytes(&bytes, "https://example.invalid", &dir)
+            .expect("valid root bytes must produce a client");
+        let bootstrap = client
+            .bootstrap_root()
+            .expect("override constructor must populate bootstrap_root()");
+        assert_eq!(
+            bootstrap.version, 7,
+            "bootstrap version must round-trip the supplied root's version"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `TufClient::with_initial_root_bytes` rejects a root whose
+    /// `expires` is in the past (relative to the current clock --
+    /// pinned via `with_now_override`-style discipline in the
+    /// fixture, but this test uses the real clock and a 1970 expiry
+    /// to be unambiguously in the past).
+    ///
+    /// Bug it catches: a constructor that builds a client around an
+    /// already-expired bootstrap would let downstream chain walks
+    /// proceed using bytes the operator should already have rotated.
+    /// The expired-bootstrap branch is component 3 of issue #27 --
+    /// without this test, the runtime guard is effectively dead code.
+    #[test]
+    fn test_with_initial_root_bytes_rejects_expired_bootstrap() {
+        let dir = unique_temp_dir("override_expired");
+        // 1970 is unambiguously before any test runner clock.
+        let (synthetic_root, _sks) = build_test_root(1, 1, 1, "1970-01-02T00:00:00Z");
+        let bytes = envelope_bytes_for(&synthetic_root);
+
+        let err = TufClient::with_initial_root_bytes(&bytes, "https://example.invalid", &dir)
+            .expect_err("expired bootstrap must be rejected");
+        match err {
+            TufError::EmbeddedRootExpired {
+                expired_at,
+                now_iso8601,
+                hint,
+            } => {
+                assert_eq!(expired_at, "1970-01-02T00:00:00Z");
+                assert!(
+                    !now_iso8601.is_empty(),
+                    "now_iso8601 must be populated for diagnostics"
+                );
+                assert!(
+                    hint.contains("with_initial_root_bytes"),
+                    "hint must direct operators to the override constructor; got: {hint}"
+                );
+            }
+            other => panic!("expected EmbeddedRootExpired, got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `TufClient::with_initial_root_bytes` rejects malformed JSON
+    /// with [`TufError::Json`] rather than panicking or constructing
+    /// a junk client.
+    ///
+    /// Bug it catches: an `unwrap()` on the JSON parse path would
+    /// crash the calling process when an air-gapped operator passes a
+    /// truncated download. We surface a typed error so callers can
+    /// log + retry with a fresh fetch.
+    #[test]
+    fn test_with_initial_root_bytes_rejects_malformed_json() {
+        let dir = unique_temp_dir("override_garbage");
+        let err =
+            TufClient::with_initial_root_bytes(b"not-json{}", "https://example.invalid", &dir)
+                .expect_err("malformed JSON must error");
+        assert!(
+            matches!(err, TufError::Json(_)),
+            "expected TufError::Json for malformed JSON, got {err:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `TufClient::with_initial_root_bytes` rejects an envelope that
+    /// is well-formed JSON but missing the top-level `signed` field.
+    ///
+    /// Bug it catches: a fetch that returned a snapshot.json or a
+    /// 200-response error page rendered as JSON would otherwise be
+    /// silently accepted as a "root" with all default fields.
+    #[test]
+    fn test_with_initial_root_bytes_rejects_envelope_missing_signed() {
+        let dir = unique_temp_dir("override_no_signed");
+        let bytes = b"{\"signatures\":[]}";
+        let err = TufClient::with_initial_root_bytes(bytes, "https://example.invalid", &dir)
+            .expect_err("envelope without `signed` must error");
+        assert!(
+            matches!(err, TufError::Json(_)),
+            "expected TufError::Json for missing `signed`, got {err:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `TufClient::fetch_root_from_bootstrap` errors cleanly when the
+    /// client was constructed without a bootstrap (i.e. via
+    /// [`TufClient::new`]) -- those callers must use the explicit
+    /// [`TufClient::fetch_root`] path.
+    ///
+    /// Bug it catches: a `.unwrap()` on `self.initial_root` inside
+    /// `fetch_root_from_bootstrap` would panic on a perfectly legal
+    /// construction path. The typed error documents the right
+    /// alternative for the operator.
+    #[test]
+    fn test_fetch_root_from_bootstrap_without_bootstrap_returns_typed_error() {
+        let dir = unique_temp_dir("no_bootstrap");
+        let client =
+            TufClient::new("https://example.invalid", &dir).expect("bare ctor must succeed");
+        assert!(
+            client.bootstrap_root().is_none(),
+            "bare ctor must leave bootstrap_root() at None"
+        );
+        let err = client
+            .fetch_root_from_bootstrap()
+            .expect_err("must error without a bootstrap");
+        assert!(
+            matches!(err, TufError::MissingRole { .. }),
+            "expected MissingRole, got {err:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 }

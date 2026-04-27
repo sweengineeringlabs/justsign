@@ -248,6 +248,31 @@ pub enum TufError {
     /// inside an otherwise-well-formed envelope.
     #[error("envelope span parse: {0}")]
     SpanParse(#[from] crate::span::SpanParseError),
+
+    /// The bundled (or caller-supplied) initial trust root has
+    /// already expired relative to the system clock at the time
+    /// [`crate::client::TufClient::with_initial_root_bytes`] was
+    /// called. This is a different bug class from [`Self::Expired`]:
+    /// `Expired` fires after fetching a fresh role from the mirror;
+    /// `EmbeddedRootExpired` fires before any network traffic, on
+    /// the bootstrap material itself. Distinct so operators can
+    /// route on it -- typically the fix is "upgrade justsign" (the
+    /// bundled root is stale) or "supply a fresh root via
+    /// `with_initial_root_bytes`" (the override path for air-gapped
+    /// deploys).
+    #[error(
+        "embedded TUF trust root has expired: expires_at={expired_at}, now={now_iso8601}; {hint}"
+    )]
+    EmbeddedRootExpired {
+        /// The `signed.expires` timestamp the embedded root declared.
+        expired_at: String,
+        /// The current time, rendered as RFC 3339 UTC-Z, for the
+        /// operator to confirm the system clock is correct.
+        now_iso8601: String,
+        /// Actionable hint -- usually "upgrade justsign or pass a
+        /// fresh root via TufClient::with_initial_root_bytes()".
+        hint: String,
+    },
 }
 
 /// Verify that `signatures` satisfies the named role's threshold

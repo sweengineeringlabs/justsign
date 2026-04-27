@@ -41,5 +41,13 @@ reqwest       = { version = "0.12", default-features = false, features = ["block
 ed25519-dalek = { version = "2", default-features = false, features = ["std", "rand_core"] }
 rand_core     = { version = "0.6", features = ["std"] }
 
+# build-dependencies are kept minimal: the build-time integrity check
+# (build.rs, component 2 of issue #27) only needs to parse JSON and
+# do RFC 3339 / Unix-seconds arithmetic. Date maths is inlined in
+# build.rs (no chrono / time dep) to mirror the std-only choice
+# tuf/src/expiry.rs already makes for runtime expiry.
+[build-dependencies]
+serde_json = { workspace = true }
+
 [lints]
 workspace = true

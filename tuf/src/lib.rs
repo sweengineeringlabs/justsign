@@ -30,15 +30,19 @@
 //! - Enforce expiry on every role at fetch time ([`expiry`]).
 //! - Cache raw wire bytes to disk for re-use across invocations.
 //!
+//! # Bootstrap
+//!
+//! Per ADR `docs/2-architecture/adr_001_sigstore_tuf_bootstrap.md`,
+//! the Sigstore production TUF root is bundled into the library at
+//! build time (see [`embedded`]). [`TufClient::sigstore`] uses the
+//! bundled root by default; [`TufClient::with_initial_root_bytes`]
+//! lets air-gapped or custom-mirror callers override.
+//!
 //! # Out of scope
 //!
-//! - **Bootstrap.** The caller supplies the trusted initial root.
-//!   Baking a Sigstore root into the binary is a separate
-//!   attack-surface decision tracked elsewhere.
 //! - **Delegations.** No delegated targets traversal —
 //!   [`Targets::delegations`] is preserved as raw JSON.
-//! - **ECDSA / RSA keys.** Ed25519-only, mirroring Sigstore's
-//!   deployed shape.
+//! - **ECDSA / RSA keys.** Ed25519-only, see "Cryptography" below.
 //!
 //! # Cryptography
 //!
@@ -48,10 +52,14 @@
 //! - `keyval.public` is a hex-encoded 32-byte Ed25519 public key
 //!   (lowercase hex, no `0x` prefix — TUF convention).
 //!
-//! ECDSA roots (`keytype = "ecdsa-sha2-nistp256"`) are rejected with
-//! [`TufError::UnsupportedKeyType`]. Sigstore's current TUF root is
-//! Ed25519, so this matches the deployed shape; ECDSA support would
-//! land alongside chained-root verification in v1.
+//! ECDSA roots (`keytype = "ecdsa-sha2-nistp256"`) are rejected by
+//! [`verify_role`] with [`TufError::UnsupportedKeyType`]. Sigstore's
+//! current production root (v14) uses ECDSA P-256 keys, so a live
+//! chained-root walk against the bundled root will surface
+//! [`TufError::UnsupportedKeyType`] until ECDSA verification lands.
+//! The bundled-root parse path itself (the [`Root`] deserialiser) is
+//! algorithm-agnostic; only signature verification is gated on
+//! Ed25519 today. Adding ECDSA support is tracked separately.
 //!
 //! # Canonical-JSON
 //!
@@ -71,6 +79,7 @@
 
 pub mod canonical;
 pub mod client;
+pub mod embedded;
 pub mod expiry;
 mod root;
 pub mod span;
@@ -78,6 +87,11 @@ pub mod types;
 
 pub use canonical::{canonicalize, CanonicalizationError};
 pub use client::TufClient;
+pub use embedded::{
+    SIGSTORE_PRODUCTION_ROOT_BYTES, SIGSTORE_PRODUCTION_ROOT_FETCHED_AT,
+    SIGSTORE_PRODUCTION_ROOT_SHA256, SIGSTORE_PRODUCTION_ROOT_SOURCE,
+    SIGSTORE_PRODUCTION_ROOT_VERSION,
+};
 pub use expiry::{format_rfc3339_utc, is_expired, ExpiryParseError};
 pub use root::{
     verify_role, verify_self_signed, Key, KeyId, KeyVal, Role, RoleName, Root, Signature, TufError,

@@ -1,0 +1,13 @@
+# Pin TUF root metadata assets to byte-exact LF storage.
+#
+# The bundled Sigstore production root in `tuf/assets/sigstore_prod.root.json`
+# carries a SHA-256 digest in `tuf/src/embedded.rs` that was computed over
+# the upstream-provided bytes (LF line endings, as Sigstore publishes them).
+# Without this rule git would round-trip the file through CRLF on
+# Windows checkouts via `core.autocrlf=true`, breaking the digest test
+# and the build-time integrity check.
+#
+# `binary` is the strongest guarantee: byte-for-byte preservation,
+# never EOL-converted, never diff'd as text. We treat the asset as
+# binary because that is what the trust claim requires.
+tuf/assets/*.root.json binary
