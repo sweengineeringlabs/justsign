@@ -1,0 +1,91 @@
+# Empty [workspace] table — declares this directory as its own
+# workspace root, kept distinct from the parent workspace at ../.
+# cargo-fuzz convention; mirrors what `cargo fuzz init` emits.
+[workspace]
+
+[package]
+name        = "swe_justsign-fuzz"
+version     = "0.0.0"
+publish     = false
+edition     = "2021"
+description = "cargo-fuzz harness for justsign wire-decode parsers. Each binary feeds &[u8] into one parser and asserts no panic."
+
+[package.metadata]
+cargo-fuzz = true
+
+# Path-deps to the workspace crates. The package on disk uses
+# `name = "swe_justsign_spec"` for crates.io but
+# `[lib] name = "spec"` for the rust-side `use spec::…` form, so
+# the dep's LHS here MUST match the lib name (`spec`, `tuf`, …) —
+# otherwise rustc can't resolve the `use` path. We pin the
+# `package = "swe_justsign_<crate>"` form alongside so cargo
+# disambiguates against the on-disk Cargo.toml.
+[dependencies]
+libfuzzer-sys = "0.4"
+serde_json    = "1"
+
+spec   = { path = "../spec",   package = "swe_justsign_spec" }
+tuf    = { path = "../tuf",    package = "swe_justsign_tuf" }
+fulcio = { path = "../fulcio", package = "swe_justsign_fulcio" }
+rekor  = { path = "../rekor",  package = "swe_justsign_rekor" }
+sign   = { path = "../sign",   package = "swe_justsign_sign" }
+
+# Each target is a separate cargo bin. `test = false`, `doc = false`,
+# `bench = false` mirrors what `cargo fuzz init` emits — the bins are
+# driven by libFuzzer, not cargo's normal test harness.
+
+[[bin]]
+name = "envelope_decode_json"
+path = "fuzz_targets/envelope_decode_json.rs"
+test = false
+doc  = false
+bench = false
+
+[[bin]]
+name = "bundle_decode_json"
+path = "fuzz_targets/bundle_decode_json.rs"
+test = false
+doc  = false
+bench = false
+
+[[bin]]
+name = "statement_decode_json"
+path = "fuzz_targets/statement_decode_json.rs"
+test = false
+doc  = false
+bench = false
+
+[[bin]]
+name = "tuf_canonicalize"
+path = "fuzz_targets/tuf_canonicalize.rs"
+test = false
+doc  = false
+bench = false
+
+[[bin]]
+name = "tuf_parse_with_signed_span"
+path = "fuzz_targets/tuf_parse_with_signed_span.rs"
+test = false
+doc  = false
+bench = false
+
+[[bin]]
+name = "fulcio_parse_chain"
+path = "fuzz_targets/fulcio_parse_chain.rs"
+test = false
+doc  = false
+bench = false
+
+[[bin]]
+name = "rekor_decode_log_entry_bytes"
+path = "fuzz_targets/rekor_decode_log_entry_bytes.rs"
+test = false
+doc  = false
+bench = false
+
+[[bin]]
+name = "oci_parse_referrer_manifest"
+path = "fuzz_targets/oci_parse_referrer_manifest.rs"
+test = false
+doc  = false
+bench = false

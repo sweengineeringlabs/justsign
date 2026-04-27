@@ -1,0 +1,16 @@
+# cargo-fuzz outputs — never commit these.
+target/
+artifacts/
+Cargo.lock
+
+# `corpus/` holds two kinds of files:
+#   1. Hand-curated seed inputs we ship (committed; small; one per
+#      target; covers the happy-path shape so libFuzzer doesn't have
+#      to reinvent it from random bytes).
+#   2. libFuzzer-grown corpora from local runs (NOT committed; can
+#      balloon to GBs; not deterministic across hosts).
+#
+# We ignore the directory by default, then `git add -f` each seed by
+# name when seeding. New seeds added later need the same `-f` so
+# they don't silently grow the repo.
+corpus/

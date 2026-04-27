@@ -1,0 +1,93 @@
+# Manual-dispatch fuzz runs for justsign wire-decode parsers.
+#
+# Each job runs one cargo-fuzz target for 5 minutes (300 seconds) of
+# wall-clock libFuzzer time. Per-target jobs run in parallel so a
+# full pass completes in ~5 minutes rather than ~40.
+#
+# Gated to `workflow_dispatch` only (never on push or pull_request)
+# because:
+#
+#   1. 8 targets x 5 minutes x every-push is too much CI cost for
+#      the marginal coverage gain.
+#   2. Fuzz failures need triage (minimise the crash input, decide
+#      whether the input is in scope) — they're a manual investigation,
+#      not a "merge blocker".
+#
+# Run from the Actions tab -> "Fuzz (manual)" -> Run workflow.
+#
+# On a found crash, the job uploads the artifacts directory so the
+# crash input survives the runner's tmpfs. Triage locally with
+# `cargo +nightly fuzz run <target> <artifact-path>`.
+
+name: Fuzz (manual)
+
+on:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Set per-target by `target` in the matrix below; `max_total_time`
+  # is in seconds (libFuzzer convention).
+  FUZZ_MAX_TOTAL_TIME: "300"
+
+jobs:
+  fuzz:
+    name: cargo fuzz run ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      # Don't cancel siblings on first failure — every target's a
+      # separate parser; one crash should not mask the others.
+      fail-fast: false
+      matrix:
+        target:
+          - envelope_decode_json
+          - bundle_decode_json
+          - statement_decode_json
+          - tuf_canonicalize
+          - tuf_parse_with_signed_span
+          - fulcio_parse_chain
+          - rekor_decode_log_entry_bytes
+          - oci_parse_referrer_manifest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install nightly Rust
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache cargo + fuzz target dir
+        uses: Swatinem/rust-cache@v2
+        with:
+          # Scope the cache by fuzz target so parallel matrix jobs
+          # don't fight each other for the same key.
+          key: fuzz-${{ matrix.target }}
+          workspaces: |
+            fuzz -> fuzz/target
+
+      - name: Install cargo-fuzz
+        # `--locked` keeps the install deterministic; pinning the
+        # version would be tighter but cargo-fuzz hasn't broken its
+        # CLI in years.
+        run: cargo install cargo-fuzz --locked
+
+      - name: Run ${{ matrix.target }} for ${{ env.FUZZ_MAX_TOTAL_TIME }}s
+        # `cargo fuzz run` defaults to passing argv after `--` to
+        # libFuzzer. `-max_total_time=N` bounds the run; the job
+        # exits 0 on time-up with no crashes, non-zero on a crash
+        # (which fails the matrix cell and surfaces in the UI).
+        working-directory: fuzz
+        run: |
+          cargo +nightly fuzz run ${{ matrix.target }} \
+            -- -max_total_time=${{ env.FUZZ_MAX_TOTAL_TIME }}
+
+      - name: Upload crash artifacts (if any)
+        # `if: failure()` covers the "libFuzzer found a crash" path —
+        # the run exited non-zero, the artifacts/ dir holds the
+        # repro bytes. Without this upload the crash is lost when
+        # the runner shuts down.
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}/
+          if-no-files-found: ignore
+          retention-days: 14

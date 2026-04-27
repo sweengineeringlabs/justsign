@@ -1,0 +1,1 @@
+{"mediaType":"application/vnd.dev.sigstore.bundle+json;version=0.3","verificationMaterial":{"tlogEntries":[]},"messageSignature":{"messageDigest":{"algorithm":"SHA2_256","digest":"ESERESERESERESERESERESERESERESERESERESERESERESEREQ=="},"signature":"MEUCIQ=="}}

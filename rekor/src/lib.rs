@@ -24,7 +24,7 @@ pub mod merkle;
 #[cfg(feature = "async")]
 pub mod async_client;
 
-pub use client::{HttpRekorClient, LogEntry, MockRekorClient, RekorClient};
+pub use client::{decode_log_entry_bytes, HttpRekorClient, LogEntry, MockRekorClient, RekorClient};
 pub use entry::{Data, HashedRekord, HashedRekordHash, PublicKey, Signature};
 pub use merkle::{verify_inclusion, EMPTY_TREE_ROOT, INTERNAL_NODE_PREFIX, LEAF_NODE_PREFIX};
 

@@ -266,9 +266,12 @@ fn decode_log_entry_response(resp: reqwest::blocking::Response) -> Result<LogEnt
 /// the blocking and the (gated) async transport without dragging
 /// `reqwest::blocking::Response` into the async path.
 ///
-/// Visible to the `async_client` sibling module via
-/// `pub(crate)`; not part of the public API.
-pub(crate) fn decode_log_entry_bytes(raw: &[u8]) -> Result<LogEntry, RekorError> {
+/// Exposed `pub` so the out-of-tree `fuzz/` harness (issue #24) can
+/// drive it directly with arbitrary `&[u8]` inputs without going
+/// through a real `reqwest::Response`. The function is pure, takes
+/// only an opaque byte slice, and surfaces typed errors — exactly
+/// the contract the fuzzer asserts (no panics).
+pub fn decode_log_entry_bytes(raw: &[u8]) -> Result<LogEntry, RekorError> {
     // Rekor returns `{ "<uuid>": { ... } }` — a one-element JSON
     // object keyed by the server-assigned UUID. We deserialise into
     // a `BTreeMap` so we don't depend on the field name and grab the
