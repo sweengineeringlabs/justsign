@@ -12,14 +12,23 @@
 //! ```json
 //! {
 //!   "mediaType": "application/vnd.dev.sigstore.bundle+json;version=0.3",
-//!   "verificationMaterial": { ... },
+//!   "verificationMaterial": {
+//!     "x509CertificateChain": {
+//!       "certificates": [ { "rawBytes": "<base64 DER>" }, ... ]
+//!     },
+//!     "tlogEntries": [ ... ]
+//!   },
 //!   "dsseEnvelope":      { ... }   // exactly one of dsseEnvelope OR
 //!   "messageSignature":  { ... }   // messageSignature is set
 //! }
 //! ```
 //!
 //! Per the protobuf spec, `dsse_envelope` and `message_signature` are
-//! a `oneof` — exactly one MUST be set. We enforce that on decode.
+//! a `oneof` — exactly one MUST be set. The cert material is also a
+//! `oneof` between `x509CertificateChain` (chain) and `certificate`
+//! (single `X509Certificate`); we pin `encode_json` to emit the chain
+//! shape and accept either on decode for cosign-legacy compat.
+//! Bundles that set both arms are rejected.
 //!
 //! We do NOT parse X.509 certs (held as raw DER `Vec<u8>`) and we do
 //! NOT verify Merkle inclusion proofs — that's
@@ -264,11 +273,42 @@ impl Bundle {
             }
         };
 
-        let certificate = match wire.verification_material.certificate {
-            None => None,
-            Some(cert_wire) => {
-                let mut certs = Vec::with_capacity(cert_wire.certificates.len());
-                for c in cert_wire.certificates {
+        // Cert chain decode accepts BOTH wire shapes per
+        // protobuf-specs sigstore_bundle.proto's
+        // `VerificationMaterial.content` oneof:
+        //
+        // * Canonical (what we emit): `x509CertificateChain` ─ the
+        //   multi-cert wrapper. Field is at proto number 2; the JSON
+        //   key is camelCase per protobuf-JSON convention. Holds an
+        //   ordered `certificates` array of `X509Certificate
+        //   { rawBytes }`. Leaf at index 0, intermediates after.
+        //
+        // * Legacy / cosign sign-blob path: `certificate` ─ a SINGLE
+        //   `X509Certificate { rawBytes }` (proto field 5). Cosign 2.x
+        //   for sign-blob without a chain emits this. We lift it into
+        //   a one-element `Vec<Vec<u8>>` so the in-memory model stays
+        //   chain-shaped regardless of which wire arm we read.
+        //
+        // Bundles populating BOTH arms are rejected: the protobuf
+        // `oneof` guarantees exactly one is set, and accepting both
+        // would mask a producer bug.
+        //
+        // The legacy `certificate` arm is a v0 compat layer. Plan to
+        // remove it in v0.2.0 once downstream consumers (justoci,
+        // justsign-cli) all emit the canonical chain shape and the
+        // wider Sigstore ecosystem has migrated. Until then, silent
+        // acceptance avoids breaking real cosign-signed artifacts.
+        let certificate = match (
+            wire.verification_material.x509_certificate_chain,
+            wire.verification_material.certificate,
+        ) {
+            (Some(_), Some(_)) => {
+                return Err(BundleDecodeError::BothCertificateShapesSet);
+            }
+            (None, None) => None,
+            (Some(chain_wire), None) => {
+                let mut certs = Vec::with_capacity(chain_wire.certificates.len());
+                for c in chain_wire.certificates {
                     let der = STANDARD.decode(c.raw_bytes.as_bytes()).map_err(|e| {
                         BundleDecodeError::CertificateBase64 {
                             detail: e.to_string(),
@@ -278,6 +318,16 @@ impl Bundle {
                 }
                 Some(Certificate {
                     certificates: certs,
+                })
+            }
+            (None, Some(single_wire)) => {
+                let der = STANDARD
+                    .decode(single_wire.raw_bytes.as_bytes())
+                    .map_err(|e| BundleDecodeError::CertificateBase64 {
+                        detail: e.to_string(),
+                    })?;
+                Some(Certificate {
+                    certificates: vec![der],
                 })
             }
         };
@@ -327,11 +377,24 @@ impl Bundle {
             }
         };
 
-        let certificate =
+        // Encoder emits the canonical `x509CertificateChain` shape.
+        // See decoder comment for the rationale; in short, this is the
+        // protobuf-JSON encoding of `X509CertificateChain` (proto field
+        // 2 of the `VerificationMaterial.content` oneof) and is the
+        // only protobuf-canonical shape that can hold an ordered chain
+        // (leaf-first) in a single field.
+        //
+        // We emit `None` (i.e. omit the field entirely under
+        // `skip_serializing_if = "Option::is_none"`) when the in-memory
+        // chain is absent. We do NOT emit an empty chain object: a
+        // bundle with `x509CertificateChain.certificates: []` would
+        // pass schema validation but be useless to a verifier, so
+        // signaling absence at the field level is honest.
+        let x509_certificate_chain =
             self.verification_material
                 .certificate
                 .as_ref()
-                .map(|cert| CertificateWire {
+                .map(|cert| X509CertificateChainWire {
                     certificates: cert
                         .certificates
                         .iter()
@@ -351,7 +414,8 @@ impl Bundle {
         let wire = BundleWire {
             media_type: self.media_type.clone(),
             verification_material: VerificationMaterialWire {
-                certificate,
+                x509_certificate_chain,
+                certificate: None,
                 tlog_entries,
                 timestamp_verification_data: self
                     .verification_material
@@ -498,10 +562,27 @@ struct BundleWire {
 
 #[derive(Deserialize, Serialize)]
 struct VerificationMaterialWire {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    certificate: Option<CertificateWire>,
+    /// Canonical chain shape — protobuf-JSON encoding of
+    /// `X509CertificateChain`. This is what `encode_json` emits.
+    #[serde(
+        rename = "x509CertificateChain",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    x509_certificate_chain: Option<X509CertificateChainWire>,
+
+    /// Legacy single-cert shape — protobuf-JSON encoding of
+    /// `X509Certificate`. v0 compat: cosign sign-blob without an
+    /// explicit chain emits this. We never emit it (the field is
+    /// hard-coded to `None` in the encoder). On decode, we lift it
+    /// into a one-element chain. Plan to remove this arm in v0.2.0
+    /// once the wider ecosystem has migrated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    certificate: Option<X509CertificateWire>,
+
     #[serde(rename = "tlogEntries", default)]
     tlog_entries: Vec<TlogEntryWire>,
+
     #[serde(
         rename = "timestampVerificationData",
         skip_serializing_if = "Option::is_none"
@@ -509,9 +590,20 @@ struct VerificationMaterialWire {
     timestamp_verification_data: Option<serde_json::Value>,
 }
 
+/// Wire shape for `X509CertificateChain` ─ a list of DER-encoded
+/// certs in leaf-first order. Protobuf-JSON name on the wire is
+/// `certificates` (camelCase by convention; lowercase here matches).
 #[derive(Deserialize, Serialize)]
-struct CertificateWire {
+struct X509CertificateChainWire {
     certificates: Vec<RawBytesWire>,
+}
+
+/// Wire shape for `X509Certificate` ─ a single DER cert. Protobuf
+/// field name is `raw_bytes`; protobuf-JSON converts to `rawBytes`.
+#[derive(Deserialize, Serialize)]
+struct X509CertificateWire {
+    #[serde(rename = "rawBytes")]
+    raw_bytes: String,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -614,6 +706,13 @@ pub enum BundleDecodeError {
 
     #[error("certificate base64 decode: {detail}")]
     CertificateBase64 { detail: String },
+
+    #[error(
+        "verificationMaterial has BOTH x509CertificateChain AND certificate set; \
+         per protobuf-specs sigstore_bundle.proto these are arms of a oneof, \
+         exactly one must be set"
+    )]
+    BothCertificateShapesSet,
 
     #[error("messageSignature.signature base64 decode: {detail}")]
     MessageSignatureBase64 { detail: String },
@@ -915,5 +1014,275 @@ mod tests {
             .verification_material
             .timestamp_verification_data
             .is_none());
+    }
+
+    /// Load-bearing pin (issue #31): `encode_json` MUST emit the cert
+    /// material at `verificationMaterial.x509CertificateChain` with a
+    /// `certificates` list of `{"rawBytes": "..."}` objects, and MUST
+    /// NOT emit the legacy single-cert `verificationMaterial.certificate`
+    /// shape.
+    ///
+    /// Bug it catches: a future serde refactor that flips the field
+    /// name back (e.g. someone renames the `x509_certificate_chain`
+    /// wire field to `certificate` thinking it's just camelCasing)
+    /// silently breaks every downstream cosign / sigstore-rs verifier
+    /// that pattern-matches the protobuf-JSON oneof arm by name. A
+    /// round-trip test does NOT catch this — we'd round-trip our own
+    /// bad shape just fine. The wire-key assertion is the only thing
+    /// that pins the externally-observable JSON contract.
+    #[test]
+    fn test_encode_json_emits_canonical_certificate_shape() {
+        let bundle = fixture_dsse_bundle();
+        let bytes = bundle.encode_json().expect("encode");
+        let s = std::str::from_utf8(&bytes).expect("utf8");
+
+        // Canonical chain key MUST be present.
+        assert!(
+            s.contains(r#""x509CertificateChain":{"certificates":[{"rawBytes":""#),
+            "expected x509CertificateChain.certificates[].rawBytes shape, got: {s}"
+        );
+
+        // Legacy single-cert key MUST NOT be present. We're strict:
+        // the substring `"certificate":` (with no `Chain` suffix)
+        // would only appear if the encoder regressed to the legacy
+        // arm. Other places the word `certificate` appears in the
+        // wire (e.g. `x509CertificateChain`) include a different
+        // suffix or are unrelated.
+        assert!(
+            !s.contains(r#""certificate":"#),
+            "encoder must not emit the legacy `certificate` arm; got: {s}"
+        );
+
+        // Schema sanity: `verificationMaterial` exists at top level.
+        assert!(
+            s.contains(r#""verificationMaterial":{"#),
+            "expected verificationMaterial wrapper, got: {s}"
+        );
+    }
+
+    /// Round-trip via the canonical shape: encode → decode preserves
+    /// the chain.
+    ///
+    /// Bug it catches: a decoder that only handled the legacy
+    /// `certificate` arm (and silently dropped the
+    /// `x509CertificateChain` arm to `None`) would let our own
+    /// encoded bundles fail to round-trip — the chain would survive
+    /// encode but vanish on decode.
+    #[test]
+    fn test_decode_json_accepts_canonical_certificate_shape() {
+        let original = fixture_dsse_bundle();
+        let bytes = original.encode_json().expect("encode");
+        let decoded = Bundle::decode_json(&bytes).expect("decode");
+
+        let cert = decoded
+            .verification_material
+            .certificate
+            .expect("chain present");
+        assert_eq!(cert.certificates.len(), 2);
+        assert_eq!(
+            cert.certificates[0],
+            vec![0x30, 0x82, 0x01, 0x00, 0xDE, 0xAD]
+        );
+        assert_eq!(
+            cert.certificates[1],
+            vec![0x30, 0x82, 0x02, 0x00, 0xBE, 0xEF]
+        );
+    }
+
+    /// Hand-crafted JSON in the legacy `certificate.rawBytes`
+    /// (singular `X509Certificate`) shape decodes successfully and
+    /// the cert bytes come through verbatim.
+    ///
+    /// Bug it catches: a decoder that hard-rejected the legacy arm
+    /// would break compat with cosign 2.x sign-blob output (which
+    /// only ships the leaf cert, encoded as the singular
+    /// `X509Certificate` oneof arm). The legacy arm is a v0 compat
+    /// layer; this test pins that we DO accept it during the
+    /// migration window. The legacy single cert is lifted into a
+    /// one-element chain so downstream verification code stays
+    /// chain-shaped.
+    ///
+    /// `inputBytes` for `rawBytes` is `0x30, 0x82, 0x01, 0x00, 0xCA, 0xFE`
+    /// base64-encoded as `MIIBAMr+`.
+    #[test]
+    fn test_decode_json_accepts_legacy_x509certificatechain_shape_with_warning() {
+        // NB: the test name historically refers to the cosign-legacy
+        // arm; in protobuf-specs terms this is the singular
+        // `X509Certificate` (`certificate.rawBytes`) arm. The test
+        // covers BOTH shapes a producer might use — first the
+        // x509CertificateChain wrapper using the legacy field name,
+        // then the singular cosign sign-blob shape.
+        let chain_legacy = br#"{
+            "mediaType": "application/vnd.dev.sigstore.bundle+json;version=0.3",
+            "verificationMaterial": {
+                "x509CertificateChain": {
+                    "certificates": [
+                        { "rawBytes": "MIIBAN6t" },
+                        { "rawBytes": "MIICAL7v" }
+                    ]
+                },
+                "tlogEntries": []
+            },
+            "messageSignature": {
+                "messageDigest": {
+                    "algorithm": "SHA2_256",
+                    "digest": "ESERESERESERESERESERESERESERESERESERESERESERESEREQ=="
+                },
+                "signature": "MEUCIQ=="
+            }
+        }"#;
+        let decoded = Bundle::decode_json(chain_legacy).expect("decode legacy chain");
+        let cert = decoded
+            .verification_material
+            .certificate
+            .expect("chain decoded");
+        assert_eq!(cert.certificates.len(), 2);
+        assert_eq!(
+            cert.certificates[0],
+            vec![0x30, 0x82, 0x01, 0x00, 0xDE, 0xAD]
+        );
+        assert_eq!(
+            cert.certificates[1],
+            vec![0x30, 0x82, 0x02, 0x00, 0xBE, 0xEF]
+        );
+
+        // Cosign sign-blob singular shape — `certificate.rawBytes`
+        // (X509Certificate oneof arm). The single DER is lifted into
+        // a one-element Vec so the in-memory `Certificate` model is
+        // consistent.
+        let single_legacy = br#"{
+            "mediaType": "application/vnd.dev.sigstore.bundle+json;version=0.3",
+            "verificationMaterial": {
+                "certificate": { "rawBytes": "MIIBAMr+" },
+                "tlogEntries": []
+            },
+            "messageSignature": {
+                "messageDigest": {
+                    "algorithm": "SHA2_256",
+                    "digest": "ESERESERESERESERESERESERESERESERESERESERESERESEREQ=="
+                },
+                "signature": "MEUCIQ=="
+            }
+        }"#;
+        let decoded = Bundle::decode_json(single_legacy).expect("decode single legacy");
+        let cert = decoded
+            .verification_material
+            .certificate
+            .expect("single cert lifted to chain");
+        assert_eq!(cert.certificates.len(), 1);
+        assert_eq!(
+            cert.certificates[0],
+            vec![0x30, 0x82, 0x01, 0x00, 0xCA, 0xFE]
+        );
+    }
+
+    /// A bundle that populates BOTH `x509CertificateChain` AND
+    /// `certificate` arms is rejected with a typed error — the
+    /// protobuf `oneof` requires exactly one to be set, and a
+    /// permissive decoder would let a malicious producer ship
+    /// inconsistent material that two different verifiers
+    /// interpret differently.
+    ///
+    /// Bug it catches: a decoder that "preferred" one arm and
+    /// silently ignored the other would create a verifier-confusion
+    /// surface across the Sigstore ecosystem.
+    #[test]
+    fn test_decode_rejects_both_certificate_shapes_set() {
+        let json = br#"{
+            "mediaType": "application/vnd.dev.sigstore.bundle+json;version=0.3",
+            "verificationMaterial": {
+                "x509CertificateChain": {
+                    "certificates": [{ "rawBytes": "MIIBAN6t" }]
+                },
+                "certificate": { "rawBytes": "MIIBAMr+" },
+                "tlogEntries": []
+            },
+            "messageSignature": {
+                "messageDigest": {
+                    "algorithm": "SHA2_256",
+                    "digest": "ESERESERESERESERESERESERESERESERESERESERESERESEREQ=="
+                },
+                "signature": "MEUCIQ=="
+            }
+        }"#;
+        let err = Bundle::decode_json(json).expect_err("must reject both arms");
+        assert!(
+            matches!(err, BundleDecodeError::BothCertificateShapesSet),
+            "expected BothCertificateShapesSet, got {err:?}"
+        );
+    }
+
+    /// Encode → decode → re-encode is byte-stable. This is a
+    /// stronger invariant than the existing struct-level round-trip:
+    /// it pins that the JSON form is canonical (no re-ordering of
+    /// keys, no extraneous whitespace, no float drift on numeric
+    /// fields).
+    ///
+    /// Bug it catches: a serde refactor that swapped to a HashMap-
+    /// backed wire shape would scramble field order on each encode,
+    /// breaking attestation hashes that some consumers compute over
+    /// the bundle bytes.
+    #[test]
+    fn test_decode_json_round_trip_preserves_chain_bytes() {
+        let original = fixture_dsse_bundle();
+        let first_bytes = original.encode_json().expect("encode 1");
+        let decoded = Bundle::decode_json(&first_bytes).expect("decode");
+        let second_bytes = decoded.encode_json().expect("encode 2");
+        assert_eq!(
+            first_bytes, second_bytes,
+            "encode → decode → re-encode must be byte-stable"
+        );
+
+        // And the chain bytes specifically must come through
+        // verbatim — no normalisation, no re-ordering.
+        let cert = decoded
+            .verification_material
+            .certificate
+            .expect("chain decoded");
+        assert_eq!(cert.certificates.len(), 2);
+        assert_eq!(
+            cert.certificates[0],
+            vec![0x30, 0x82, 0x01, 0x00, 0xDE, 0xAD]
+        );
+        assert_eq!(
+            cert.certificates[1],
+            vec![0x30, 0x82, 0x02, 0x00, 0xBE, 0xEF]
+        );
+    }
+
+    /// A bundle whose in-memory `verification_material.certificate`
+    /// is `None` MUST emit JSON with NEITHER the
+    /// `x509CertificateChain` nor the legacy `certificate` field
+    /// present. The `Option`-typed wire field is the source of truth
+    /// for "no chain attached".
+    ///
+    /// Bug it catches: a wire shape that emitted
+    /// `"x509CertificateChain":{"certificates":[]}` (an empty
+    /// wrapper) would pass schema validation but be semantically
+    /// "we have a chain — it's empty", which is meaningfully
+    /// different from "no chain at all". Verifiers reading the
+    /// bundle to decide whether to do PKI vs raw-key validation
+    /// branch on field presence; an empty-but-present chain misroutes
+    /// them.
+    #[test]
+    fn test_encode_json_with_empty_chain_emits_no_certificate_field() {
+        let bundle = fixture_message_signature_bundle();
+        // Sanity: the fixture has no chain.
+        assert!(bundle.verification_material.certificate.is_none());
+
+        let bytes = bundle.encode_json().expect("encode");
+        let s = std::str::from_utf8(&bytes).expect("utf8");
+
+        assert!(
+            !s.contains("x509CertificateChain"),
+            "expected x509CertificateChain field absent for None chain, got: {s}"
+        );
+        // `"certificate":` would be the legacy arm, which we never
+        // emit; this is belt-and-suspenders against a future bug that
+        // wires up the legacy arm by mistake.
+        assert!(
+            !s.contains(r#""certificate":"#),
+            "legacy certificate arm must never be emitted, got: {s}"
+        );
     }
 }
