@@ -5,7 +5,13 @@
 //!
 //! * RFC 6962 Merkle inclusion-proof verification (`merkle::verify_inclusion`).
 //! * `hashedrekord` v0.0.1 entry types (`entry::HashedRekord`) with
-//!   JSON encode/decode.
+//!   JSON encode/decode — the schema for `MessageSignature`-content
+//!   bundles (cosign `sign-blob` shape).
+//! * `dsse` v0.0.1 entry type (`entry::DsseRekord`) with JSON encode
+//!   — the schema for `DsseEnvelope`-content bundles (cosign `attest`
+//!   / DSSE-keyless shape). Schemas mismatch is load-bearing: the
+//!   two schemas verify signatures over different bytes (payload
+//!   hash vs DSSE PAE) and must be dispatched per bundle content.
 //! * A `RekorClient` trait + two impls: `MockRekorClient` (canned
 //!   single-leaf log; deterministic; no I/O) and `HttpRekorClient`
 //!   (blocking `reqwest`-backed; talks to a real Rekor server such
@@ -25,7 +31,7 @@ pub mod merkle;
 pub mod async_client;
 
 pub use client::{decode_log_entry_bytes, HttpRekorClient, LogEntry, MockRekorClient, RekorClient};
-pub use entry::{Data, HashedRekord, HashedRekordHash, PublicKey, Signature};
+pub use entry::{Data, DsseRekord, HashedRekord, HashedRekordHash, PublicKey, Signature};
 pub use merkle::{verify_inclusion, EMPTY_TREE_ROOT, INTERNAL_NODE_PREFIX, LEAF_NODE_PREFIX};
 
 #[cfg(feature = "async")]
@@ -134,6 +140,27 @@ pub enum RekorError {
     /// retry will probably not help.
     #[error("rekor response decode: {0}")]
     Decode(serde_json::Error),
+
+    /// The active [`RekorClient`] (or [`crate::AsyncRekorClient`])
+    /// implementation does not support the requested operation —
+    /// surfaced when a caller invokes `submit_dsse` on an external
+    /// trait impl that hasn't overridden the default.
+    ///
+    /// Default-impl-only construction site: keeps the trait surface
+    /// extensible (issue #39 added `submit_dsse`) without breaking
+    /// every external implementor that only knew `submit`. The
+    /// in-tree clients ([`crate::HttpRekorClient`], the async
+    /// counterpart, and [`crate::MockRekorClient`]) all override
+    /// the default — so callers who pick a justsign client never
+    /// see this. External impls discover the gap via the typed
+    /// variant, not a panic.
+    #[error("rekor client does not support operation: {operation}")]
+    Unsupported {
+        /// The operation that was unsupported. Free-form so we
+        /// don't have to enumerate every method on the trait — the
+        /// string is diagnostic only and shows up in error logs.
+        operation: &'static str,
+    },
 }
 
 /// Lower-case hex of a 32-byte digest. Used by `RekorError`'s

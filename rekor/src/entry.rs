@@ -1,7 +1,24 @@
-//! Rekor `hashedrekord` v0.0.1 entry shape.
+//! Rekor entry types.
+//!
+//! Two schemas are supported here:
+//!
+//! * [`HashedRekord`] — `hashedrekord` v0.0.1. The schema for
+//!   `MessageSignature`-content bundles (cosign `sign-blob` shape):
+//!   the signature is verified against `SHA-256(payload)`.
+//! * [`DsseRekord`]  — `dsse` v0.0.1. The schema for
+//!   `DsseEnvelope`-content bundles (cosign `attest` / DSSE shape):
+//!   the signature is verified against the DSSE PAE bytes
+//!   (`DSSEv1 SP <type-len> SP <type> SP <payload-len> SP <payload>`),
+//!   not the payload hash. Schemas mismatch is the load-bearing
+//!   reason both types exist — submitting a DSSE bundle's signature
+//!   to the hashedrekord schema fails Rekor's signature
+//!   verification with `invalid signature when validating ASN.1
+//!   encoded signature`.
+//!
+//! ## `hashedrekord` body shape
 //!
 //! This is the JSON Rekor accepts at `POST /api/v1/log/entries` and
-//! returns inside `LogEntry.body` (base64-encoded). The shape:
+//! returns inside `LogEntry.body` (base64-encoded):
 //!
 //! ```json
 //! {
@@ -14,6 +31,27 @@
 //!   }
 //! }
 //! ```
+//!
+//! ## `dsse` submit shape
+//!
+//! ```json
+//! {
+//!   "apiVersion": "0.0.1",
+//!   "kind": "dsse",
+//!   "spec": {
+//!     "proposedContent": {
+//!       "envelope": "<JSON-serialised DSSE envelope as a string>",
+//!       "verifiers": ["<base64-encoded PEM cert(s) or pubkey>"]
+//!     }
+//!   }
+//! }
+//! ```
+//!
+//! Note that `envelope` is the DSSE envelope JSON *as a string*
+//! (not nested JSON) per
+//! `sigstore/rekor/pkg/types/dsse/v0.0.1/dsse_v0_0_1_schema.json`,
+//! and each `verifiers` entry is base64 of the PEM (cert or pubkey)
+//! bytes — also per the schema's `format: "byte"` field convention.
 //!
 //! v0 ships the bare body (no `apiVersion`/`kind` envelope). The
 //! envelope wrapping lives at the submit boundary — added in v0.5
@@ -171,6 +209,100 @@ struct HashWire {
     value: String,
 }
 
+// ──────────────────────────────────────────────────────────────────
+// DSSE rekor entry (sigstore/rekor types/dsse v0.0.1).
+//
+// Producer-side struct. The wire shape Rekor accepts at
+// `POST /api/v1/log/entries` is `{apiVersion: "0.0.1", kind: "dsse",
+// spec: <encode_json output>}`; the envelope wrapping lives at the
+// submit boundary in `client::HttpRekorClient::submit_dsse` so the
+// mock and the HTTP client share this same canonical body.
+// ──────────────────────────────────────────────────────────────────
+
+/// `dsse` v0.0.1 rekor entry.
+///
+/// Used by callers whose bundles are DSSE-shaped (cosign `attest` /
+/// `sign-blob` keyless) — separate from [`HashedRekord`] which is for
+/// `MessageSignature`-shaped bundles (cosign `sign-blob` static-key).
+/// Schemas mismatch is the load-bearing reason: hashedrekord's
+/// signature verification expects `signature == ECDSA(SHA-256(payload))`,
+/// but DSSE signs PAE bytes, not payload bytes. Submitting a DSSE
+/// bundle's signature via the hashedrekord schema fails Rekor's
+/// signature verification with `invalid signature when validating
+/// ASN.1 encoded signature`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DsseRekord {
+    /// JSON-serialised DSSE envelope. Rekor parses this on receipt
+    /// to extract the inner signatures + payload + payload_type.
+    /// Held verbatim here so the producer that built the envelope
+    /// (typically [`crate::HashedRekord`]'s peer construction site
+    /// in `swe_justsign_sign`) can hand the canonical bytes through
+    /// without a re-encode round-trip.
+    pub envelope_bytes: Vec<u8>,
+
+    /// Verifier credentials. Each entry is PEM-encoded — a leaf
+    /// cert (for keyless flows) OR a public key (for static-key
+    /// flows). The producer typically supplies a single leaf cert
+    /// for keyless flows. Rekor verifies each `signature` in the
+    /// envelope against each verifier by computing the DSSE PAE and
+    /// checking the ECDSA signature.
+    ///
+    /// Stored as raw PEM bytes here; [`Self::encode_json`] handles
+    /// the base64 transcoding required by the schema's `format:
+    /// "byte"` field convention.
+    pub verifiers_pem: Vec<Vec<u8>>,
+}
+
+impl DsseRekord {
+    /// Encode to the JSON `spec` body Rekor expects on
+    /// `POST /api/v1/log/entries`.
+    ///
+    /// Wire shape (the `spec` object only — the `apiVersion`/`kind`
+    /// envelope is added at the submit boundary):
+    ///
+    /// ```json
+    /// {
+    ///   "proposedContent": {
+    ///     "envelope": "<DSSE envelope JSON as a STRING>",
+    ///     "verifiers": ["<base64 of PEM bytes>", ...]
+    ///   }
+    /// }
+    /// ```
+    ///
+    /// `envelope` is a JSON string field — NOT nested JSON. Rekor
+    /// parses the string back into JSON on receipt; nesting it as a
+    /// JSON object here would fail schema validation.
+    pub fn encode_json(&self) -> Result<Vec<u8>, RekorError> {
+        use serde::de::Error as _;
+
+        // The envelope must round-trip through UTF-8: Rekor's schema
+        // declares it as `type: "string"`, and serde_json::Value's
+        // String variant requires `Vec<u8>` to be valid UTF-8.
+        // Rejecting non-UTF-8 here surfaces a typed error rather
+        // than silently emitting a malformed string field.
+        let envelope_str = std::str::from_utf8(&self.envelope_bytes).map_err(|e| {
+            RekorError::Json(serde_json::Error::custom(format!(
+                "dsse envelope is not valid UTF-8: {e}"
+            )))
+        })?;
+
+        let verifiers: Vec<String> = self
+            .verifiers_pem
+            .iter()
+            .map(|pem| STANDARD.encode(pem))
+            .collect();
+
+        let body = serde_json::json!({
+            "proposedContent": {
+                "envelope": envelope_str,
+                "verifiers": verifiers,
+            }
+        });
+        let bytes = serde_json::to_vec(&body)?;
+        Ok(bytes)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -276,5 +408,121 @@ mod tests {
         }"#;
         let err = HashedRekord::decode_json(json).unwrap_err();
         assert!(matches!(err, RekorError::Json(_)));
+    }
+
+    // ── DsseRekord encoder tests ──────────────────────────────────
+
+    /// Pin the canonical wire shape for `DsseRekord::encode_json`.
+    /// The `proposedContent.envelope` field MUST be a JSON string
+    /// (the DSSE envelope's JSON serialised as a string), and
+    /// `proposedContent.verifiers` MUST be an array of base64-
+    /// encoded PEM strings — per
+    /// `sigstore/rekor/pkg/types/dsse/v0.0.1/dsse_v0_0_1_schema.json`.
+    ///
+    /// Bug it catches: a refactor that flips the field naming (e.g.
+    /// `proposedContent.payload` instead of `proposedContent.envelope`,
+    /// or `keys` instead of `verifiers`) silently breaks every Rekor
+    /// submission because production Rekor enforces this schema and
+    /// rejects unknown fields. Equally — a refactor that nests the
+    /// envelope as a JSON object instead of a string would also be
+    /// rejected by Rekor's schema validation.
+    #[test]
+    fn test_dsse_rekord_encode_json_emits_canonical_shape() {
+        let envelope_json =
+            br#"{"payloadType":"text/plain","payload":"aGVsbG8=","signatures":[{"sig":"AAA="}]}"#;
+        let pem = b"-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n";
+
+        let entry = DsseRekord {
+            envelope_bytes: envelope_json.to_vec(),
+            verifiers_pem: vec![pem.to_vec()],
+        };
+
+        let body = entry.encode_json().expect("encode");
+        let parsed: serde_json::Value = serde_json::from_slice(&body).expect("valid JSON");
+
+        // Top-level object has exactly `proposedContent` (writeOnly
+        // submit shape per the schema).
+        let pc = parsed
+            .get("proposedContent")
+            .expect("proposedContent must be present");
+
+        // `envelope` is a JSON STRING field — NOT a nested JSON
+        // object. Pin both: the type AND the exact byte sequence
+        // (we round-trip through std::str::from_utf8 so the bytes
+        // are preserved verbatim).
+        let env_value = pc.get("envelope").expect("envelope field present");
+        let env_str = env_value
+            .as_str()
+            .expect("envelope must be a JSON string, not nested JSON");
+        assert_eq!(env_str.as_bytes(), envelope_json);
+
+        // `verifiers` is an array of base64-encoded PEM strings.
+        // Pin the base64 contents — the schema's `format: "byte"`
+        // requires base64-of-the-PEM, NOT raw PEM, NOT base64-of-DER.
+        let verifiers = pc
+            .get("verifiers")
+            .and_then(|v| v.as_array())
+            .expect("verifiers must be an array");
+        assert_eq!(verifiers.len(), 1);
+        let v0 = verifiers[0].as_str().expect("verifier must be a string");
+        let decoded = STANDARD.decode(v0).expect("verifier must be base64");
+        assert_eq!(decoded, pem);
+
+        // No stray fields in proposedContent — the writeOnly schema
+        // requires exactly { envelope, verifiers }; an extra field
+        // is a regression that would surface as "additionalProperties
+        // not allowed" from Rekor's strict schema validation.
+        let pc_obj = pc.as_object().expect("proposedContent is an object");
+        assert_eq!(
+            pc_obj.len(),
+            2,
+            "proposedContent must have exactly envelope+verifiers, got {pc_obj:?}",
+        );
+    }
+
+    /// `DsseRekord::encode_json` accepts multiple verifiers and
+    /// preserves their order — Rekor's schema specifies an array,
+    /// not a set, and order-sensitive callers (those producing
+    /// envelopes signed by multiple keys) need stable ordering.
+    ///
+    /// Bug it catches: an encoder that deduplicates or sorts
+    /// verifiers would silently drop or reorder the producer's
+    /// supplied list, breaking multi-signature DSSE flows.
+    #[test]
+    fn test_dsse_rekord_encode_json_preserves_verifier_order() {
+        let entry = DsseRekord {
+            envelope_bytes: br#"{"payloadType":"x","payload":"","signatures":[]}"#.to_vec(),
+            verifiers_pem: vec![b"first-pem".to_vec(), b"second-pem".to_vec()],
+        };
+        let body = entry.encode_json().expect("encode");
+        let parsed: serde_json::Value = serde_json::from_slice(&body).expect("valid JSON");
+        let verifiers = parsed["proposedContent"]["verifiers"]
+            .as_array()
+            .expect("verifiers array");
+        let v0 = STANDARD.decode(verifiers[0].as_str().unwrap()).unwrap();
+        let v1 = STANDARD.decode(verifiers[1].as_str().unwrap()).unwrap();
+        assert_eq!(v0, b"first-pem");
+        assert_eq!(v1, b"second-pem");
+    }
+
+    /// Non-UTF-8 envelope bytes surface a typed `RekorError::Json`
+    /// rather than silently emitting a malformed JSON-string field.
+    /// The schema declares `envelope` as `type: "string"`, and
+    /// serde_json::Value::String requires UTF-8.
+    ///
+    /// Bug it catches: an encoder that called
+    /// `String::from_utf8_lossy` would silently corrupt envelope
+    /// bytes containing non-UTF-8 sequences (which, in practice,
+    /// shouldn't happen — DSSE envelopes are JSON, hence UTF-8 — but
+    /// a producer-side bug or a fuzzer could supply invalid input).
+    #[test]
+    fn test_dsse_rekord_encode_json_rejects_non_utf8_envelope_with_typed_error() {
+        let entry = DsseRekord {
+            // 0xFF is invalid UTF-8 in any position.
+            envelope_bytes: vec![0xFF, 0xFE, 0xFD],
+            verifiers_pem: vec![b"pem".to_vec()],
+        };
+        let err = entry.encode_json().expect_err("must reject non-UTF-8");
+        assert!(matches!(err, RekorError::Json(_)), "got {err:?}");
     }
 }

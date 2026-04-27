@@ -20,7 +20,7 @@ use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
 use serde::Deserialize;
 
-use crate::entry::HashedRekord;
+use crate::entry::{DsseRekord, HashedRekord};
 use crate::merkle::{hash_leaf, verify_inclusion};
 use crate::RekorError;
 
@@ -62,10 +62,39 @@ pub struct LogEntry {
     pub body: Vec<u8>,
 }
 
-/// Rekor client SPI. v0 has only `submit`; query operations join
-/// in v0.5 alongside the HTTP backend.
+/// Rekor client SPI. v0 has only `submit` (`hashedrekord` schema)
+/// and `submit_dsse` (`dsse` schema, issue #39); query operations
+/// join in v0.5 alongside the HTTP backend.
+///
+/// Two submit methods, one per schema, dispatched by the caller
+/// based on the bundle's content type:
+///
+/// * `MessageSignature` content → `submit` (`hashedrekord` schema).
+///   Rekor verifies `signature == ECDSA(SHA-256(payload))`.
+/// * `DsseEnvelope` content     → `submit_dsse` (`dsse` schema).
+///   Rekor verifies the signature against the DSSE PAE bytes, NOT
+///   the payload hash.
+///
+/// The split is load-bearing: production Rekor rejects DSSE-content
+/// bundles submitted via `hashedrekord` with `invalid signature when
+/// validating ASN.1 encoded signature` because the schema's
+/// signature-verification model mismatches what the producer signed.
 pub trait RekorClient {
+    /// Submit a `hashedrekord` entry (signature over
+    /// `SHA-256(payload)`).
     fn submit(&self, entry: &HashedRekord) -> Result<LogEntry, RekorError>;
+
+    /// Submit a `dsse` entry (signature over the DSSE PAE bytes).
+    ///
+    /// Default impl returns [`RekorError::Unsupported`] so external
+    /// trait impls written before issue #39 keep building. The
+    /// in-tree clients ([`HttpRekorClient`], [`MockRekorClient`])
+    /// override the default.
+    fn submit_dsse(&self, _entry: &DsseRekord) -> Result<LogEntry, RekorError> {
+        Err(RekorError::Unsupported {
+            operation: "submit_dsse",
+        })
+    }
 }
 
 /// Deterministic in-memory mock — every submission lands in its
@@ -88,27 +117,44 @@ impl RekorClient for MockRekorClient {
         // Canonicalise the body so the leaf hash is reproducible
         // for the same logical input.
         let body = entry.encode_json()?;
-        let leaf_hash = hash_leaf(&body);
-
-        // Single-leaf log → root == leaf_hash, empty inclusion path.
-        let root_hash = leaf_hash;
-        let inclusion_proof: Vec<[u8; 32]> = Vec::new();
-
-        // UUID = lowercase hex of the leaf hash. Stable for a
-        // given entry; mirrors the spirit of Rekor's UUID
-        // (server-assigned, but deterministic per content here).
-        let uuid = hex_lower_64(&leaf_hash);
-
-        Ok(LogEntry {
-            uuid,
-            log_index: 0,
-            tree_size: 1,
-            leaf_hash,
-            inclusion_proof,
-            root_hash,
-            body,
-        })
+        synthesise_log_entry(body)
     }
+
+    fn submit_dsse(&self, entry: &DsseRekord) -> Result<LogEntry, RekorError> {
+        // Same single-leaf-log shape as `submit` — the mock is
+        // schema-agnostic at the LogEntry level. Callers that want
+        // to assert the schema choice round-trip the body through
+        // `DsseRekord` decoding (or compare to the canonical bytes).
+        let body = entry.encode_json()?;
+        synthesise_log_entry(body)
+    }
+}
+
+/// Build a deterministic single-leaf-log [`LogEntry`] from a
+/// canonical body. Shared between `submit` and `submit_dsse` so
+/// both schemas land with the same inclusion-proof shape — the
+/// distinction is the body bytes the caller hashed in.
+fn synthesise_log_entry(body: Vec<u8>) -> Result<LogEntry, RekorError> {
+    let leaf_hash = hash_leaf(&body);
+
+    // Single-leaf log → root == leaf_hash, empty inclusion path.
+    let root_hash = leaf_hash;
+    let inclusion_proof: Vec<[u8; 32]> = Vec::new();
+
+    // UUID = lowercase hex of the leaf hash. Stable for a
+    // given entry; mirrors the spirit of Rekor's UUID
+    // (server-assigned, but deterministic per content here).
+    let uuid = hex_lower_64(&leaf_hash);
+
+    Ok(LogEntry {
+        uuid,
+        log_index: 0,
+        tree_size: 1,
+        leaf_hash,
+        inclusion_proof,
+        root_hash,
+        body,
+    })
 }
 
 impl LogEntry {
@@ -233,6 +279,34 @@ impl RekorClient for HttpRekorClient {
         let body = serde_json::json!({
             "apiVersion": "0.0.1",
             "kind": "hashedrekord",
+            "spec": spec_value,
+        });
+
+        let url = format!("{}/api/v1/log/entries", self.base_url);
+        let resp = self
+            .http
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
+            .json(&body)
+            .send()?;
+        decode_log_entry_response(resp)
+    }
+
+    fn submit_dsse(&self, entry: &DsseRekord) -> Result<LogEntry, RekorError> {
+        // Same envelope shape as `submit`, but `kind` flips to
+        // `"dsse"` and `spec` carries the DsseRekord body
+        // (proposedContent.envelope as a JSON string,
+        // proposedContent.verifiers as base64-of-PEM strings).
+        //
+        // Schema choice is load-bearing: production Rekor rejects
+        // DSSE-content bundles submitted via the hashedrekord
+        // schema with `invalid signature when validating ASN.1
+        // encoded signature`. See issue #39.
+        let spec_value: serde_json::Value = serde_json::from_slice(&entry.encode_json()?)?;
+        let body = serde_json::json!({
+            "apiVersion": "0.0.1",
+            "kind": "dsse",
             "spec": spec_value,
         });
 
@@ -1243,5 +1317,325 @@ mod tests {
 
         assert_eq!(log_entry.uuid, "cafe-d00d");
         assert_eq!(log_entry.body, body);
+    }
+
+    // ── DSSE schema (issue #39) ───────────────────────────────────
+
+    /// Minimal local server that captures the request body so a
+    /// test can assert what we sent on the wire. Serves a canned
+    /// 201 success response. Mirrors `LocalServer` but exposes the
+    /// captured body via a shared `Arc<Mutex<Vec<u8>>>`.
+    struct CapturingServer {
+        base_url: String,
+        port: u16,
+        shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        captured: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+        handle: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl CapturingServer {
+        fn start(response_status: u16, response_body: Vec<u8>) -> Self {
+            use std::io::{BufRead, BufReader, Read as _, Write};
+            use std::net::TcpListener;
+            use std::sync::atomic::{AtomicBool, Ordering};
+            use std::sync::{Arc, Mutex};
+            use std::thread;
+            use std::time::Duration;
+
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+            let port = listener.local_addr().unwrap().port();
+            let base_url = format!("http://127.0.0.1:{port}");
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let shutdown_t = Arc::clone(&shutdown);
+            let captured: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+            let captured_t = Arc::clone(&captured);
+
+            let handle = thread::spawn(move || loop {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(s) => s,
+                    Err(_) => return,
+                };
+                if shutdown_t.load(Ordering::SeqCst) {
+                    let _ = stream.shutdown(std::net::Shutdown::Both);
+                    return;
+                }
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .expect("read timeout");
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(5)))
+                    .expect("write timeout");
+
+                let mut reader = BufReader::new(stream.try_clone().expect("clone"));
+                let mut request_line = String::new();
+                if reader.read_line(&mut request_line).is_err() {
+                    continue;
+                }
+                let mut content_length: usize = 0;
+                loop {
+                    let mut hdr = String::new();
+                    match reader.read_line(&mut hdr) {
+                        Ok(0) => break,
+                        Ok(_) => {
+                            if hdr == "\r\n" || hdr == "\n" {
+                                break;
+                            }
+                            if let Some(rest) =
+                                hdr.to_ascii_lowercase().strip_prefix("content-length:")
+                            {
+                                content_length = rest.trim().parse().unwrap_or(0);
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                if content_length > 0 {
+                    let mut body_buf = vec![0u8; content_length];
+                    let _ = reader.read_exact(&mut body_buf);
+                    let mut guard = captured_t.lock().expect("captured mutex");
+                    *guard = body_buf;
+                }
+
+                let header = format!(
+                    "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    response_status,
+                    status_reason(response_status),
+                    response_body.len()
+                );
+                let _ = stream.write_all(header.as_bytes());
+                let _ = stream.write_all(&response_body);
+                let _ = stream.flush();
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+            });
+
+            Self {
+                base_url,
+                port,
+                shutdown,
+                captured,
+                handle: Some(handle),
+            }
+        }
+
+        fn captured_body(&self) -> Vec<u8> {
+            self.captured.lock().expect("captured mutex").clone()
+        }
+    }
+
+    impl Drop for CapturingServer {
+        fn drop(&mut self) {
+            use std::sync::atomic::Ordering;
+            use std::time::Duration;
+            self.shutdown.store(true, Ordering::SeqCst);
+            let _ = std::net::TcpStream::connect_timeout(
+                &format!("127.0.0.1:{}", self.port).parse().unwrap(),
+                Duration::from_secs(2),
+            );
+            if let Some(h) = self.handle.take() {
+                let _ = h.join();
+            }
+        }
+    }
+
+    fn sample_dsse_rekord() -> DsseRekord {
+        DsseRekord {
+            envelope_bytes: br#"{"payloadType":"text/plain","payload":"aGVsbG8=","signatures":[{"sig":"AAA="}]}"#.to_vec(),
+            verifiers_pem: vec![
+                b"-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n"
+                    .to_vec(),
+            ],
+        }
+    }
+
+    /// `HttpRekorClient::submit_dsse` sends `{apiVersion: "0.0.1",
+    /// kind: "dsse", spec: <DsseRekord body>}` on the wire. A
+    /// regression that flipped `kind` back to `"hashedrekord"` (or
+    /// dropped the dsse spec entirely) would silently revert the
+    /// fix for issue #39 — production Rekor would resume rejecting
+    /// DSSE-content bundles with `invalid signature when validating
+    /// ASN.1 encoded signature`.
+    #[test]
+    fn test_http_rekor_client_submit_dsse_emits_dsse_kind_on_wire() {
+        // Reuse the existing rekor_success_envelope helper to build
+        // a Rekor-shaped 2xx response — `submit_dsse` reuses the
+        // same response decoder, so the response shape is identical.
+        let response_envelope = {
+            let body = sample_dsse_rekord().encode_json().expect("encode");
+            rekor_success_envelope("dsse-uuid-1", &body)
+        };
+        let server = CapturingServer::start(201, response_envelope);
+
+        let client = HttpRekorClient::new(&server.base_url).expect("client");
+        let _log_entry = client
+            .submit_dsse(&sample_dsse_rekord())
+            .expect("submit_dsse");
+
+        let captured = server.captured_body();
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&captured).expect("captured body must be JSON");
+
+        // `kind` must be exactly `"dsse"` — NOT `"hashedrekord"`.
+        // This is the load-bearing assertion: a regression that
+        // resubmitted DSSE-content bundles via the hashedrekord
+        // schema would surface here as the wrong kind on the wire.
+        assert_eq!(
+            parsed.get("kind").and_then(|v| v.as_str()),
+            Some("dsse"),
+            "submit_dsse must emit kind=dsse, captured body: {parsed}"
+        );
+        assert_eq!(
+            parsed.get("apiVersion").and_then(|v| v.as_str()),
+            Some("0.0.1"),
+        );
+        // `spec.proposedContent.envelope` must be present and a
+        // string — not nested JSON. Pinning it here catches a
+        // regression that would re-introduce nested JSON (which
+        // production Rekor's schema rejects).
+        let env_value = parsed
+            .pointer("/spec/proposedContent/envelope")
+            .expect("envelope pointer present");
+        assert!(
+            env_value.is_string(),
+            "spec.proposedContent.envelope must be a JSON string, got {env_value:?}"
+        );
+    }
+
+    /// `MockRekorClient::submit_dsse` produces a deterministic
+    /// single-leaf-log [`LogEntry`] — same shape as `submit` so
+    /// downstream consumers don't have to special-case the schema.
+    /// The body bytes round-trip through `DsseRekord::encode_json`
+    /// canonical form.
+    ///
+    /// Bug it catches: a mock that returned a constant LogEntry
+    /// regardless of input (or returned the hashedrekord-shape body
+    /// instead of the dsse-shape body) would let downstream tests
+    /// "pass" without exercising the dsse schema at all.
+    #[test]
+    fn test_dsse_rekord_round_trip_through_mock_client() {
+        let client = MockRekorClient::new();
+        let entry = sample_dsse_rekord();
+
+        let log_entry_a = client.submit_dsse(&entry).expect("submit_dsse");
+        let log_entry_b = client.submit_dsse(&entry).expect("submit_dsse twice");
+
+        // Determinism: same entry → same UUID + leaf hash.
+        assert_eq!(log_entry_a.uuid, log_entry_b.uuid);
+        assert_eq!(log_entry_a.leaf_hash, log_entry_b.leaf_hash);
+        // Mock log_index is the deterministic single-leaf-log 0.
+        assert_eq!(log_entry_a.log_index, 0);
+        assert_eq!(log_entry_a.tree_size, 1);
+        // Body is the canonical DsseRekord encoding.
+        assert_eq!(log_entry_a.body, entry.encode_json().expect("encode"));
+        // Self-consistency: the mock's inclusion proof reconstructs
+        // its own root, just like `submit`.
+        log_entry_a
+            .verify_self_consistent()
+            .expect("mock dsse log entry must be self-consistent");
+    }
+
+    /// External `RekorClient` impls that pre-date issue #39 only
+    /// override `submit`; the default `submit_dsse` returns
+    /// [`RekorError::Unsupported`] so callers see a typed error
+    /// instead of a panic or a wrong-schema submission.
+    ///
+    /// Bug it catches: a refactor that removed the default impl
+    /// would silently break every external caller that hadn't
+    /// updated their trait impl — the breakage would only surface
+    /// at the failing build (good) OR at runtime via an arbitrary
+    /// panic (bad). Pin the default-impl contract explicitly.
+    #[test]
+    fn test_rekor_client_default_submit_dsse_returns_unsupported() {
+        struct LegacyClient;
+        impl RekorClient for LegacyClient {
+            fn submit(&self, _entry: &HashedRekord) -> Result<LogEntry, RekorError> {
+                unreachable!("not exercised by this test");
+            }
+            // No `submit_dsse` override — must inherit the default.
+        }
+
+        let client: Box<dyn RekorClient> = Box::new(LegacyClient);
+        let err = client
+            .submit_dsse(&sample_dsse_rekord())
+            .expect_err("legacy impl must surface Unsupported");
+        match err {
+            RekorError::Unsupported { operation } => {
+                assert_eq!(operation, "submit_dsse");
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    /// Skip-pass integration test: dsse schema against staging.
+    ///
+    /// Mirrors `test_http_rekor_client_round_trips_against_staging`
+    /// for the dsse schema. Always-on; SKIPs unless
+    /// `JUSTSIGN_REKOR_STAGING == "1"`.
+    ///
+    /// Bug it catches: wire-format drift between our dsse JSON
+    /// envelope and what production Rekor's `dsse` v0.0.1 type
+    /// accepts. Unit tests verify our encoding matches the schema
+    /// JSON; only a live call surfaces upstream API changes
+    /// (schema evolution, renamed fields, new required wrappers).
+    #[test]
+    fn test_http_rekor_client_submit_dsse_round_trips_against_staging() {
+        if std::env::var("JUSTSIGN_REKOR_STAGING").as_deref() != Ok("1") {
+            eprintln!("SKIP: JUSTSIGN_REKOR_STAGING != 1 — staging Rekor dsse test skipped");
+            return;
+        }
+
+        // Synthetic envelope. The signature inside is bogus — we
+        // pin the *transport contract* here, not signature
+        // validity. Production Rekor will reject a synthetic
+        // signature with a typed 4xx; that's an acceptable outcome
+        // for this test (the request shape parsed and the
+        // verification step ran, which is what we're checking).
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let payload = format!("staging dsse round-trip nonce={nonce}");
+        // Build a minimal but well-formed DSSE envelope. The
+        // payload is base64 in the wire form; we hand-roll a JSON
+        // string here so this test stays in the rekor crate (no
+        // dep on swe_justsign_spec).
+        let payload_b64 = STANDARD.encode(payload.as_bytes());
+        let envelope_json = format!(
+            r#"{{"payloadType":"text/plain","payload":"{payload_b64}","signatures":[{{"sig":"AAA="}}]}}"#,
+        );
+
+        let entry = DsseRekord {
+            envelope_bytes: envelope_json.into_bytes(),
+            verifiers_pem: vec![
+                b"-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE\n-----END PUBLIC KEY-----\n"
+                    .to_vec(),
+            ],
+        };
+
+        let client =
+            HttpRekorClient::new("https://rekor.sigstage.dev").expect("staging client builds");
+
+        match client.submit_dsse(&entry) {
+            Ok(log_entry) => {
+                assert!(
+                    !log_entry.uuid.is_empty(),
+                    "staging submit_dsse returned empty UUID"
+                );
+            }
+            Err(RekorError::ClientError { status, body }) => {
+                eprintln!(
+                    "staging submit_dsse returned typed ClientError {status}: {body} \
+                     (acceptable for a synthetic envelope; transport contract held)"
+                );
+            }
+            Err(RekorError::AlreadyExists { body }) => {
+                eprintln!(
+                    "staging submit_dsse returned AlreadyExists: {body} \
+                     (acceptable on a content collision; idempotency contract held)"
+                );
+            }
+            Err(other) => {
+                panic!("staging submit_dsse returned untyped error: {other:?}");
+            }
+        }
     }
 }

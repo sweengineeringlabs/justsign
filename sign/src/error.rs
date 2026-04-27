@@ -9,7 +9,10 @@
 //! on it (retry, drop the bundle, escalate, log).
 
 use rekor::RekorError;
-use spec::{BundleDecodeError, BundleEncodeError, StatementDecodeError, StatementEncodeError};
+use spec::{
+    BundleDecodeError, BundleEncodeError, EnvelopeEncodeError, StatementDecodeError,
+    StatementEncodeError,
+};
 
 /// Failure surface of [`crate::sign_blob`].
 ///
@@ -72,6 +75,15 @@ pub enum SignError {
     /// callers see the same typed error on both sides of the loop.
     #[error("cert chain is empty (keyless signing requires a leaf cert)")]
     EmptyCertChain,
+
+    /// Internal: encoding the DSSE envelope JSON failed while
+    /// building the `dsse` rekor entry. Surfaced (instead of
+    /// being collapsed into [`SignError::BundleEncode`]) because
+    /// envelope-encode and bundle-encode are different
+    /// construction sites: a regression in DSSE serialisation
+    /// shouldn't masquerade as a bundle-shape failure.
+    #[error("dsse envelope encode for rekor: {0}")]
+    EnvelopeEncode(#[from] EnvelopeEncodeError),
 }
 
 /// Failure surface of [`crate::verify_blob`].

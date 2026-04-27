@@ -111,7 +111,7 @@ pub use spec::{CYCLONEDX_BOM_V1_5_PREDICATE_TYPE, SPDX_DOCUMENT_V2_3_PREDICATE_T
 use p256::ecdsa::signature::Verifier as _;
 use p256::ecdsa::Signature as P256Signature;
 
-use rekor::{HashedRekord, HashedRekordHash, LogEntry, PublicKey, RekorClient};
+use rekor::{DsseRekord, HashedRekord, HashedRekordHash, LogEntry, PublicKey, RekorClient};
 use sha2::{Digest, Sha256};
 use spec::{
     Bundle, BundleContent, Certificate as SpecCertificate, Checkpoint, Envelope, HashOutput,
@@ -320,7 +320,7 @@ pub fn sign_blob(
     let tlog_entries = if let Some(client) = rekor {
         let entry = build_hashed_rekord(payload, &sig_bytes, Vec::new());
         let log_entry = client.submit(&entry)?;
-        vec![log_entry_to_tlog_entry(&log_entry)]
+        vec![log_entry_to_tlog_entry(&log_entry, "hashedrekord")]
     } else {
         Vec::new()
     };
@@ -395,10 +395,13 @@ pub fn sign_blob_keyless(
     }
 
     // 2. PAE + sign. Same flow as sign_blob; inlined here so the
-    //    keyless rekor submission can pin the leaf-cert PEM into the
-    //    hashedrekord publicKey field (real Rekor rejects empty
-    //    pubkeys with "invalid public key: failure decoding PEM";
-    //    cosign keyless writes the leaf cert here, and we match).
+    //    keyless rekor submission can dispatch to the dsse schema
+    //    (DSSE-content bundles ALWAYS need the dsse rekor schema —
+    //    submitting them via hashedrekord makes production Rekor
+    //    reject the entry with `invalid signature when validating
+    //    ASN.1 encoded signature` because hashedrekord verifies
+    //    signature against `SHA-256(payload)` while DSSE signs the
+    //    PAE bytes; see issue #39).
     let pae_bytes = spec::pae(payload_type.as_bytes(), payload);
     let sig_bytes = signer
         .sign(&pae_bytes)
@@ -413,17 +416,14 @@ pub fn sign_blob_keyless(
         }],
     };
 
-    // 3. PEM-encode the leaf cert for Rekor's hashedrekord
-    //    publicKey.content. The leaf is at index 0 of the chain;
-    //    DER bytes wrap into a `CERTIFICATE` PEM block.
-    let leaf_pem = pem::encode(&pem::Pem::new("CERTIFICATE", cert_chain_der[0].clone()));
-
-    // 4. Optional Rekor submission, with the leaf cert pinned as the
-    //    publicKey.
+    // 3. Optional Rekor submission via the `dsse` schema. The leaf
+    //    cert (DER, index 0 of the chain) becomes the entry's sole
+    //    `verifier` — Rekor PEM-wraps it on receipt and verifies
+    //    each envelope signature against the recomputed PAE.
     let tlog_entries = if let Some(client) = rekor {
-        let entry = build_hashed_rekord(payload, &sig_bytes, leaf_pem.into_bytes());
-        let log_entry = client.submit(&entry)?;
-        vec![log_entry_to_tlog_entry(&log_entry)]
+        let entry = build_dsse_rekord(&envelope, &cert_chain_der[0])?;
+        let log_entry = client.submit_dsse(&entry)?;
+        vec![log_entry_to_tlog_entry(&log_entry, "dsse")]
     } else {
         Vec::new()
     };
@@ -620,15 +620,43 @@ fn build_hashed_rekord(
     }
 }
 
+/// Build the `dsse` rekor entry for a DSSE envelope + leaf cert.
+///
+/// Used by [`sign_blob_keyless`] (DSSE-content bundles always need
+/// the dsse schema; submitting them via hashedrekord makes
+/// production Rekor reject the entry with `invalid signature when
+/// validating ASN.1 encoded signature` because hashedrekord
+/// verifies `signature == ECDSA(SHA-256(payload))` while DSSE signs
+/// the PAE bytes — see issue #39).
+///
+/// `leaf_der` is the DER-encoded leaf certificate; we PEM-wrap it
+/// here because the dsse schema's `verifiers` field expects PEM
+/// bytes (base64-encoded on the wire by the rekor crate). The
+/// entry that gets logged is `(envelope-as-string, [base64(PEM(leaf))])`.
+fn build_dsse_rekord(envelope: &Envelope, leaf_der: &[u8]) -> Result<DsseRekord, SignError> {
+    let envelope_bytes = envelope.encode_json()?;
+    let leaf_pem = pem::encode(&pem::Pem::new("CERTIFICATE", leaf_der.to_vec()));
+    Ok(DsseRekord {
+        envelope_bytes,
+        verifiers_pem: vec![leaf_pem.into_bytes()],
+    })
+}
+
 /// Translate a `rekor::LogEntry` into the [`spec::TlogEntry`] wire
 /// shape the bundle carries.
+///
+/// `kind` is the rekor schema name (`"hashedrekord"` for
+/// MessageSignature-content bundles, `"dsse"` for DSSE-content
+/// bundles). Verifiers gate on this field — a tlog entry tagged
+/// with the wrong kind would be re-checked under the wrong
+/// signature-verification model and silently fail. See issue #39.
 ///
 /// Type-width drift: the rekor crate uses `u64` for indices /
 /// tree sizes; the spec crate uses `i64` (matching the protobuf
 /// wire shape). Casting through `as i64` is safe for any value
 /// returned by the v0 mock (single-leaf log, log_index = 0,
 /// tree_size = 1).
-fn log_entry_to_tlog_entry(entry: &LogEntry) -> TlogEntry {
+fn log_entry_to_tlog_entry(entry: &LogEntry, kind: &str) -> TlogEntry {
     TlogEntry {
         log_index: entry.log_index as i64,
         log_id: HashOutput {
@@ -638,7 +666,7 @@ fn log_entry_to_tlog_entry(entry: &LogEntry) -> TlogEntry {
             digest: entry.leaf_hash.to_vec(),
         },
         kind_version: KindVersion {
-            kind: "hashedrekord".to_string(),
+            kind: kind.to_string(),
             version: "0.0.1".to_string(),
         },
         // The mock has no integration timestamp; v0.5 will populate
@@ -2713,10 +2741,16 @@ mod tests {
 
         // tlog entry mirrors what `sign_blob` emits — the keyless
         // path adds a chain on top of, not instead of, transparency.
+        // Schema is `dsse` (NOT hashedrekord): DSSE-content bundles
+        // ALWAYS use the dsse rekor schema; submitting them via
+        // hashedrekord makes production Rekor reject the entry with
+        // `invalid signature when validating ASN.1 encoded signature`
+        // because hashedrekord verifies `signature == ECDSA(SHA-256(payload))`
+        // while DSSE signs the PAE bytes. See issue #39.
         assert_eq!(bundle.verification_material.tlog_entries.len(), 1);
         let tlog = &bundle.verification_material.tlog_entries[0];
         assert_eq!(tlog.log_index, 0);
-        assert_eq!(tlog.kind_version.kind, "hashedrekord");
+        assert_eq!(tlog.kind_version.kind, "dsse");
         let proof = tlog.inclusion_proof.as_ref().unwrap();
         assert_eq!(proof.tree_size, 1);
 
@@ -2751,6 +2785,126 @@ mod tests {
             }
             other => panic!("expected DsseEnvelope, got {other:?}"),
         }
+    }
+
+    /// `sign_blob_keyless` MUST dispatch to `submit_dsse` (the dsse
+    /// rekor schema) and NOT to `submit` (the hashedrekord schema).
+    ///
+    /// Bug it catches: a regression that flips the dispatch back to
+    /// `submit` (the hashedrekord path) would silently re-introduce
+    /// the bug fixed by issue #39. Production Rekor would resume
+    /// rejecting DSSE-content bundles with `invalid signature when
+    /// validating ASN.1 encoded signature` — but the bug wouldn't
+    /// surface in any unit test that uses a permissive mock client,
+    /// because mocks don't enforce signature semantics. This test
+    /// pins the dispatch by recording WHICH method the producer
+    /// called, irrespective of the mock's tolerance.
+    #[test]
+    fn test_sign_blob_keyless_dispatches_to_dsse_schema() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct DispatchRecordingClient {
+            submit_calls: AtomicUsize,
+            submit_dsse_calls: AtomicUsize,
+        }
+        impl rekor::RekorClient for DispatchRecordingClient {
+            fn submit(
+                &self,
+                _entry: &rekor::HashedRekord,
+            ) -> Result<rekor::LogEntry, rekor::RekorError> {
+                self.submit_calls.fetch_add(1, Ordering::SeqCst);
+                // Return a mock-shape log entry; the test asserts on
+                // dispatch counts, not on the entry contents.
+                Ok(rekor::LogEntry {
+                    uuid: "submit-canary".into(),
+                    log_index: 0,
+                    tree_size: 1,
+                    leaf_hash: [0u8; 32],
+                    inclusion_proof: Vec::new(),
+                    root_hash: [0u8; 32],
+                    body: Vec::new(),
+                })
+            }
+            fn submit_dsse(
+                &self,
+                _entry: &rekor::DsseRekord,
+            ) -> Result<rekor::LogEntry, rekor::RekorError> {
+                self.submit_dsse_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(rekor::LogEntry {
+                    uuid: "submit-dsse-canary".into(),
+                    log_index: 0,
+                    tree_size: 1,
+                    leaf_hash: [0u8; 32],
+                    inclusion_proof: Vec::new(),
+                    root_hash: [0u8; 32],
+                    body: Vec::new(),
+                })
+            }
+        }
+
+        let client = DispatchRecordingClient {
+            submit_calls: AtomicUsize::new(0),
+            submit_dsse_calls: AtomicUsize::new(0),
+        };
+        let signer = MockSigner::new(canned_signature(), None);
+        let chain: Vec<Vec<u8>> = vec![b"leaf-der".to_vec()];
+
+        let _bundle = sign_blob_keyless(
+            b"witnessed payload",
+            "text/plain",
+            &signer,
+            &chain,
+            Some(&client),
+        )
+        .expect("sign_blob_keyless");
+
+        assert_eq!(
+            client.submit_dsse_calls.load(Ordering::SeqCst),
+            1,
+            "sign_blob_keyless must call submit_dsse exactly once"
+        );
+        assert_eq!(
+            client.submit_calls.load(Ordering::SeqCst),
+            0,
+            "sign_blob_keyless MUST NOT call submit (hashedrekord schema is wrong for DSSE bundles; see issue #39)"
+        );
+    }
+
+    /// `build_dsse_rekord` produces a [`rekor::DsseRekord`] whose
+    /// envelope_bytes round-trip through [`spec::Envelope::decode_json`]
+    /// and whose verifier list pins the leaf cert as PEM. Catches
+    /// regressions where the envelope-encoder drift breaks the
+    /// rekor entry shape silently (e.g. a refactor that base64s the
+    /// envelope ahead of time, or that wraps the leaf in DER instead
+    /// of PEM).
+    #[test]
+    fn test_build_dsse_rekord_pins_envelope_and_leaf_pem() {
+        let envelope = Envelope {
+            payload_type: "text/plain".to_string(),
+            payload: b"hello".to_vec(),
+            signatures: vec![DsseSignature {
+                keyid: None,
+                sig: vec![0xAA, 0xBB],
+            }],
+        };
+        let leaf_der = b"this-is-not-real-der-but-tests-the-pem-wrapping".to_vec();
+
+        let entry = build_dsse_rekord(&envelope, &leaf_der).expect("build_dsse_rekord");
+
+        // Envelope round-trips back through the spec decoder.
+        let round_tripped =
+            spec::Envelope::decode_json(&entry.envelope_bytes).expect("decode envelope");
+        assert_eq!(round_tripped, envelope);
+
+        // Single verifier; PEM-wrapped CERTIFICATE block carrying
+        // exactly the DER bytes we passed in.
+        assert_eq!(entry.verifiers_pem.len(), 1);
+        let pem_str = std::str::from_utf8(&entry.verifiers_pem[0]).expect("PEM is UTF-8");
+        assert!(pem_str.starts_with("-----BEGIN CERTIFICATE-----"));
+        assert!(pem_str.contains("-----END CERTIFICATE-----"));
+        let parsed = pem::parse(pem_str).expect("parsable PEM");
+        assert_eq!(parsed.tag(), "CERTIFICATE");
+        assert_eq!(parsed.contents(), leaf_der);
     }
 }
 

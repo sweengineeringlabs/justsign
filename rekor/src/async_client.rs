@@ -33,7 +33,7 @@
 use async_trait::async_trait;
 
 use crate::client::{classify_non_success, decode_log_entry_bytes, LogEntry};
-use crate::entry::HashedRekord;
+use crate::entry::{DsseRekord, HashedRekord};
 use crate::RekorError;
 
 /// Default timeout for a single async HTTP exchange with Rekor.
@@ -51,6 +51,19 @@ pub trait AsyncRekorClient: Send + Sync {
     /// Submit a `hashedrekord` entry, return the resulting
     /// [`LogEntry`] (UUID, log index, inclusion proof, body).
     async fn submit(&self, entry: &HashedRekord) -> Result<LogEntry, RekorError>;
+
+    /// Submit a `dsse` entry (signature over the DSSE PAE bytes).
+    ///
+    /// Default impl returns [`RekorError::Unsupported`] so external
+    /// async-trait impls written before issue #39 keep building.
+    /// The in-tree client ([`HttpRekorClientAsync`]) overrides the
+    /// default. Mirrors [`crate::RekorClient::submit_dsse`] on the
+    /// blocking trait.
+    async fn submit_dsse(&self, _entry: &DsseRekord) -> Result<LogEntry, RekorError> {
+        Err(RekorError::Unsupported {
+            operation: "submit_dsse",
+        })
+    }
 }
 
 /// Non-blocking Rekor HTTP client.
@@ -133,6 +146,29 @@ impl AsyncRekorClient for HttpRekorClientAsync {
         let body = serde_json::json!({
             "apiVersion": "0.0.1",
             "kind": "hashedrekord",
+            "spec": spec_value,
+        });
+
+        let url = format!("{}/api/v1/log/entries", self.base_url);
+        let resp = self
+            .http
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
+            .json(&body)
+            .send()
+            .await?;
+        decode_async(resp).await
+    }
+
+    async fn submit_dsse(&self, entry: &DsseRekord) -> Result<LogEntry, RekorError> {
+        // Mirror the blocking `submit_dsse` envelope shape exactly —
+        // keep the two transports lock-step so a fix on one path
+        // is automatically available on the other.
+        let spec_value: serde_json::Value = serde_json::from_slice(&entry.encode_json()?)?;
+        let body = serde_json::json!({
+            "apiVersion": "0.0.1",
+            "kind": "dsse",
             "spec": spec_value,
         });
 
