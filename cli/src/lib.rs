@@ -52,7 +52,8 @@ use sign::spec::Bundle;
 use sign::{
     fulcio::{build_csr, FulcioClient, HttpFulcioClient},
     rekor::{HttpRekorClient, MockRekorClient, RekorClient},
-    sign_blob, sign_blob_keyless, verify_blob, EcdsaP256Signer, VerifyingKey,
+    sign_blob, sign_blob_keyless, sign_blob_message, sign_blob_message_keyless, verify_blob,
+    verify_blob_message, EcdsaP256Signer, VerifyingKey,
 };
 
 // OIDC providers are exposed via --oidc-provider on the
@@ -106,11 +107,19 @@ pub fn print_usage<W: Write>(out: &mut W) -> std::io::Result<()> {
     )?;
     writeln!(
         out,
-        "  justsign sign-blob <file> {{--key <priv-pem> | --keyless [--fulcio <url>] [--oidc-provider <kind>]}} \\\n      [--output-bundle <path>] [--rekor[=<url>]] [--mock-rekor]"
+        "  justsign sign-blob <file> {{--key <priv-pem> | --keyless [--fulcio <url>] [--oidc-provider <kind>]}} \\\n      [--shape message|dsse] [--payload-type <mime>] [--output-bundle <path>] [--rekor[=<url>]] [--mock-rekor]"
     )?;
     writeln!(
         out,
         "      signs <file>, emits a Sigstore bundle v0.3 JSON to <path> or stdout."
+    )?;
+    writeln!(
+        out,
+        "      --shape message (DEFAULT): MessageSignature content; cosign sign-blob interop."
+    )?;
+    writeln!(
+        out,
+        "      --shape dsse: DSSE envelope content; cosign attest interop. --payload-type sets MIME."
     )?;
     writeln!(
         out,
@@ -154,11 +163,19 @@ pub fn print_usage<W: Write>(out: &mut W) -> std::io::Result<()> {
     )?;
     writeln!(
         out,
-        "  justsign verify-blob <bundle-path> --key <pub-pem-path> [--rekor[=<url>]] [--mock-rekor]"
+        "  justsign verify-blob <bundle-path> --key <pub-pem-path> [--shape message|dsse] [--payload <path>] \\\n      [--rekor[=<url>]] [--mock-rekor]"
     )?;
     writeln!(
         out,
         "      verifies the bundle. Exit 0 on success, 1 on failure."
+    )?;
+    writeln!(
+        out,
+        "      --shape message (DEFAULT): requires --payload <path>; re-hashes and verifies."
+    )?;
+    writeln!(
+        out,
+        "      --shape dsse: payload is embedded in the envelope; --payload is rejected."
     )?;
     writeln!(
         out,
@@ -299,12 +316,60 @@ enum SignMode {
     },
 }
 
+/// Bundle content shape `sign-blob` / `verify-blob` should produce
+/// or accept. Mirrors cosign's distinction between `sign-blob`
+/// (MessageSignature content; raw blob bytes) and `attest` (DSSE
+/// envelope content; in-toto Statement payload).
+///
+/// Default is [`BundleShape::Message`] — cosign's `sign-blob`
+/// equivalent. Operators signing in-toto attestations pass
+/// `--shape dsse` explicitly, or use the dedicated `attest` CLI
+/// surface (future).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BundleShape {
+    /// `messageSignature` content arm. cosign `sign-blob` /
+    /// `verify-blob` interop. Signature is over `SHA-256(payload)`;
+    /// rekor schema is `hashedrekord`.
+    Message,
+    /// `dsseEnvelope` content arm. cosign `attest` /
+    /// `verify-blob-attestation` interop. Signature is over the DSSE
+    /// PAE bytes; rekor schema is `dsse`. Required for in-toto
+    /// Statement payloads.
+    Dsse,
+}
+
+/// Parse the `--shape <kind>` flag value.
+///
+/// Bug it pre-empts: a parser that silently fell back to a default
+/// on an unknown shape would mask operator typos (`--shape dsee`
+/// for `--shape dsse`) and silently sign the wrong content arm.
+fn parse_bundle_shape(s: &str) -> Result<BundleShape, CliError> {
+    match s {
+        "message" => Ok(BundleShape::Message),
+        "dsse" => Ok(BundleShape::Dsse),
+        other => Err(CliError(format!(
+            "unknown --shape: '{other}' (expected: message, dsse)"
+        ))),
+    }
+}
+
+/// Default DSSE `payload_type` for `--shape dsse` when the operator
+/// doesn't pass `--payload-type`. Sigstore's convention for raw-blob
+/// DSSE is the generic octet-stream MIME type — nothing semantic.
+/// Attestation flows pass `application/vnd.in-toto+json` explicitly.
+const DEFAULT_DSSE_PAYLOAD_TYPE: &str = "application/octet-stream";
+
 /// Parsed `sign-blob` arg state.
 struct SignBlobArgs {
     file: String,
     mode: SignMode,
     output_bundle: Option<String>,
     rekor: RekorChoice,
+    shape: BundleShape,
+    /// `payload_type` for `--shape dsse`. Ignored for
+    /// `--shape message` (MessageSignature has no payload_type
+    /// concept; the digest+signature pair stands alone).
+    payload_type: String,
 }
 
 /// Parse the `--rekor[=<url>]` flag. Returns the URL to use.
@@ -320,7 +385,7 @@ fn parse_sign_blob_args(args: &[String]) -> Result<SignBlobArgs, CliError> {
         .first()
         .ok_or_else(|| {
             CliError(
-                "sign-blob requires <file> [--key <priv-pem> | --keyless [--fulcio <url>] [--oidc-provider <kind>]] [--output-bundle <path>] [--rekor[=<url>]] [--mock-rekor]"
+                "sign-blob requires <file> [--key <priv-pem> | --keyless [--fulcio <url>] [--oidc-provider <kind>]] [--shape message|dsse] [--payload-type <mime>] [--output-bundle <path>] [--rekor[=<url>]] [--mock-rekor]"
                     .to_string(),
             )
         })?
@@ -331,6 +396,8 @@ fn parse_sign_blob_args(args: &[String]) -> Result<SignBlobArgs, CliError> {
     let mut oidc_provider: Option<OidcProviderKind> = None;
     let mut output_bundle: Option<String> = None;
     let mut rekor = RekorChoice::None;
+    let mut shape: Option<BundleShape> = None;
+    let mut payload_type: Option<String> = None;
     let mut i = 1;
     while i < args.len() {
         let arg = args[i].as_str();
@@ -367,6 +434,20 @@ fn parse_sign_blob_args(args: &[String]) -> Result<SignBlobArgs, CliError> {
                 output_bundle = Some(v.clone());
                 i += 2;
             }
+            "--shape" => {
+                let v = args
+                    .get(i + 1)
+                    .ok_or_else(|| CliError("--shape requires a kind argument".to_string()))?;
+                shape = Some(parse_bundle_shape(v)?);
+                i += 2;
+            }
+            "--payload-type" => {
+                let v = args.get(i + 1).ok_or_else(|| {
+                    CliError("--payload-type requires a MIME argument".to_string())
+                })?;
+                payload_type = Some(v.clone());
+                i += 2;
+            }
             "--mock-rekor" => {
                 if rekor != RekorChoice::None {
                     return Err(CliError(
@@ -390,6 +471,22 @@ fn parse_sign_blob_args(args: &[String]) -> Result<SignBlobArgs, CliError> {
             other => return Err(CliError(format!("unknown flag: {other}"))),
         }
     }
+    // Default shape is `message` (cosign sign-blob equivalent —
+    // issue #40). Operators signing in-toto attestations opt in via
+    // `--shape dsse`. Default `payload_type` for DSSE is
+    // `application/octet-stream`; for MessageSignature it's unused.
+    let shape = shape.unwrap_or(BundleShape::Message);
+    let payload_type = match (shape, payload_type) {
+        (BundleShape::Message, Some(_)) => {
+            return Err(CliError(
+                "--payload-type is only valid with --shape dsse (MessageSignature has no payload_type field)"
+                    .to_string(),
+            ));
+        }
+        (BundleShape::Message, None) => String::new(),
+        (BundleShape::Dsse, Some(v)) => v,
+        (BundleShape::Dsse, None) => DEFAULT_DSSE_PAYLOAD_TYPE.to_string(),
+    };
     // `--key` and `--keyless` are mutually exclusive AND one is required.
     let mode = match (key, keyless) {
         (Some(_), true) => {
@@ -426,6 +523,8 @@ fn parse_sign_blob_args(args: &[String]) -> Result<SignBlobArgs, CliError> {
         mode,
         output_bundle,
         rekor,
+        shape,
+        payload_type,
     })
 }
 
@@ -483,17 +582,19 @@ pub fn cmd_sign_blob<W: Write>(args: &[String], out: &mut W) -> Result<(), CliEr
                 .map_err(|e| CliError(format!("parse PKCS#8 PEM private key: {e}")))?;
             let signer = EcdsaP256Signer::new(signing_key, None);
 
-            sign_blob(
-                &payload,
-                // Bundle media type — pinning the v0.3 string here keeps
-                // operator-facing CLI output identical regardless of which
-                // sign path the binary takes (cosign-compat tools key off
-                // this string).
-                "application/vnd.dev.sigstore.bundle+json;version=0.3",
-                &signer,
-                rekor_arg,
-            )
-            .map_err(|e| CliError(format!("sign_blob: {e}")))?
+            // Dispatch on the bundle shape:
+            //   --shape message (default): MessageSignature content,
+            //     cosign `sign-blob` interop, signature over
+            //     SHA-256(payload). Issue #40.
+            //   --shape dsse: DSSE envelope content, cosign `attest`
+            //     interop, signature over PAE bytes. Operator passes
+            //     `--payload-type` for the wrapper MIME.
+            match parsed.shape {
+                BundleShape::Message => sign_blob_message(&payload, &signer, rekor_arg)
+                    .map_err(|e| CliError(format!("sign_blob_message: {e}")))?,
+                BundleShape::Dsse => sign_blob(&payload, &parsed.payload_type, &signer, rekor_arg)
+                    .map_err(|e| CliError(format!("sign_blob: {e}")))?,
+            }
         }
         SignMode::Keyless {
             fulcio_url,
@@ -536,22 +637,28 @@ pub fn cmd_sign_blob<W: Write>(args: &[String], out: &mut W) -> Result<(), CliEr
                 cert_chain.certs.iter().map(|c| c.der.clone()).collect();
 
             // Step 6: build the signer over the ephemeral key and
-            // delegate to `sign_blob_keyless`. The bundle returned
-            // carries the leaf cert on the wire at
-            // `verification_material.certificate.rawBytes` (singular
-            // `X509Certificate`, the protobuf-specs v0.3 final shape
-            // cosign 3.0+ requires) and (when rekor_arg is Some) the
-            // inclusion proof in `tlog_entries`. The full chain is
-            // still held in-process by `Certificate.certificates`.
+            // delegate to the keyless producer matching the chosen
+            // shape. Both producers carry the leaf cert on the wire
+            // at `verification_material.certificate.rawBytes`
+            // (singular `X509Certificate`, the protobuf-specs v0.3
+            // final shape cosign 3.0+ requires); they differ in the
+            // content arm (MessageSignature vs DsseEnvelope) and the
+            // rekor schema dispatch (hashedrekord vs dsse).
             let signer = EcdsaP256Signer::new(signing_key, None);
-            sign_blob_keyless(
-                &payload,
-                "application/vnd.dev.sigstore.bundle+json;version=0.3",
-                &signer,
-                &cert_chain_der,
-                rekor_arg,
-            )
-            .map_err(|e| CliError(format!("sign_blob_keyless: {e}")))?
+            match parsed.shape {
+                BundleShape::Message => {
+                    sign_blob_message_keyless(&payload, &signer, &cert_chain_der, rekor_arg)
+                        .map_err(|e| CliError(format!("sign_blob_message_keyless: {e}")))?
+                }
+                BundleShape::Dsse => sign_blob_keyless(
+                    &payload,
+                    &parsed.payload_type,
+                    &signer,
+                    &cert_chain_der,
+                    rekor_arg,
+                )
+                .map_err(|e| CliError(format!("sign_blob_keyless: {e}")))?,
+            }
         }
     };
 
@@ -577,6 +684,12 @@ struct VerifyBlobArgs {
     bundle: String,
     key: String,
     rekor: RekorChoice,
+    shape: BundleShape,
+    /// Path to the original payload bytes — required for
+    /// `--shape message` (verifier re-hashes them and checks against
+    /// the bundle's pinned digest). Ignored for `--shape dsse` (the
+    /// payload is embedded in the envelope).
+    payload: Option<String>,
 }
 
 fn parse_verify_blob_args(args: &[String]) -> Result<VerifyBlobArgs, CliError> {
@@ -584,13 +697,15 @@ fn parse_verify_blob_args(args: &[String]) -> Result<VerifyBlobArgs, CliError> {
         .first()
         .ok_or_else(|| {
             CliError(
-                "verify-blob requires <bundle-path> --key <pub-pem-path> [--rekor[=<url>]] [--mock-rekor]"
+                "verify-blob requires <bundle-path> --key <pub-pem-path> [--shape message|dsse] [--payload <path>] [--rekor[=<url>]] [--mock-rekor]"
                     .to_string(),
             )
         })?
         .clone();
     let mut key: Option<String> = None;
     let mut rekor = RekorChoice::None;
+    let mut shape: Option<BundleShape> = None;
+    let mut payload: Option<String> = None;
     let mut i = 1;
     while i < args.len() {
         let arg = args[i].as_str();
@@ -600,6 +715,20 @@ fn parse_verify_blob_args(args: &[String]) -> Result<VerifyBlobArgs, CliError> {
                     .get(i + 1)
                     .ok_or_else(|| CliError("--key requires a path argument".to_string()))?;
                 key = Some(v.clone());
+                i += 2;
+            }
+            "--shape" => {
+                let v = args
+                    .get(i + 1)
+                    .ok_or_else(|| CliError("--shape requires a kind argument".to_string()))?;
+                shape = Some(parse_bundle_shape(v)?);
+                i += 2;
+            }
+            "--payload" => {
+                let v = args
+                    .get(i + 1)
+                    .ok_or_else(|| CliError("--payload requires a path argument".to_string()))?;
+                payload = Some(v.clone());
                 i += 2;
             }
             "--mock-rekor" => {
@@ -627,7 +756,25 @@ fn parse_verify_blob_args(args: &[String]) -> Result<VerifyBlobArgs, CliError> {
     }
     let key =
         key.ok_or_else(|| CliError("verify-blob requires --key <pub-pem-path>".to_string()))?;
-    Ok(VerifyBlobArgs { bundle, key, rekor })
+    let shape = shape.unwrap_or(BundleShape::Message);
+    // `--payload` is required for `--shape message` (the verifier
+    // re-hashes the payload bytes the operator fetched, and the path
+    // tells us where to find them). For `--shape dsse` the payload is
+    // already embedded in the envelope, so the flag is rejected to
+    // catch typo'd command lines that pass both.
+    if shape == BundleShape::Dsse && payload.is_some() {
+        return Err(CliError(
+            "--payload is only valid with --shape message (DSSE bundles carry the payload inline)"
+                .to_string(),
+        ));
+    }
+    Ok(VerifyBlobArgs {
+        bundle,
+        key,
+        rekor,
+        shape,
+        payload,
+    })
 }
 
 /// `verify-blob <bundle-path> --key <pub-pem-path>` — verify the
@@ -672,8 +819,31 @@ pub fn cmd_verify_blob<W: Write>(args: &[String], out: &mut W) -> Result<(), Cli
         }
     };
 
-    verify_blob(&bundle, &[verifying_key], rekor_arg)
-        .map_err(|e| CliError(format!("verify_blob: {e}")))?;
+    // Dispatch on the bundle shape:
+    //   --shape message (default): MessageSignature content. Caller
+    //     supplies `--payload <path>`; verifier re-hashes those bytes
+    //     and checks against the bundle's pinned digest, then verifies
+    //     the signature against the digest.
+    //   --shape dsse: DSSE envelope content. Payload is embedded in
+    //     the envelope; verifier re-derives the PAE and checks.
+    match parsed.shape {
+        BundleShape::Message => {
+            let payload_path = parsed.payload.ok_or_else(|| {
+                CliError(
+                    "--shape message requires --payload <path> (verifier re-hashes the payload)"
+                        .to_string(),
+                )
+            })?;
+            let payload_bytes = std::fs::read(Path::new(&payload_path))
+                .map_err(|e| CliError(format!("read {payload_path}: {e}")))?;
+            verify_blob_message(&bundle, &payload_bytes, &[verifying_key], rekor_arg)
+                .map_err(|e| CliError(format!("verify_blob_message: {e}")))?;
+        }
+        BundleShape::Dsse => {
+            verify_blob(&bundle, &[verifying_key], rekor_arg)
+                .map_err(|e| CliError(format!("verify_blob: {e}")))?;
+        }
+    }
 
     writeln!(out, "OK").map_err(|e| CliError(format!("write: {e}")))?;
     Ok(())
@@ -925,6 +1095,11 @@ mod tests {
     /// matching public PEM — happy path round-trip through every
     /// CLI-side serialise/parse step.
     ///
+    /// Default `--shape message` (issue #40, cosign sign-blob
+    /// equivalent): sign reads `<file>` and emits a MessageSignature
+    /// bundle; verify takes the same `<file>` via `--payload <path>`,
+    /// re-hashes, and checks the signature.
+    ///
     /// Bug it catches: any drift between the PEM the generator
     /// writes and the PEM the verifier expects (e.g. a generator
     /// that wrote SEC1 PEM directly instead of SPKI; a verifier
@@ -946,7 +1121,7 @@ mod tests {
         let bundle_path = dir.join_str("bundle.json");
         cmd_sign_blob(
             &[
-                payload_path,
+                payload_path.clone(),
                 "--key".into(),
                 priv_path,
                 "--output-bundle".into(),
@@ -957,8 +1132,17 @@ mod tests {
         .unwrap();
 
         let mut verify_out = Vec::new();
-        cmd_verify_blob(&[bundle_path, "--key".into(), pub_path], &mut verify_out)
-            .expect("matching key must verify");
+        cmd_verify_blob(
+            &[
+                bundle_path,
+                "--key".into(),
+                pub_path,
+                "--payload".into(),
+                payload_path,
+            ],
+            &mut verify_out,
+        )
+        .expect("matching key must verify");
 
         let verify_msg = String::from_utf8(verify_out).unwrap();
         assert!(
@@ -991,7 +1175,7 @@ mod tests {
         let bundle_path = dir.join_str("bundle.json");
         cmd_sign_blob(
             &[
-                payload_path,
+                payload_path.clone(),
                 "--key".into(),
                 priv_a,
                 "--output-bundle".into(),
@@ -1002,23 +1186,38 @@ mod tests {
         .unwrap();
 
         let mut verify_out = Vec::new();
-        let err = cmd_verify_blob(&[bundle_path, "--key".into(), pub_b], &mut verify_out)
-            .expect_err("verification with wrong key MUST fail");
+        let err = cmd_verify_blob(
+            &[
+                bundle_path,
+                "--key".into(),
+                pub_b,
+                "--payload".into(),
+                payload_path,
+            ],
+            &mut verify_out,
+        )
+        .expect_err("verification with wrong key MUST fail");
+        // Default shape is `--shape message` (issue #40), so the
+        // verify step runs through `verify_blob_message`.
         assert!(
-            err.0.contains("verify_blob"),
+            err.0.contains("verify_blob_message") || err.0.contains("verify_blob"),
             "error should name the verify step, got: {}",
             err.0
         );
     }
 
-    /// Bundle whose payload bytes were mutated post-signing must
-    /// fail verification.
+    /// Bundle whose pinned digest no longer matches the payload the
+    /// verifier was handed must fail verification.
     ///
-    /// Bug it catches: a verifier that signed/verified over the
-    /// envelope text (rather than re-deriving the PAE from
-    /// payload + payload_type) would silently accept this tamper.
-    /// We mutate the base64-encoded `payload` field of the DSSE
-    /// envelope inside the JSON bundle directly.
+    /// MessageSignature semantics (default shape, issue #40): the
+    /// bundle pins `messageDigest.digest = SHA-256(payload)` at
+    /// sign time; verify recomputes from `--payload` and rejects
+    /// when they disagree. We mutate the bundle's pinned digest in
+    /// place (so the caller-supplied payload no longer matches) and
+    /// require rejection.
+    ///
+    /// Bug it catches: a verifier that skipped the digest gate
+    /// would accept a bundle re-pointed at different bytes.
     #[test]
     fn test_cli_verify_blob_with_tampered_bundle_fails() {
         let dir = Tempdir::new("tamper");
@@ -1033,7 +1232,7 @@ mod tests {
         let bundle_path = dir.join_str("bundle.json");
         cmd_sign_blob(
             &[
-                payload_path,
+                payload_path.clone(),
                 "--key".into(),
                 priv_path,
                 "--output-bundle".into(),
@@ -1043,25 +1242,38 @@ mod tests {
         )
         .unwrap();
 
-        // Decode the bundle, mutate the payload bytes, re-encode.
+        // Decode the bundle, mutate the pinned digest, re-encode.
         // Going through the typed Bundle API (rather than text
         // surgery on the JSON) makes the test robust to any
         // base64 padding / field-ordering drift in the encoder.
         let bytes = std::fs::read(&bundle_path).unwrap();
         let mut bundle = Bundle::decode_json(&bytes).unwrap();
-        if let sign::spec::BundleContent::DsseEnvelope(env) = &mut bundle.content {
-            env.payload = b"tampered payload".to_vec();
-        } else {
-            panic!("expected DSSE envelope content");
+        match &mut bundle.content {
+            sign::spec::BundleContent::MessageSignature(ms) => {
+                // Flip a bit so the recomputed SHA-256 of the payload
+                // file no longer matches; verify_blob_message must
+                // surface PayloadDigestMismatch.
+                ms.message_digest.digest[0] ^= 0xFF;
+            }
+            other => panic!("expected MessageSignature content, got {other:?}"),
         }
         let mutated = bundle.encode_json().unwrap();
         std::fs::write(&bundle_path, &mutated).unwrap();
 
         let mut verify_out = Vec::new();
-        let err = cmd_verify_blob(&[bundle_path, "--key".into(), pub_path], &mut verify_out)
-            .expect_err("tampered bundle MUST fail verification");
+        let err = cmd_verify_blob(
+            &[
+                bundle_path,
+                "--key".into(),
+                pub_path,
+                "--payload".into(),
+                payload_path,
+            ],
+            &mut verify_out,
+        )
+        .expect_err("tampered bundle MUST fail verification");
         assert!(
-            err.0.contains("verify_blob"),
+            err.0.contains("verify_blob_message") || err.0.contains("verify_blob"),
             "error should name verify step, got: {}",
             err.0
         );
@@ -1421,6 +1633,239 @@ mod tests {
         );
         assert!(
             err.0.contains("static"),
+            "error must list legal values, got: {}",
+            err.0
+        );
+    }
+
+    // ── --shape flag (issue #40) ────────────────────────────────────
+    //
+    // cosign's `sign-blob` produces MessageSignature content;
+    // `attest` produces DSSE envelope content. justsign's CLI now
+    // dispatches on `--shape <kind>` with `message` (default) routing
+    // to the cosign-blob equivalent.
+
+    /// Default `--shape` is `message`. Pin the parser default so a
+    /// regression that flipped the default to `dsse` (the pre-#40
+    /// behaviour) would surface here at the lib-test layer rather
+    /// than out in the wild as cosign-rejected bundles.
+    ///
+    /// Bug it catches: an operator running `justsign sign-blob` with
+    /// no `--shape` flag MUST get a MessageSignature-content bundle
+    /// (cosign sign-blob shape). A regression that defaulted to dsse
+    /// would re-introduce the issue-40 wire-shape gap silently.
+    #[test]
+    fn test_cli_sign_blob_default_shape_is_message() {
+        let dir = Tempdir::new("default-shape");
+        let payload_path = dir.join_str("payload.bin");
+        std::fs::write(&payload_path, b"data").unwrap();
+
+        // Parser-only test — we don't actually need a real key here.
+        let parsed =
+            parse_sign_blob_args(&[payload_path, "--key".into(), "/dev/null".into()]).unwrap();
+        assert_eq!(
+            parsed.shape,
+            BundleShape::Message,
+            "default --shape MUST be message (cosign sign-blob equivalent)"
+        );
+        assert_eq!(
+            parsed.payload_type, "",
+            "MessageSignature has no payload_type concept; default must be empty"
+        );
+    }
+
+    /// `--shape dsse` routes through `sign_blob` (DSSE content) and
+    /// produces a bundle whose content arm is `DsseEnvelope`. Pinned
+    /// so a regression that ignored `--shape dsse` and silently used
+    /// the message default would emit the wrong content arm for
+    /// attestation flows.
+    ///
+    /// Bug it catches: a dispatch site that branched on the wrong
+    /// field (e.g. `parsed.mode` instead of `parsed.shape`) would
+    /// emit the same shape regardless of the `--shape` flag.
+    #[test]
+    fn test_cli_sign_blob_shape_dsse_routes_to_dsse_path() {
+        let dir = Tempdir::new("shape-dsse");
+        let prefix = dir.join_str("k");
+        let mut sink = Vec::new();
+        cmd_generate_key_pair(std::slice::from_ref(&prefix), &mut sink).unwrap();
+        let priv_path = format!("{prefix}.key");
+
+        let payload_path = dir.join_str("payload.bin");
+        std::fs::write(&payload_path, b"attestation-shaped payload").unwrap();
+        let bundle_path = dir.join_str("bundle.json");
+        cmd_sign_blob(
+            &[
+                payload_path,
+                "--key".into(),
+                priv_path,
+                "--shape".into(),
+                "dsse".into(),
+                "--output-bundle".into(),
+                bundle_path.clone(),
+            ],
+            &mut sink,
+        )
+        .unwrap();
+
+        let bytes = std::fs::read(&bundle_path).unwrap();
+        let bundle = Bundle::decode_json(&bytes).unwrap();
+        assert_eq!(
+            bundle.content_kind(),
+            sign::spec::BundleContentKind::DsseEnvelope,
+            "--shape dsse MUST emit DsseEnvelope content"
+        );
+    }
+
+    /// Default `--shape message` is the cosign sign-blob equivalent:
+    /// produces a MessageSignature-content bundle that round-trips
+    /// through the CLI's verify-blob path with `--payload`.
+    ///
+    /// Bug it catches: any drift between the default-shape sign path
+    /// and the default-shape verify path — e.g. a `cmd_sign_blob`
+    /// that ignored `--shape` and always emitted DSSE while
+    /// `cmd_verify_blob` defaulted to `verify_blob_message`. The
+    /// asymmetry would surface as `WrongContentType` rejection on a
+    /// freshly-produced bundle.
+    #[test]
+    fn test_cli_sign_blob_shape_message_round_trips_through_cli_verify() {
+        let dir = Tempdir::new("shape-msg-rt");
+        let prefix = dir.join_str("k");
+        let mut sink = Vec::new();
+        cmd_generate_key_pair(std::slice::from_ref(&prefix), &mut sink).unwrap();
+        let priv_path = format!("{prefix}.key");
+        let pub_path = format!("{prefix}.pub");
+
+        let payload_path = dir.join_str("payload.bin");
+        std::fs::write(&payload_path, b"cosign sign-blob equivalent").unwrap();
+        let bundle_path = dir.join_str("bundle.json");
+
+        cmd_sign_blob(
+            &[
+                payload_path.clone(),
+                "--key".into(),
+                priv_path,
+                "--output-bundle".into(),
+                bundle_path.clone(),
+            ],
+            &mut sink,
+        )
+        .expect("sign with default --shape message must succeed");
+
+        // Sanity: the bundle on disk is MessageSignature-shaped.
+        let bytes = std::fs::read(&bundle_path).unwrap();
+        let bundle = Bundle::decode_json(&bytes).unwrap();
+        assert_eq!(
+            bundle.content_kind(),
+            sign::spec::BundleContentKind::MessageSignature
+        );
+
+        // Verify with default --shape message + --payload.
+        let mut verify_out = Vec::new();
+        cmd_verify_blob(
+            &[
+                bundle_path,
+                "--key".into(),
+                pub_path,
+                "--payload".into(),
+                payload_path,
+            ],
+            &mut verify_out,
+        )
+        .expect("MessageSignature bundle MUST round-trip through CLI verify");
+        let s = String::from_utf8(verify_out).unwrap();
+        assert!(s.contains("OK"), "verify must print OK, got: {s}");
+    }
+
+    /// `--shape message` requires `--payload` (verifier needs the
+    /// bytes to re-hash). Missing `--payload` surfaces a typed error
+    /// rather than panicking on a None unwrap or running the wrong
+    /// code path.
+    ///
+    /// Bug it catches: a parser that auto-defaulted `--payload` to
+    /// the bundle path (or some other "convenient" fallback) would
+    /// silently re-hash the wrong bytes and either pass a wrong
+    /// bundle or fail with a confusing error.
+    #[test]
+    fn test_cli_verify_blob_shape_message_requires_payload() {
+        let dir = Tempdir::new("shape-msg-no-payload");
+        let prefix = dir.join_str("k");
+        let mut sink = Vec::new();
+        cmd_generate_key_pair(std::slice::from_ref(&prefix), &mut sink).unwrap();
+        let priv_path = format!("{prefix}.key");
+        let pub_path = format!("{prefix}.pub");
+
+        let payload_path = dir.join_str("payload.bin");
+        std::fs::write(&payload_path, b"data").unwrap();
+        let bundle_path = dir.join_str("bundle.json");
+        cmd_sign_blob(
+            &[
+                payload_path,
+                "--key".into(),
+                priv_path,
+                "--output-bundle".into(),
+                bundle_path.clone(),
+            ],
+            &mut sink,
+        )
+        .unwrap();
+
+        let mut verify_out = Vec::new();
+        let err = cmd_verify_blob(&[bundle_path, "--key".into(), pub_path], &mut verify_out)
+            .expect_err("--shape message without --payload MUST surface an error");
+        assert!(
+            err.0.contains("--payload"),
+            "error must name the missing flag, got: {}",
+            err.0
+        );
+    }
+
+    /// `--payload` with `--shape dsse` is rejected — DSSE bundles
+    /// carry the payload inline so a `--payload` arg would be
+    /// silently ignored, which is the kind of footgun this
+    /// surface-area must reject loudly.
+    ///
+    /// Bug it catches: a parser that accepted `--payload` in the
+    /// dsse branch and then silently ignored it would let an
+    /// operator think they were verifying a particular file when
+    /// the actual signature was over different bytes (the
+    /// envelope's embedded payload).
+    #[test]
+    fn test_cli_verify_blob_shape_dsse_rejects_payload_flag() {
+        let parsed = parse_verify_blob_args(&[
+            "bundle.json".into(),
+            "--key".into(),
+            "k.pub".into(),
+            "--shape".into(),
+            "dsse".into(),
+            "--payload".into(),
+            "/some/path".into(),
+        ]);
+        match parsed {
+            Ok(_) => panic!("--shape dsse + --payload MUST surface an error"),
+            Err(err) => {
+                let lower = err.0.to_lowercase();
+                assert!(
+                    lower.contains("--payload") && lower.contains("dsse"),
+                    "error must explain the conflict, got: {}",
+                    err.0
+                );
+            }
+        }
+    }
+
+    /// Unknown `--shape` value surfaces a typed error naming the
+    /// legal values. Same posture as `parse_oidc_provider_kind`.
+    #[test]
+    fn test_cli_parse_bundle_shape_rejects_unknown_value() {
+        let err = parse_bundle_shape("dsee").expect_err("typo'd shape MUST reject");
+        assert!(
+            err.0.contains("dsse"),
+            "error must list legal values, got: {}",
+            err.0
+        );
+        assert!(
+            err.0.contains("message"),
             "error must list legal values, got: {}",
             err.0
         );

@@ -88,6 +88,26 @@ pub enum BundleContent {
     MessageSignature(MessageSignature),
 }
 
+/// Lightweight discriminator for [`BundleContent`] — names which arm
+/// is set without exposing the inner data.
+///
+/// Useful when callers want to dispatch on shape before borrowing
+/// (or moving out of) the inner content. Verifiers gating on shape
+/// before pulling the wrong arm consume this; it surfaces directly
+/// from [`Bundle::content_kind`].
+///
+/// Bug it pre-empts: a verifier that pattern-matched on
+/// `BundleContent` and accidentally took both arms (or returned the
+/// wrong typed error for the non-target arm) gets a typed kind to
+/// route on instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BundleContentKind {
+    /// `bundle.content == BundleContent::DsseEnvelope(_)`.
+    DsseEnvelope,
+    /// `bundle.content == BundleContent::MessageSignature(_)`.
+    MessageSignature,
+}
+
 /// Trust material — what the verifier needs to bind the signature to
 /// a Fulcio identity and a Rekor entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -234,6 +254,15 @@ pub struct Checkpoint {
 }
 
 impl Bundle {
+    /// Return which content arm is set without borrowing the inner
+    /// data. Useful for shape-dispatch before pulling the wrong arm.
+    pub fn content_kind(&self) -> BundleContentKind {
+        match &self.content {
+            BundleContent::DsseEnvelope(_) => BundleContentKind::DsseEnvelope,
+            BundleContent::MessageSignature(_) => BundleContentKind::MessageSignature,
+        }
+    }
+
     /// Decode a bundle from its canonical JSON form.
     ///
     /// Enforces the `oneof` invariant: exactly one of `dsseEnvelope`
@@ -1242,6 +1271,25 @@ mod tests {
             cert.certificates[0],
             vec![0x30, 0x82, 0x01, 0x00, 0xDE, 0xAD]
         );
+    }
+
+    /// `Bundle::content_kind()` discriminates the two arms without
+    /// borrowing the inner data — DSSE bundles report
+    /// `BundleContentKind::DsseEnvelope` and message-signature
+    /// bundles report `BundleContentKind::MessageSignature`.
+    ///
+    /// Bug it catches: a `content_kind()` impl that swapped the
+    /// arms (returning `MessageSignature` for DSSE bundles and vice
+    /// versa) would silently mis-route every shape-dispatched
+    /// verifier. This pins the mapping at the spec layer so the
+    /// downstream `verify_blob_message` shape-check stays honest.
+    #[test]
+    fn test_content_kind_discriminates_dsse_and_message_signature_bundles() {
+        let dsse = fixture_dsse_bundle();
+        assert_eq!(dsse.content_kind(), BundleContentKind::DsseEnvelope);
+
+        let ms = fixture_message_signature_bundle();
+        assert_eq!(ms.content_kind(), BundleContentKind::MessageSignature);
     }
 
     /// A bundle whose in-memory `verification_material.certificate`

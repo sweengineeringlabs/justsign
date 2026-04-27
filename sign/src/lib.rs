@@ -114,9 +114,10 @@ use p256::ecdsa::Signature as P256Signature;
 use rekor::{DsseRekord, HashedRekord, HashedRekordHash, LogEntry, PublicKey, RekorClient};
 use sha2::{Digest, Sha256};
 use spec::{
-    Bundle, BundleContent, Certificate as SpecCertificate, Checkpoint, Envelope, HashOutput,
-    InclusionProof, KindVersion, Signature as DsseSignature, Statement, Subject, TlogEntry,
-    VerificationMaterial, IN_TOTO_STATEMENT_V1_TYPE, SIGSTORE_BUNDLE_V0_3_MEDIA_TYPE,
+    Bundle, BundleContent, BundleContentKind, Certificate as SpecCertificate, Checkpoint, Envelope,
+    HashOutput, InclusionProof, KindVersion, MessageSignature as SpecMessageSignature,
+    Signature as DsseSignature, Statement, Subject, TlogEntry, VerificationMaterial,
+    IN_TOTO_STATEMENT_V1_TYPE, SIGSTORE_BUNDLE_V0_3_MEDIA_TYPE,
 };
 use std::collections::BTreeMap;
 
@@ -336,6 +337,434 @@ pub fn sign_blob(
         },
         content: BundleContent::DsseEnvelope(envelope),
     })
+}
+
+/// SHA-256 algorithm identifier used by Sigstore `MessageSignature`
+/// bundles. Pinned as a `&'static str` so the same value is reused
+/// across producer + verifier: any drift here would silently break
+/// shape-equality between the value `sign_blob_message` writes into
+/// `messageDigest.algorithm` and the value
+/// `verify_blob_message` checks for. Sigstore's protobuf-specs
+/// `HashAlgorithm` enum names this variant `SHA2_256`.
+const SHA2_256_ALGORITHM: &str = "SHA2_256";
+
+/// Sign `payload` in the `MessageSignature` content shape — the
+/// cosign `sign-blob` equivalent.
+///
+/// The signature is produced over the SHA-256 hash of the payload
+/// bytes (NOT a DSSE PAE wrap), and the resulting bundle's content
+/// arm is [`BundleContent::MessageSignature`] rather than
+/// [`BundleContent::DsseEnvelope`]. Verifiers (including cosign 3.x
+/// `verify-blob`) accept the bundle without trying to JSON-decode
+/// the payload as an in-toto Statement — fixing the wire-shape gap
+/// that made justsign's earlier `sign_blob` output cosign-rejected
+/// (`payload must be a valid DSSE envelope: invalid character 'j'
+/// looking for beginning of value`).
+///
+/// Use this for raw blob signing (release artefacts, files,
+/// arbitrary bytes). For attestation-shape signing (in-toto
+/// Statement payloads), keep using [`attest`] / [`sign_blob`].
+///
+/// Pipeline:
+///
+/// 1. Compute `digest = SHA-256(payload)`.
+/// 2. Hand `digest` to the signer (NOT a PAE wrap — `signer.sign(&digest)`
+///    directly). The leaf signature lands in the bundle's
+///    `messageSignature.signature` field; the digest is pinned in
+///    `messageSignature.messageDigest.{algorithm, digest}`.
+/// 3. If `rekor` is `Some`, build a `hashedrekord` body whose
+///    `data.hash.value` is the same `SHA-256(payload)` digest and
+///    submit via [`rekor::RekorClient::submit`] — the schema that
+///    matches MessageSignature semantics. Embed the resulting
+///    `LogEntry` as a `tlog_entry` tagged `kind = "hashedrekord"`.
+/// 4. Wrap into a [`Bundle`] tagged
+///    `media_type = application/vnd.dev.sigstore.bundle+json;version=0.3`,
+///    with `verification_material.certificate = None` (static-key
+///    flow). Use [`sign_blob_message_keyless`] for the cert-bearing
+///    keyless equivalent.
+///
+/// Errors surface via [`SignError`]; the construction sites are the
+/// same as [`sign_blob`] (signer / rekor / bundle-encode), with
+/// [`SignError::EmptyCertChain`] reserved for the keyless variant.
+pub fn sign_blob_message(
+    payload: &[u8],
+    signer: &dyn Signer,
+    rekor: Option<&dyn RekorClient>,
+) -> Result<Bundle, SignError> {
+    // 1. Compute the payload digest. cosign's MessageSignature schema
+    //    pins SHA-256 — protobuf-specs `HashAlgorithm.SHA2_256` is the
+    //    only value cosign 3.x accepts here. v0 only emits SHA-256;
+    //    surfacing other algorithms would require pinning a wider hash
+    //    SPI (out of scope for issue #40).
+    let digest = Sha256::digest(payload);
+
+    // 2. Sign the digest bytes directly. Critically, this is NOT a
+    //    DSSE PAE wrap — MessageSignature schema verifies the
+    //    signature against `signer_sign(SHA-256(payload))`, NOT against
+    //    `signer_sign(PAE(payload_type, payload))`. Mis-wiring this
+    //    is the core failure mode the issue-40 schema dispatch fixes.
+    let digest_bytes: Vec<u8> = digest.to_vec();
+    let sig_bytes = signer
+        .sign(&digest_bytes)
+        .map_err(|e| SignError::Signer(e.to_string()))?;
+
+    let message_signature = SpecMessageSignature {
+        message_digest: HashOutput {
+            algorithm: SHA2_256_ALGORITHM.to_string(),
+            digest: digest_bytes,
+        },
+        signature: sig_bytes.clone(),
+    };
+
+    // 3. Optional Rekor submission via `hashedrekord` (NOT `dsse`).
+    //    MessageSignature-content bundles use the hashedrekord
+    //    schema — Rekor verifies `signature == ECDSA(SHA-256(payload))`,
+    //    matching what we just signed. A static-key sign_blob_message
+    //    has no Fulcio cert in scope, so the publicKey field is empty
+    //    (real Rekor rejects this; static-key callers driving real
+    //    Rekor must use the keyless variant or move to a real-pubkey-
+    //    binding API in v0.5).
+    let tlog_entries = if let Some(client) = rekor {
+        let entry = build_hashed_rekord(payload, &sig_bytes, Vec::new());
+        let log_entry = client.submit(&entry)?;
+        vec![log_entry_to_tlog_entry(&log_entry, "hashedrekord")]
+    } else {
+        Vec::new()
+    };
+
+    // 4. Bundle. No cert chain in the static-key path; verifiers in
+    //    this flow are handed the trusted public key directly.
+    Ok(Bundle {
+        media_type: SIGSTORE_BUNDLE_V0_3_MEDIA_TYPE.to_string(),
+        verification_material: VerificationMaterial {
+            certificate: None,
+            tlog_entries,
+            timestamp_verification_data: None,
+        },
+        content: BundleContent::MessageSignature(message_signature),
+    })
+}
+
+/// Keyless variant of [`sign_blob_message`] — adds a Fulcio cert
+/// chain to the bundle, and uses the leaf cert PEM as the rekor
+/// `publicKey.content`. Mirror of [`sign_blob_keyless`] but emits a
+/// `MessageSignature`-content bundle instead of a DSSE envelope.
+///
+/// Inputs:
+///
+/// * `payload` / `signer` / `rekor` — same shape as
+///   [`sign_blob_message`]. The hash + sign + Rekor flow is identical;
+///   only the cert-chain attachment is new.
+/// * `cert_chain_der` — DER-encoded cert chain, **leaf at index 0**,
+///   intermediates following. Same shape as
+///   [`sign_blob_keyless`]'s `cert_chain_der` argument. The function
+///   does NOT cryptographically validate that the leaf's
+///   SubjectPublicKeyInfo matches the signer's verifying key — that
+///   coupling is the caller's responsibility (typically: caller
+///   generated the keypair, requested a Fulcio cert for it, passes
+///   both into this call).
+///
+/// Wire shape:
+///
+/// * Bundle's `verification_material.certificate` is set to a
+///   one-element `Certificate { certificates: vec![chain[0].clone()] }`
+///   carrying just the leaf — protobuf-specs v0.3 final mandates the
+///   singular leaf shape, and cosign 3.x rejects bundles populating
+///   `x509CertificateChain`. Intermediates come along in-process for
+///   any verifier that wants to walk them; the wire emit is leaf-only.
+/// * Rekor entry's `publicKey.content` is the leaf cert as PEM bytes
+///   (Rekor base64s the value on its side).
+///
+/// Errors:
+///
+/// * [`SignError::EmptyCertChain`] — `cert_chain_der.is_empty()`.
+///   Rejected upfront so we never emit a bundle whose cert material
+///   is structurally valid but semantically empty.
+/// * [`SignError::Signer`] / [`SignError::RekorSubmit`] /
+///   [`SignError::BundleEncode`] — inherited from
+///   [`sign_blob_message`].
+pub fn sign_blob_message_keyless(
+    payload: &[u8],
+    signer: &dyn Signer,
+    cert_chain_der: &[Vec<u8>],
+    rekor: Option<&dyn RekorClient>,
+) -> Result<Bundle, SignError> {
+    // 1. Reject empty chains BEFORE doing any signing work — same
+    //    posture as `sign_blob_keyless`. Mirrors the verifier-side
+    //    `VerifyError::EmptyCertChain` exit in
+    //    `verify_blob_message_keyless`.
+    if cert_chain_der.is_empty() {
+        return Err(SignError::EmptyCertChain);
+    }
+
+    // 2. SHA-256 + sign the digest. Same pipeline as
+    //    `sign_blob_message`; inlined here so the rekor submission can
+    //    embed the leaf cert's PEM as the entry's `publicKey.content`.
+    let digest = Sha256::digest(payload);
+    let digest_bytes: Vec<u8> = digest.to_vec();
+    let sig_bytes = signer
+        .sign(&digest_bytes)
+        .map_err(|e| SignError::Signer(e.to_string()))?;
+
+    let message_signature = SpecMessageSignature {
+        message_digest: HashOutput {
+            algorithm: SHA2_256_ALGORITHM.to_string(),
+            digest: digest_bytes,
+        },
+        signature: sig_bytes.clone(),
+    };
+
+    // 3. Optional Rekor submission via `hashedrekord` carrying the
+    //    leaf cert PEM as `publicKey.content`. Production Rekor
+    //    PEM-decodes this on receipt and verifies each detached
+    //    signature against `SHA-256(payload)` — the schema match for
+    //    MessageSignature-content bundles. We do NOT use the dsse
+    //    schema here: dsse is for DSSE-content bundles and verifies
+    //    against PAE bytes (issue #39). Mismatch produces Rekor's
+    //    `invalid signature when validating ASN.1 encoded signature`.
+    let tlog_entries = if let Some(client) = rekor {
+        let leaf_pem = pem::encode(&pem::Pem::new("CERTIFICATE", cert_chain_der[0].clone()));
+        let entry = build_hashed_rekord(payload, &sig_bytes, leaf_pem.into_bytes());
+        let log_entry = client.submit(&entry)?;
+        vec![log_entry_to_tlog_entry(&log_entry, "hashedrekord")]
+    } else {
+        Vec::new()
+    };
+
+    // 4. Bundle with the FULL cert chain attached in-memory. The wire
+    //    emit (`Bundle::encode_json`) is leaf-only per protobuf-specs
+    //    v0.3 final and #38, but in-process verifiers walk the chain
+    //    via `cert_chain::verify_chain` to bind the leaf to a trust
+    //    anchor and need the intermediates to do so. Keeping the full
+    //    chain in the `Certificate` model matches `sign_blob_keyless`'s
+    //    posture (the only difference between the two is the content
+    //    arm — DSSE vs MessageSignature).
+    Ok(Bundle {
+        media_type: SIGSTORE_BUNDLE_V0_3_MEDIA_TYPE.to_string(),
+        verification_material: VerificationMaterial {
+            certificate: Some(SpecCertificate {
+                certificates: cert_chain_der.to_vec(),
+            }),
+            tlog_entries,
+            timestamp_verification_data: None,
+        },
+        content: BundleContent::MessageSignature(message_signature),
+    })
+}
+
+/// Verify a `MessageSignature`-content bundle previously produced by
+/// [`sign_blob_message`] (or a third-party Sigstore signer with the
+/// same wire shape — cosign `sign-blob`, sigstore-go, sigstore-js).
+///
+/// Inputs:
+///
+/// * `bundle` — the artifact to verify.
+/// * `payload` — the raw blob bytes the verifier already fetched
+///   (e.g. by re-downloading the release artefact). The verifier
+///   re-hashes these and checks the result against
+///   `messageDigest.digest` before checking the signature.
+/// * `trusted_keys` — list of [`VerifyingKey`]s the caller accepts.
+///   Same shape as [`verify_blob`]'s parameter.
+/// * `rekor` — optional [`rekor::RekorClient`]; when present, every
+///   `tlog_entry` in the bundle has its inclusion proof re-verified.
+///   Same posture as [`verify_blob`].
+///
+/// Steps, in order:
+///
+/// 1. Reject if `bundle.content_kind() != MessageSignature` —
+///    surface as [`VerifyError::WrongContentType`]. A DSSE-content
+///    bundle handed to this verifier means the caller routed an
+///    attestation through the raw-blob verifier; symmetric to
+///    [`verify_blob`]'s [`VerifyError::EnvelopeMissing`] in the
+///    other direction.
+/// 2. Pull the [`MessageSignature`]; assert
+///    `algorithm == "SHA2_256"`. v0 supports only SHA-256 — every
+///    other value surfaces [`VerifyError::UnsupportedHashAlgorithm`].
+/// 3. Recompute `SHA-256(payload)` and compare to
+///    `messageDigest.digest`. Mismatch surfaces
+///    [`VerifyError::PayloadDigestMismatch`].
+/// 4. Verify the bundle's `signature` against `messageDigest.digest`
+///    using the algorithm-tagged [`try_verify`] dispatch. At least
+///    ONE trusted key must validate; otherwise
+///    [`VerifyError::SignatureInvalid`].
+/// 5. Optional Rekor inclusion-proof check — same posture as
+///    [`verify_blob`].
+pub fn verify_blob_message(
+    bundle: &Bundle,
+    payload: &[u8],
+    trusted_keys: &[VerifyingKey],
+    rekor: Option<&dyn RekorClient>,
+) -> Result<(), VerifyError> {
+    // 1. Shape gate: this verifier ONLY accepts MessageSignature
+    //    content. A DSSE bundle here is a routing bug.
+    if bundle.content_kind() != BundleContentKind::MessageSignature {
+        return Err(VerifyError::WrongContentType {
+            expected: "MessageSignature",
+            found: "DsseEnvelope",
+        });
+    }
+    let message_signature = match &bundle.content {
+        BundleContent::MessageSignature(ms) => ms,
+        // The shape gate above already proved this branch is
+        // unreachable. We re-match (rather than `unreachable!()`)
+        // to keep the function panic-free on any future content arm.
+        BundleContent::DsseEnvelope(_) => {
+            return Err(VerifyError::WrongContentType {
+                expected: "MessageSignature",
+                found: "DsseEnvelope",
+            });
+        }
+    };
+
+    // 2. Algorithm gate. v0 supports SHA-256 only; protobuf-specs
+    //    declares SHA2_256 / SHA2_384 / SHA2_512 / SHA3_256 / SHA3_384
+    //    / SHA3_512, but cosign and the broader ecosystem standardise
+    //    on SHA-256 for blob signing. Other algorithms surface a typed
+    //    error rather than silently re-hashing under SHA-256 (which
+    //    would always mismatch).
+    if message_signature.message_digest.algorithm != SHA2_256_ALGORITHM {
+        return Err(VerifyError::UnsupportedHashAlgorithm {
+            algorithm: message_signature.message_digest.algorithm.clone(),
+        });
+    }
+
+    // 3. Payload-digest gate. Re-hash what the caller handed us and
+    //    cross-check against the digest the bundle pinned. Mismatch
+    //    means the caller fetched the wrong payload (or the bundle
+    //    was misrouted) — distinct from a tampered-signature failure.
+    let computed = Sha256::digest(payload);
+    let computed_bytes: &[u8] = &computed;
+    let pinned_digest: &[u8] = &message_signature.message_digest.digest;
+    if computed_bytes != pinned_digest {
+        return Err(VerifyError::PayloadDigestMismatch {
+            expected: hex_lower(pinned_digest),
+            computed: hex_lower(computed_bytes),
+        });
+    }
+
+    // 4. Signature gate. The signed bytes are the digest itself —
+    //    NOT a DSSE PAE. Run the same algorithm-tagged dispatch
+    //    `verify_blob` uses so multi-algorithm trusted-key sets work
+    //    transparently here too.
+    let mut any_valid = false;
+    for key in trusted_keys {
+        if try_verify(key, pinned_digest, &message_signature.signature) {
+            any_valid = true;
+            break;
+        }
+    }
+    if !any_valid {
+        // MessageSignature carries no `keyid` — surface `None`. The
+        // bundle's cert (when present) is the only identity binding
+        // and is checked separately in `verify_blob_message_keyless`.
+        return Err(VerifyError::SignatureInvalid { keyid: None });
+    }
+
+    // 5. Optional Rekor proof check — identical posture to
+    //    `verify_blob`. Caller asked for transparency by passing a
+    //    client; an empty `tlog_entries` is `NoTlogEntry`. Each
+    //    entry's inclusion proof is re-verified against its embedded
+    //    root (online freshness is a v0.5 concern).
+    if let Some(client) = rekor {
+        if bundle.verification_material.tlog_entries.is_empty() {
+            return Err(VerifyError::NoTlogEntry);
+        }
+        let _ = client;
+        for tlog in &bundle.verification_material.tlog_entries {
+            verify_tlog_entry(tlog)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Keyless variant of [`verify_blob_message`]. Walks the cert chain
+/// to a trusted root, then dispatches to [`verify_blob_message`] with
+/// the leaf's verifying key. Same shape as [`verify_blob_keyless`]
+/// but routes through the MessageSignature verifier for the
+/// signature check.
+///
+/// See [`verify_blob_keyless_with_clock`] for the full pipeline,
+/// error surface, and rationale for each gate. This function uses
+/// the system clock for cert validity checks; production callers
+/// want this. Tests and air-gapped deploys can pin a clock by
+/// dropping into the explicit-clock variant
+/// [`verify_blob_message_keyless_with_clock`].
+pub fn verify_blob_message_keyless(
+    bundle: &Bundle,
+    payload: &[u8],
+    trust_anchors_der: &[Vec<u8>],
+    expected_san: Option<&str>,
+    rekor: Option<&dyn RekorClient>,
+) -> Result<(), VerifyError> {
+    verify_blob_message_keyless_with_clock(
+        bundle,
+        payload,
+        trust_anchors_der,
+        expected_san,
+        rekor,
+        &spec::SystemClock,
+    )
+}
+
+/// Explicit-clock variant of [`verify_blob_message_keyless`].
+///
+/// Same pipeline as [`verify_blob_keyless_with_clock`] (chain walk,
+/// validity-window enforcement on EVERY cert, optional SAN policy
+/// gate), then dispatches to [`verify_blob_message`] for the
+/// signature + payload-digest + Rekor check rather than to
+/// [`verify_blob`]. The split exists so DSSE-attestation flows and
+/// raw-blob flows hit the same chain validation but route the
+/// signature check through their respective shape verifiers.
+pub fn verify_blob_message_keyless_with_clock(
+    bundle: &Bundle,
+    payload: &[u8],
+    trust_anchors_der: &[Vec<u8>],
+    expected_san: Option<&str>,
+    rekor: Option<&dyn RekorClient>,
+    clock: &dyn spec::Clock,
+) -> Result<(), VerifyError> {
+    // 1. Chain pull — `Some` but empty inner is treated as `None`
+    //    per the convention `verify_blob_keyless_with_clock` set.
+    let chain_der: &[Vec<u8>] = match &bundle.verification_material.certificate {
+        Some(cert) if !cert.certificates.is_empty() => &cert.certificates,
+        _ => return Err(VerifyError::EmptyCertChain),
+    };
+
+    // 2. Chain walk → leaf VerifyingKey.
+    let leaf_vk = cert_chain::verify_chain(chain_der, trust_anchors_der)?;
+
+    // 3. Validity-window enforcement (issue #26). Apply to EVERY
+    //    cert; expiry on an intermediate is just as security-relevant
+    //    as expiry on the leaf.
+    let now = clock.now_unix_secs();
+    for cert_der in chain_der {
+        let (not_before, not_after) = cert_chain::cert_validity_window(cert_der)?;
+        if now < not_before {
+            return Err(VerifyError::CertNotYetValid { not_before });
+        }
+        if now >= not_after {
+            return Err(VerifyError::CertExpired { not_after });
+        }
+    }
+
+    // 4. SAN policy gate.
+    if let Some(expected) = expected_san {
+        let actual = cert_chain::extract_san(&chain_der[0])?;
+        if !actual.iter().any(|entry| entry == expected) {
+            return Err(VerifyError::SanMismatch {
+                expected: expected.to_string(),
+                actual,
+            });
+        }
+    }
+
+    // 5. Hand off to verify_blob_message with the leaf VK as the
+    //    single trusted key. This composes the chain check with the
+    //    MessageSignature-shape signature verification — same
+    //    pattern as verify_blob_keyless_with_clock's hand-off to
+    //    verify_blob.
+    verify_blob_message(bundle, payload, &[VerifyingKey::P256(leaf_vk)], rekor)
 }
 
 /// Sign `payload` with the given [`Signer`] and emit a keyless
@@ -2905,6 +3334,300 @@ mod tests {
         let parsed = pem::parse(pem_str).expect("parsable PEM");
         assert_eq!(parsed.tag(), "CERTIFICATE");
         assert_eq!(parsed.contents(), leaf_der);
+    }
+
+    // ── MessageSignature content path (issue #40) ───────────────────
+    //
+    // cosign treats Sigstore Bundle's two content arms as functionally
+    // distinct: messageSignature -> sign-blob / verify-blob,
+    // dsseEnvelope -> attest / verify-blob-attestation. justsign's
+    // earlier `sign_blob` always emitted DsseEnvelope content, so
+    // `cosign verify-blob` rejected the output with "payload must be a
+    // valid DSSE envelope: invalid character 'j'". `sign_blob_message`
+    // closes the gap.
+    //
+    // Tests below pin: the content arm produced, the
+    // signature-over-digest semantics (NOT PAE), the rekor schema
+    // dispatch (hashedrekord, NOT dsse), the verifier's shape gate,
+    // and the digest / wrong-key rejection cases.
+
+    /// Bug it catches: a producer that built `sign_blob_message` on
+    /// top of `sign_blob` (and reused the DSSE envelope content) would
+    /// emit a bundle cosign rejects with "payload must be a valid DSSE
+    /// envelope". The shape-arm assertion is the load-bearing gate.
+    #[test]
+    fn test_sign_blob_message_produces_message_signature_content() {
+        let signer = MockSigner::new(canned_signature(), Some("k1".into()));
+        let bundle = sign_blob_message(b"raw blob bytes", &signer, None).unwrap();
+
+        assert_eq!(
+            bundle.content_kind(),
+            spec::BundleContentKind::MessageSignature
+        );
+        match &bundle.content {
+            BundleContent::MessageSignature(ms) => {
+                assert_eq!(ms.message_digest.algorithm, "SHA2_256");
+                assert_eq!(ms.message_digest.digest.len(), 32);
+                assert_eq!(ms.signature, canned_signature());
+            }
+            other => panic!("expected MessageSignature content, got {other:?}"),
+        }
+        assert_eq!(bundle.media_type, SIGSTORE_BUNDLE_V0_3_MEDIA_TYPE);
+        assert!(bundle.verification_material.certificate.is_none());
+    }
+
+    /// Bug it catches: a producer that signed PAE bytes (the DSSE
+    /// flow) instead of the SHA-256 digest. Real Rekor / cosign would
+    /// reject the resulting signature because the verifier recomputes
+    /// `SHA-256(payload)` and checks the signature against THAT, not
+    /// against any PAE wrap. Round-trips with a real ECDSA key to
+    /// catch this — a mock signer wouldn't surface the failure.
+    #[test]
+    fn test_sign_blob_message_signature_verifies_against_payload_hash() {
+        let mut rng = ChaCha20Rng::from_seed([0xD0; 32]);
+        let sk = SigningKey::random(&mut rng);
+        let vk = VerifyingKey::P256(*sk.verifying_key());
+        let signer = EcdsaP256Signer::new(sk, Some("msg-key".into()));
+
+        let payload = b"production-grade raw blob \xF0\x9F\x9A\x80";
+        let bundle = sign_blob_message(payload, &signer, None).unwrap();
+
+        verify_blob_message(&bundle, payload, &[vk], None)
+            .expect("real ECDSA signature over SHA-256(payload) must verify");
+    }
+
+    /// Bug it catches: a producer that ignored the rekor argument
+    /// entirely (forgot to call `.submit`) would emit a bundle with
+    /// empty `tlog_entries`. We check both the entry count AND that
+    /// the schema is `hashedrekord` (NOT `dsse`) — a regression that
+    /// dispatched to the dsse rekor schema would still attach a tlog
+    /// entry, but real Rekor would reject the submission because the
+    /// dsse schema verifies signatures over PAE bytes, not over the
+    /// SHA-256 digest we signed here.
+    #[test]
+    fn test_sign_blob_message_with_mock_rekor_attaches_tlog_entry() {
+        let signer = MockSigner::new(canned_signature(), None);
+        let client = MockRekorClient::new();
+
+        let bundle = sign_blob_message(b"witnessed raw blob", &signer, Some(&client)).unwrap();
+        assert_eq!(bundle.verification_material.tlog_entries.len(), 1);
+        let tlog = &bundle.verification_material.tlog_entries[0];
+        assert_eq!(
+            tlog.kind_version.kind, "hashedrekord",
+            "MessageSignature-content bundles MUST use the hashedrekord schema; \
+             dispatching to dsse here would break Rekor submission"
+        );
+        let proof = tlog.inclusion_proof.as_ref().unwrap();
+        assert_eq!(proof.tree_size, 1);
+    }
+
+    /// Bug it catches: a producer that built the bundle but forgot to
+    /// thread the cert chain into `verification_material.certificate`.
+    /// The keyless verifier would later reject every bundle this
+    /// producer emitted with `EmptyCertChain` even though the input
+    /// was non-empty.
+    #[test]
+    fn test_sign_blob_message_keyless_attaches_leaf_cert_to_bundle() {
+        let signer = MockSigner::new(canned_signature(), None);
+        let chain: Vec<Vec<u8>> = vec![
+            b"leaf-der-bytes".to_vec(),
+            b"intermediate-der-bytes".to_vec(),
+        ];
+
+        let bundle = sign_blob_message_keyless(b"keyless raw blob", &signer, &chain, None).unwrap();
+
+        let cert = bundle
+            .verification_material
+            .certificate
+            .as_ref()
+            .expect("cert chain must be Some");
+        // In-memory carries the full chain (parity with
+        // `sign_blob_keyless`); `encode_json` will emit only the leaf
+        // per protobuf-specs v0.3 final + #38. In-process verifiers
+        // need the intermediates to walk the chain.
+        assert_eq!(cert.certificates, chain);
+
+        assert_eq!(
+            bundle.content_kind(),
+            spec::BundleContentKind::MessageSignature
+        );
+
+        // Wire emit must still be leaf-only — round-trip the bundle
+        // and confirm only the leaf comes back through.
+        let bytes = bundle.encode_json().expect("encode");
+        let decoded = Bundle::decode_json(&bytes).expect("decode");
+        let decoded_cert = decoded
+            .verification_material
+            .certificate
+            .expect("decoded cert");
+        assert_eq!(
+            decoded_cert.certificates.len(),
+            1,
+            "wire emit MUST be leaf-only post-#38"
+        );
+        assert_eq!(decoded_cert.certificates[0], chain[0]);
+    }
+
+    /// Bug it catches: a producer that silently emitted a bundle
+    /// whose `certificate.certificates` is empty. Mirror of
+    /// `test_sign_blob_keyless_rejects_empty_chain` — the same
+    /// failure mode applies on the MessageSignature side.
+    #[test]
+    fn test_sign_blob_message_keyless_rejects_empty_chain() {
+        let signer = MockSigner::new(canned_signature(), None);
+        let empty: &[Vec<u8>] = &[];
+
+        let err = sign_blob_message_keyless(b"payload", &signer, empty, None)
+            .expect_err("empty chain MUST surface a typed error before signing");
+        assert!(matches!(err, SignError::EmptyCertChain));
+    }
+
+    /// Bug it catches: any drift between
+    /// `sign_blob_message_keyless` and `verify_blob_message_keyless`
+    /// — chain attachment, signature-over-digest semantics, leaf VK
+    /// derivation — would fail this round-trip even if both halves
+    /// "look right" in isolation. Load-bearing end-to-end smoke for
+    /// the keyless MessageSignature flow.
+    #[test]
+    fn test_sign_blob_message_keyless_round_trips_through_verify_blob_message_keyless() {
+        let fx = build_keyless_sign_fixture();
+
+        let leaf_signing_key_clone = KeylessSigningKey::from_bytes(&fx.leaf_signing_key.to_bytes())
+            .expect("re-import leaf key");
+        let signer = EcdsaP256Signer::new(leaf_signing_key_clone, Some("leaf".into()));
+
+        let payload = b"keyless message-signature round-trip";
+        let bundle = sign_blob_message_keyless(payload, &signer, &fx.chain_der, None)
+            .expect("sign_blob_message_keyless");
+
+        verify_blob_message_keyless(
+            &bundle,
+            payload,
+            std::slice::from_ref(&fx.root_der),
+            None,
+            None,
+        )
+        .expect("keyless MessageSignature producer + verifier must close the loop");
+    }
+
+    /// Bug it catches: a verifier that fell through to the DSSE arm
+    /// (or "tried both") would let an attestation bundle pass the
+    /// raw-blob verifier — and vice versa. The shape gate is the
+    /// security boundary that keeps the two flows distinct.
+    #[test]
+    fn test_verify_blob_message_rejects_dsse_content_bundle() {
+        let mut rng = ChaCha20Rng::from_seed([0xD1; 32]);
+        let sk = SigningKey::random(&mut rng);
+        let vk = VerifyingKey::P256(*sk.verifying_key());
+        let signer = EcdsaP256Signer::new(sk, None);
+
+        // Build a real DSSE-content bundle.
+        let dsse_bundle = sign_blob(b"attestation payload", "text/plain", &signer, None).unwrap();
+        assert_eq!(
+            dsse_bundle.content_kind(),
+            spec::BundleContentKind::DsseEnvelope
+        );
+
+        let err = verify_blob_message(&dsse_bundle, b"attestation payload", &[vk], None)
+            .expect_err("DSSE bundle handed to MessageSignature verifier MUST reject");
+        match err {
+            VerifyError::WrongContentType { expected, found } => {
+                assert_eq!(expected, "MessageSignature");
+                assert_eq!(found, "DsseEnvelope");
+            }
+            other => panic!("expected WrongContentType, got {other:?}"),
+        }
+    }
+
+    /// Bug it catches: a verifier that skipped the digest gate would
+    /// accept a bundle whose pinned digest doesn't match the payload
+    /// the caller fetched — meaning a bundle could be re-pointed at a
+    /// different blob and still pass. The PayloadDigestMismatch
+    /// surface lets ops route on "wrong file fetched" distinctly from
+    /// "tamper detected".
+    #[test]
+    fn test_verify_blob_message_rejects_payload_with_wrong_digest() {
+        let mut rng = ChaCha20Rng::from_seed([0xD2; 32]);
+        let sk = SigningKey::random(&mut rng);
+        let vk = VerifyingKey::P256(*sk.verifying_key());
+        let signer = EcdsaP256Signer::new(sk, None);
+
+        let bundle = sign_blob_message(b"original payload", &signer, None).unwrap();
+
+        let err = verify_blob_message(&bundle, b"completely different payload", &[vk], None)
+            .expect_err("wrong payload bytes MUST reject");
+        match err {
+            VerifyError::PayloadDigestMismatch { expected, computed } => {
+                // The pinned digest must NOT equal the recomputed one
+                // — that's the whole point of the surface.
+                assert_ne!(expected, computed);
+                // And both must be 64-char lowercase hex (SHA-256).
+                assert_eq!(expected.len(), 64);
+                assert_eq!(computed.len(), 64);
+            }
+            other => panic!("expected PayloadDigestMismatch, got {other:?}"),
+        }
+    }
+
+    /// Bug it catches: a verifier that returned `Ok(())` whenever
+    /// the digest gate passed (without checking the cryptographic
+    /// signature) would silently accept ANY bundle whose digest the
+    /// caller could re-derive — i.e. every bundle, since the digest
+    /// is derived from the payload. Sign with key A, verify with key
+    /// B (same payload, correct digest) — must reject as
+    /// `SignatureInvalid`.
+    #[test]
+    fn test_verify_blob_message_rejects_signature_with_wrong_key() {
+        let mut rng_a = ChaCha20Rng::from_seed([0xD3; 32]);
+        let sk_a = SigningKey::random(&mut rng_a);
+        let signer_a = EcdsaP256Signer::new(sk_a, None);
+
+        let mut rng_b = ChaCha20Rng::from_seed([0xD4; 32]);
+        let sk_b = SigningKey::random(&mut rng_b);
+        let vk_b = VerifyingKey::P256(*sk_b.verifying_key());
+
+        let payload = b"signed by A, verified against B";
+        let bundle = sign_blob_message(payload, &signer_a, None).unwrap();
+
+        let err = verify_blob_message(&bundle, payload, &[vk_b], None)
+            .expect_err("wrong-key verification MUST reject");
+        assert!(
+            matches!(err, VerifyError::SignatureInvalid { keyid: None }),
+            "expected SignatureInvalid (no keyid for MessageSignature), got {err:?}"
+        );
+    }
+
+    /// Bug it catches: a verifier that hardcoded SHA-256 acceptance
+    /// without checking the algorithm field would silently re-hash a
+    /// SHA-512-tagged bundle under SHA-256 and either pass or fail
+    /// confusingly. Surfacing the unsupported algorithm as a typed
+    /// error is the only way ops can distinguish "your bundle uses
+    /// an algo we don't support yet" from a real failure.
+    #[test]
+    fn test_verify_blob_message_rejects_unsupported_hash_algorithm() {
+        let mut rng = ChaCha20Rng::from_seed([0xD5; 32]);
+        let sk = SigningKey::random(&mut rng);
+        let vk = VerifyingKey::P256(*sk.verifying_key());
+        let signer = EcdsaP256Signer::new(sk, None);
+
+        let mut bundle = sign_blob_message(b"payload", &signer, None).unwrap();
+        // Mutate the algorithm field after the fact — simulates a
+        // producer claiming SHA-512 but actually emitting a SHA-256
+        // digest, which is exactly what the gate must catch.
+        if let BundleContent::MessageSignature(ms) = &mut bundle.content {
+            ms.message_digest.algorithm = "SHA2_512".to_string();
+        } else {
+            panic!("expected MessageSignature content");
+        }
+
+        let err = verify_blob_message(&bundle, b"payload", &[vk], None)
+            .expect_err("unsupported algorithm MUST surface a typed error");
+        match err {
+            VerifyError::UnsupportedHashAlgorithm { algorithm } => {
+                assert_eq!(algorithm, "SHA2_512");
+            }
+            other => panic!("expected UnsupportedHashAlgorithm, got {other:?}"),
+        }
     }
 }
 

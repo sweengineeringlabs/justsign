@@ -261,6 +261,62 @@ pub enum VerifyError {
     /// inner variants (wrong `_type`, malformed JSON, etc.).
     #[error("statement decode: {0}")]
     StatementDecode(#[from] StatementDecodeError),
+
+    /// Bundle's content arm doesn't match what the verifier expected.
+    /// Surfaced by [`crate::verify_blob_message`] when handed a
+    /// `DsseEnvelope`-content bundle (a DSSE attestation routed into
+    /// the raw-blob verifier), and symmetric in spirit to
+    /// [`Self::EnvelopeMissing`] (which is the DSSE-side equivalent).
+    ///
+    /// Held distinct from `EnvelopeMissing` because cosign's two
+    /// content arms are *functionally* distinct flows: a verifier
+    /// that lumped both rejections under one name would mask which
+    /// direction the wrong-shape bundle was pointed at, and operators
+    /// would have to re-read the verifier source to know whether they
+    /// fed `verify-blob` an attestation or `verify-blob-attestation`
+    /// a sign-blob bundle.
+    #[error("wrong bundle content: expected {expected}, found {found}")]
+    WrongContentType {
+        /// Content kind the verifier required.
+        expected: &'static str,
+        /// Content kind the bundle actually carried.
+        found: &'static str,
+    },
+
+    /// SHA-256 of the caller-supplied payload doesn't match the
+    /// `messageDigest.digest` pinned in a `MessageSignature`-content
+    /// bundle. Surfaced by [`crate::verify_blob_message`].
+    ///
+    /// Held distinct from [`Self::SignatureInvalid`] because a digest
+    /// mismatch means the *caller* re-fetched the wrong payload (or
+    /// the bundle was misrouted), not that the signature itself was
+    /// bad. Ops route on the two cases differently — digest mismatch
+    /// is a "you fetched the wrong file" hint; signature mismatch is
+    /// a "tamper detected" alert.
+    #[error("payload digest mismatch: bundle pinned {expected}, computed {computed}")]
+    PayloadDigestMismatch {
+        /// Hex-encoded digest the bundle pinned in
+        /// `messageDigest.digest`.
+        expected: String,
+        /// Hex-encoded SHA-256 of the payload the verifier was
+        /// handed.
+        computed: String,
+    },
+
+    /// `MessageSignature.messageDigest.algorithm` is not one this
+    /// verifier knows how to recompute. v0 supports only `SHA2_256`
+    /// — every other algorithm surfaces this typed error rather than
+    /// silently accepting (or attempting an undefined recompute).
+    ///
+    /// Surfaced by [`crate::verify_blob_message`].
+    #[error("unsupported messageDigest algorithm: {algorithm}")]
+    UnsupportedHashAlgorithm {
+        /// The algorithm string from the bundle's `messageDigest`.
+        /// Echoed verbatim so operators can see the exact value the
+        /// producer claimed (e.g. `SHA2_512`, a typo, an empty
+        /// string).
+        algorithm: String,
+    },
 }
 
 /// Failure surface of [`crate::oci`] manifest construction +

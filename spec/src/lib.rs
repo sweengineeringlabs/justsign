@@ -35,8 +35,8 @@ pub use in_toto::{
 pub use sbom::{CYCLONEDX_BOM_V1_5_PREDICATE_TYPE, SPDX_DOCUMENT_V2_3_PREDICATE_TYPE};
 
 pub use sigstore_bundle::{
-    Bundle, BundleContent, BundleDecodeError, BundleEncodeError, Certificate, Checkpoint,
-    HashOutput, InclusionPromise, InclusionProof, KindVersion, MessageSignature,
+    Bundle, BundleContent, BundleContentKind, BundleDecodeError, BundleEncodeError, Certificate,
+    Checkpoint, HashOutput, InclusionPromise, InclusionProof, KindVersion, MessageSignature,
     TimestampVerificationData, TlogEntry, VerificationMaterial, SIGSTORE_BUNDLE_V0_3_MEDIA_TYPE,
 };
 
