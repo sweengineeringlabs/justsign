@@ -46,6 +46,12 @@ pub enum SignError {
     /// from real signing failures.
     #[error("bundle encode: {0}")]
     BundleEncode(#[from] BundleEncodeError),
+
+    /// OCI manifest construction (issue #6 surface) failed. Held
+    /// as its own variant so blob and OCI flows stay
+    /// distinguishable in callers.
+    #[error("oci: {0}")]
+    Oci(#[from] OciError),
 }
 
 /// Failure surface of [`crate::verify_blob`].
@@ -135,5 +141,111 @@ pub enum VerifyError {
         /// timestamps; negative values are legal in DER but would
         /// only arise from clock-pre-1970 weirdness.
         not_after: i64,
+    },
+
+    /// Internal: re-encoding the bundle to compute its layer
+    /// digest failed during `verify_oci`. Held separately from
+    /// `BundleDecode` because the construction sites differ.
+    #[error("bundle re-encode for oci verify: {0}")]
+    BundleEncode(#[from] BundleEncodeError),
+
+    /// OCI manifest construction or parsing failed during an
+    /// `verify_oci` call. Held as its own variant so the OCI
+    /// surface can grow without disturbing the blob verifier.
+    #[error("oci: {0}")]
+    Oci(#[from] OciError),
+
+    /// Layer descriptor in the OCI referrer manifest doesn't
+    /// match the bundle the caller passed in. Distinct from
+    /// `Oci(LayerMismatch)` only in v0 — kept fused so the
+    /// verifier can route on the typed inner.
+    #[error("oci layer digest mismatch: manifest={manifest_layer_digest}, computed={computed_bundle_digest}")]
+    OciLayerMismatch {
+        /// Digest the manifest claims for the bundle layer.
+        manifest_layer_digest: String,
+        /// Digest computed from the bundle bytes the caller provided.
+        computed_bundle_digest: String,
+    },
+}
+
+/// Failure surface of [`crate::oci`] manifest construction +
+/// parsing.
+///
+/// Construction sites:
+///
+/// * `Json`              — serde_json round-trip failed (encoding
+///   the manifest, or decoding bytes the caller handed us).
+/// * `BundleEncode`      — internal: encoding the bundle to bytes
+///   to compute the layer digest hit a `BundleEncodeError`.
+///   Surfaced as a string so we don't leak the spec error type
+///   through `OciError`'s public API.
+/// * `BadDigestFormat`   — caller passed a digest that doesn't
+///   match `<algo>:<hex>`. Caught early so a typo'd digest
+///   doesn't propagate into a manifest that a registry will
+///   reject 200 lines later.
+/// * `LayerMismatch`     — manifest layer digest didn't match the
+///   bundle bytes the verifier was handed. Surfaces tampering or
+///   a wrong-bundle-for-this-manifest pairing.
+/// * `MissingSubject`    — manifest had no `subject` descriptor;
+///   it's not a referrer at all.
+/// * `WrongArtifactType` — manifest's `artifactType` isn't the
+///   Sigstore bundle media type. cosign uses a fixed string.
+/// * `WrongSchemaVersion` — OCI image manifest schemaVersion
+///   wasn't 2. v0 only emits/accepts schemaVersion=2.
+/// * `WrongLayerCount`   — referrer manifests for Sigstore
+///   bundles must carry exactly ONE layer (the bundle blob).
+#[derive(Debug, thiserror::Error)]
+pub enum OciError {
+    /// JSON encode or decode failed.
+    #[error("oci manifest json: {0}")]
+    Json(#[from] serde_json::Error),
+
+    /// Bundle could not be encoded to compute the layer digest.
+    #[error("bundle encode for oci layer: {0}")]
+    BundleEncode(String),
+
+    /// Caller-supplied digest doesn't match `<algo>:<hex>`.
+    #[error("bad digest format: {value}")]
+    BadDigestFormat {
+        /// The offending digest string. Echoed back so the caller
+        /// can route logging / user-error messages on it.
+        value: String,
+    },
+
+    /// Manifest layer digest disagrees with the bundle we have.
+    #[error("layer digest mismatch: manifest={manifest_layer_digest}, computed={computed_bundle_digest}")]
+    LayerMismatch {
+        /// Digest the manifest claims for the bundle layer.
+        manifest_layer_digest: String,
+        /// Digest computed from the bundle bytes we hashed.
+        computed_bundle_digest: String,
+    },
+
+    /// Manifest decoded fine but had no `subject` field — that's
+    /// the field that makes a manifest a referrer.
+    #[error("oci referrer manifest missing subject")]
+    MissingSubject,
+
+    /// `artifactType` wasn't the Sigstore bundle v0.3 media type.
+    #[error("wrong artifactType: found {found:?}, expected {expected:?}")]
+    WrongArtifactType {
+        /// `artifactType` as it appeared on the wire.
+        found: String,
+        /// Value we required.
+        expected: String,
+    },
+
+    /// `schemaVersion` was not 2.
+    #[error("wrong schemaVersion: found {found}")]
+    WrongSchemaVersion {
+        /// `schemaVersion` as it appeared on the wire.
+        found: i64,
+    },
+
+    /// Manifest had a layer count other than 1.
+    #[error("wrong layer count: found {found}, expected 1")]
+    WrongLayerCount {
+        /// Number of layers in the manifest.
+        found: usize,
     },
 }

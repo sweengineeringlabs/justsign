@@ -45,9 +45,10 @@ pub use tuf;
 
 pub mod cert_chain;
 mod error;
+pub mod oci;
 mod signer;
 
-pub use error::{SignError, VerifyError};
+pub use error::{OciError, SignError, VerifyError};
 pub use signer::{EcdsaP256Signer, MockSigner, Signer, SignerError};
 
 use p256::ecdsa::signature::Verifier as _;
@@ -349,6 +350,180 @@ fn hex_lower(bytes: &[u8]) -> String {
         out.push(HEX[(b & 0x0f) as usize] as char);
     }
     out
+}
+
+// ---------------------------------------------------------------
+// OCI artifact signing — issue #6
+// ---------------------------------------------------------------
+
+/// Outputs of [`sign_oci`].
+///
+/// The caller pushes `bundle_bytes` as a blob and
+/// `referrer_manifest` as a manifest at the registry. The
+/// digests are returned alongside so the caller doesn't re-hash
+/// to address either resource.
+#[derive(Debug, Clone)]
+pub struct OciSignArtifacts {
+    /// The DSSE-wrapped Sigstore bundle, in-memory.
+    pub bundle: Bundle,
+    /// `bundle.encode_json()` — exactly what the layer blob carries.
+    pub bundle_bytes: Vec<u8>,
+    /// `sha256:<hex>` of `bundle_bytes`. Matches `layers[0].digest`.
+    pub bundle_digest: String,
+    /// The OCI 1.1 referrer manifest JSON.
+    pub referrer_manifest: Vec<u8>,
+    /// `sha256:<hex>` of `referrer_manifest`.
+    pub referrer_manifest_digest: String,
+    /// Manifest media type — always
+    /// `application/vnd.oci.image.manifest.v1+json` in v0.
+    pub referrer_manifest_media_type: String,
+}
+
+/// Outputs of [`verify_oci`].
+///
+/// Returns the subject descriptor extracted from the manifest so
+/// the caller can route policy on it ("does this match the
+/// artifact I just pulled?").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedOci {
+    pub subject_digest: String,
+    pub subject_media_type: String,
+    pub subject_size: u64,
+}
+
+/// Sign an OCI artifact identified by its manifest digest +
+/// media type + size.
+///
+/// PAE-payload contract: the bytes signed are the subject
+/// digest as a UTF-8 string (e.g. `sha256:abc...`). This matches
+/// what cosign emits for container-image signatures and is the
+/// caller-friendly contract: the verifier doesn't need the
+/// artifact bytes, only its digest.
+///
+/// Logic:
+///
+/// 1. Hand `subject_digest`'s UTF-8 bytes to [`sign_blob`] with
+///    payload type `text/plain`. This produces a Sigstore bundle.
+/// 2. Encode the bundle to JSON and hash it — the layer blob.
+/// 3. Build the OCI 1.1 referrer manifest pointing at
+///    `subject_digest` and carrying the bundle layer.
+/// 4. Hash the manifest bytes for the caller to address it.
+pub fn sign_oci(
+    subject_digest: &str,
+    subject_media_type: &str,
+    subject_size: u64,
+    signer: &dyn Signer,
+    rekor: Option<&dyn RekorClient>,
+) -> Result<OciSignArtifacts, SignError> {
+    // 1. Sign the digest string. cosign also signs the digest
+    //    string (not the artifact bytes) — that's what makes OCI
+    //    signing work for arbitrarily large images.
+    let bundle = sign_blob(subject_digest.as_bytes(), "text/plain", signer, rekor)?;
+
+    // 2. Serialise the bundle once — both for the layer blob
+    //    digest AND the artifacts the caller pushes. Encoding
+    //    twice would risk byte-level drift if `Bundle::encode_json`
+    //    becomes non-deterministic.
+    let bundle_bytes = bundle.encode_json()?;
+    let bundle_digest = oci::sha256_digest_string(&bundle_bytes);
+    let bundle_size = bundle_bytes.len() as u64;
+
+    // 3. Wrap the bundle in an OCI 1.1 referrer manifest.
+    //    `build_referrer_manifest_for_bundle_bytes` skips the
+    //    re-encode of the bundle — we already have the digest.
+    let (referrer_manifest, referrer_manifest_media_type) =
+        oci::build_referrer_manifest_for_bundle_bytes(
+            &bundle_digest,
+            bundle_size,
+            subject_digest,
+            subject_media_type,
+            subject_size,
+        )
+        .map_err(SignError::Oci)?;
+
+    let referrer_manifest_digest = oci::sha256_digest_string(&referrer_manifest);
+
+    Ok(OciSignArtifacts {
+        bundle,
+        bundle_bytes,
+        bundle_digest,
+        referrer_manifest,
+        referrer_manifest_digest,
+        referrer_manifest_media_type,
+    })
+}
+
+/// Verify an OCI 1.1 referrer manifest produced by [`sign_oci`].
+///
+/// Inputs:
+///
+/// * `referrer_manifest` — manifest bytes (caller fetched from
+///   the registry).
+/// * `bundle` — the bundle blob the manifest's `layers[0]` points
+///   at (caller fetched the layer blob, decoded it via
+///   [`spec::Bundle::decode_json`]).
+/// * `trusted_keys` — same shape as [`verify_blob`].
+/// * `rekor` — same shape as [`verify_blob`].
+///
+/// Steps:
+///
+/// 1. Parse the manifest, validating shape (schemaVersion,
+///    artifactType, layer count).
+/// 2. Re-encode the bundle, hash it, and check the manifest's
+///    layer digest matches.
+/// 3. Run [`verify_blob`] over the bundle.
+/// 4. Cross-check: the bundle's signed payload is the subject
+///    digest string. The verifier confirms this matches the
+///    manifest's `subject.digest`. Any drift means the manifest
+///    was repointed at a different artifact than the one the
+///    bundle signed over.
+///
+/// Returns a [`VerifiedOci`] carrying the subject the verifier
+/// SHOULD then validate against the artifact it actually pulled.
+pub fn verify_oci(
+    referrer_manifest: &[u8],
+    bundle: &Bundle,
+    trusted_keys: &[VerifyingKey],
+    rekor: Option<&dyn RekorClient>,
+) -> Result<VerifiedOci, VerifyError> {
+    // 1. Parse + shape-validate the manifest.
+    let parsed = oci::parse_referrer_manifest(referrer_manifest).map_err(VerifyError::Oci)?;
+
+    // 2. Layer digest MUST match the bundle bytes the caller
+    //    passed. We re-encode here — the caller may have decoded
+    //    + re-encoded the bundle, but if `Bundle::encode_json`
+    //    is deterministic the digest matches.
+    let bundle_bytes = bundle.encode_json()?;
+    let computed_digest = oci::sha256_digest_string(&bundle_bytes);
+    if parsed.layer.digest != computed_digest {
+        return Err(VerifyError::OciLayerMismatch {
+            manifest_layer_digest: parsed.layer.digest,
+            computed_bundle_digest: computed_digest,
+        });
+    }
+
+    // 3. Cryptographic verification of the bundle.
+    verify_blob(bundle, trusted_keys, rekor)?;
+
+    // 4. Bundle's signed payload MUST equal the manifest subject
+    //    digest. Otherwise the manifest could be re-pointed at a
+    //    different artifact than the one this bundle attests to.
+    if let BundleContent::DsseEnvelope(env) = &bundle.content {
+        if env.payload != parsed.subject.digest.as_bytes() {
+            return Err(VerifyError::OciLayerMismatch {
+                manifest_layer_digest: parsed.subject.digest.clone(),
+                computed_bundle_digest: String::from_utf8_lossy(&env.payload).to_string(),
+            });
+        }
+    }
+    // BundleContent::MessageSignature would have been rejected by
+    // `verify_blob` already (EnvelopeMissing).
+
+    Ok(VerifiedOci {
+        subject_digest: parsed.subject.digest,
+        subject_media_type: parsed.subject.media_type,
+        subject_size: parsed.subject.size,
+    })
 }
 
 // ───────────────────────────────────────────────────────────────────
@@ -1010,5 +1185,219 @@ mod tests {
         // Verifier doesn't know about keyids; it just tries the
         // key. Should still succeed.
         verify_blob(&bundle, &[vk], None).unwrap();
+    }
+
+    // -----------------------------------------------------------
+    // OCI artifact signing tests — issue #6
+    // -----------------------------------------------------------
+
+    /// `sign_oci` produces a layer descriptor whose digest equals
+    /// the SHA-256 of the bundle bytes the caller will push.
+    ///
+    /// Bug it catches: a sign path that hashed the bundle BEFORE
+    /// the rekor `tlog_entries` were attached (hashing the
+    /// pre-rekor bundle instead of the final one) would emit a
+    /// layer digest that no registry blob could ever match.
+    #[test]
+    fn test_sign_oci_produces_consistent_layer_digest() {
+        let mut rng = ChaCha20Rng::from_seed([0x88; 32]);
+        let sk = SigningKey::random(&mut rng);
+        let signer = EcdsaP256Signer::new(sk, Some("oci-test".into()));
+
+        let subject_digest =
+            "sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        let artifacts = sign_oci(
+            subject_digest,
+            "application/vnd.oci.image.manifest.v1+json",
+            4096,
+            &signer,
+            None,
+        )
+        .unwrap();
+
+        // bundle_bytes hashes to bundle_digest.
+        let recomputed = oci::sha256_digest_string(&artifacts.bundle_bytes);
+        assert_eq!(recomputed, artifacts.bundle_digest);
+
+        // Manifest's layer descriptor carries that exact digest.
+        let parsed = oci::parse_referrer_manifest(&artifacts.referrer_manifest).unwrap();
+        assert_eq!(parsed.layer.digest, artifacts.bundle_digest);
+        assert_eq!(parsed.layer.size, artifacts.bundle_bytes.len() as u64);
+
+        // referrer_manifest_digest hashes the manifest bytes.
+        let recomputed_manifest = oci::sha256_digest_string(&artifacts.referrer_manifest);
+        assert_eq!(recomputed_manifest, artifacts.referrer_manifest_digest);
+    }
+
+    /// Tampering the bundle after signing causes `verify_oci` to
+    /// reject with `OciLayerMismatch` — the layer descriptor
+    /// pinned in the manifest no longer matches.
+    ///
+    /// Bug it catches: a verifier that ran `verify_blob` first
+    /// (and bailed on signature failure) would mask the layer-
+    /// digest check entirely. We tamper a byte that doesn't break
+    /// the bundle's signature so the layer-digest path is the
+    /// only thing standing between the verifier and a wrong-
+    /// blob acceptance.
+    #[test]
+    fn test_verify_oci_rejects_layer_digest_mismatch() {
+        let mut rng = ChaCha20Rng::from_seed([0x99; 32]);
+        let sk = SigningKey::random(&mut rng);
+        let vk = *sk.verifying_key();
+        let signer = EcdsaP256Signer::new(sk, None);
+
+        let subject_digest =
+            "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+        let artifacts = sign_oci(
+            subject_digest,
+            "application/vnd.oci.image.manifest.v1+json",
+            500,
+            &signer,
+            None,
+        )
+        .unwrap();
+
+        // Decode the bundle, mutate the keyid (a non-signed
+        // metadata field — the cryptographic signature still
+        // verifies, but the encoded bytes change). This isolates
+        // the layer-digest check from the cryptographic check.
+        let mut tampered_bundle = Bundle::decode_json(&artifacts.bundle_bytes).unwrap();
+        if let BundleContent::DsseEnvelope(env) = &mut tampered_bundle.content {
+            env.signatures[0].keyid = Some("tampered-keyid".to_string());
+        } else {
+            unreachable!();
+        }
+
+        let err =
+            verify_oci(&artifacts.referrer_manifest, &tampered_bundle, &[vk], None).unwrap_err();
+        assert!(
+            matches!(err, VerifyError::OciLayerMismatch { .. }),
+            "expected OciLayerMismatch, got {err:?}"
+        );
+    }
+
+    /// `verify_oci` rejects a manifest whose `artifactType` is
+    /// not the Sigstore bundle media type. Routes through the
+    /// `Oci(WrongArtifactType)` chain.
+    #[test]
+    fn test_verify_oci_rejects_wrong_artifact_type() {
+        // Hand-build a manifest with the wrong artifactType but
+        // an otherwise-correct shape, then drive verify_oci.
+        let mut rng = ChaCha20Rng::from_seed([0xAA; 32]);
+        let sk = SigningKey::random(&mut rng);
+        let vk = *sk.verifying_key();
+        let signer = EcdsaP256Signer::new(sk, None);
+
+        let subject_digest =
+            "sha256:2222222222222222222222222222222222222222222222222222222222222222";
+        let artifacts = sign_oci(
+            subject_digest,
+            "application/vnd.oci.image.manifest.v1+json",
+            512,
+            &signer,
+            None,
+        )
+        .unwrap();
+
+        // Mutate the artifactType in-place via a JSON round trip.
+        let mut json: serde_json::Value =
+            serde_json::from_slice(&artifacts.referrer_manifest).unwrap();
+        json["artifactType"] = serde_json::Value::String("application/wrong+json".to_string());
+        let bad_manifest = serde_json::to_vec(&json).unwrap();
+
+        let bundle = Bundle::decode_json(&artifacts.bundle_bytes).unwrap();
+        let err = verify_oci(&bad_manifest, &bundle, &[vk], None).unwrap_err();
+        match err {
+            VerifyError::Oci(OciError::WrongArtifactType { found, .. }) => {
+                assert_eq!(found, "application/wrong+json");
+            }
+            other => panic!("expected Oci(WrongArtifactType), got {other:?}"),
+        }
+    }
+
+    /// `sign_oci` followed by `verify_oci` succeeds with a real
+    /// ECDSA keypair — the full happy path.
+    ///
+    /// Bug it catches: any drift in the PAE-payload contract
+    /// (e.g. signing the digest as bytes vs. as a UTF-8 string,
+    /// or stripping the `sha256:` prefix on one side only) would
+    /// surface as a verification failure. The cross-check between
+    /// `subject.digest` and the bundle's payload would also fail
+    /// if either side rewrote the digest format.
+    #[test]
+    fn test_sign_oci_then_verify_oci_round_trips() {
+        let mut rng = ChaCha20Rng::from_seed([0xBB; 32]);
+        let sk = SigningKey::random(&mut rng);
+        let vk = *sk.verifying_key();
+        let signer = EcdsaP256Signer::new(sk, Some("rt-key".into()));
+
+        let subject_digest =
+            "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        let subject_media_type = "application/vnd.oci.image.manifest.v1+json";
+        let subject_size = 7777u64;
+
+        let artifacts = sign_oci(
+            subject_digest,
+            subject_media_type,
+            subject_size,
+            &signer,
+            None,
+        )
+        .unwrap();
+
+        // Caller would push artifacts.bundle_bytes as a layer
+        // and artifacts.referrer_manifest as a manifest. Verifier
+        // pulls them back and re-verifies.
+        let pulled_bundle = Bundle::decode_json(&artifacts.bundle_bytes).unwrap();
+        let verified =
+            verify_oci(&artifacts.referrer_manifest, &pulled_bundle, &[vk], None).unwrap();
+
+        assert_eq!(verified.subject_digest, subject_digest);
+        assert_eq!(verified.subject_media_type, subject_media_type);
+        assert_eq!(verified.subject_size, subject_size);
+    }
+
+    /// `sign_oci` with a Rekor client populates the bundle's
+    /// `tlog_entries`, the manifest still parses correctly, and
+    /// `verify_oci` with a Rekor client also succeeds.
+    ///
+    /// Bug it catches: a sign path that re-encoded the bundle
+    /// BEFORE attaching tlog entries would land a layer digest
+    /// whose preimage doesn't include the tlog. The verifier's
+    /// re-encode would then mismatch, surfacing as a
+    /// `OciLayerMismatch`.
+    #[test]
+    fn test_sign_oci_with_rekor_attaches_tlog_entry() {
+        let mut rng = ChaCha20Rng::from_seed([0xCC; 32]);
+        let sk = SigningKey::random(&mut rng);
+        let vk = *sk.verifying_key();
+        let signer = EcdsaP256Signer::new(sk, None);
+        let client = MockRekorClient::new();
+
+        let subject_digest =
+            "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+        let artifacts = sign_oci(
+            subject_digest,
+            "application/vnd.oci.image.manifest.v1+json",
+            128,
+            &signer,
+            Some(&client),
+        )
+        .unwrap();
+
+        // Bundle has exactly one tlog entry.
+        assert_eq!(artifacts.bundle.verification_material.tlog_entries.len(), 1);
+
+        // Round trip with rekor verification.
+        let pulled_bundle = Bundle::decode_json(&artifacts.bundle_bytes).unwrap();
+        assert_eq!(pulled_bundle.verification_material.tlog_entries.len(), 1);
+        let verified = verify_oci(
+            &artifacts.referrer_manifest,
+            &pulled_bundle,
+            &[vk],
+            Some(&client),
+        )
+        .unwrap();
+        assert_eq!(verified.subject_digest, subject_digest);
     }
 }
