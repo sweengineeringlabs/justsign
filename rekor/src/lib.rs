@@ -1,25 +1,27 @@
 //! Rekor client for justsign — submit + Merkle inclusion-proof
 //! verification.
 //!
-//! v0 ships verifier-only:
+//! Surface:
 //!
 //! * RFC 6962 Merkle inclusion-proof verification (`merkle::verify_inclusion`).
-//! * `hashedrekord` v0.0.1 entry types (`entry::HashedRekord`)
-//!   with JSON encode/decode.
-//! * A `RekorClient` trait + `MockRekorClient` that returns canned
-//!   entries with synthesised inclusion proofs — enough for
-//!   `swe_justsign_sign` to exercise the verifier without an HTTP
-//!   dependency.
+//! * `hashedrekord` v0.0.1 entry types (`entry::HashedRekord`) with
+//!   JSON encode/decode.
+//! * A `RekorClient` trait + two impls: `MockRekorClient` (canned
+//!   single-leaf log; deterministic; no I/O) and `HttpRekorClient`
+//!   (blocking `reqwest`-backed; talks to a real Rekor server such
+//!   as `rekor.sigstage.dev`).
 //!
-//! No real HTTP client lives here in v0. Submitting a real entry +
-//! fetching a real proof from rekor.sigstore.dev lands in a later
-//! slice; until then everything tests against the mock.
+//! `HttpRekorClient` exposes an inherent `fetch(uuid)` method on top
+//! of the trait's `submit`, mirroring `GET /api/v1/log/entries/{uuid}`
+//! for re-hydration. The trait surface stays minimal because
+//! verifiers re-check inclusion proofs against the bundle's stored
+//! root and don't need a server round-trip.
 
 pub mod client;
 pub mod entry;
 pub mod merkle;
 
-pub use client::{LogEntry, MockRekorClient, RekorClient};
+pub use client::{HttpRekorClient, LogEntry, MockRekorClient, RekorClient};
 pub use entry::{Data, HashedRekord, HashedRekordHash, PublicKey, Signature};
 pub use merkle::{verify_inclusion, EMPTY_TREE_ROOT, INTERNAL_NODE_PREFIX, LEAF_NODE_PREFIX};
 
@@ -63,6 +65,26 @@ pub enum RekorError {
     /// JSON encode/decode failure on a Rekor entry.
     #[error("rekor entry JSON: {0}")]
     Json(#[from] serde_json::Error),
+
+    /// Transport-level failure talking to a Rekor HTTP endpoint —
+    /// wraps a `reqwest::Error` (connect, TLS, body read). Mirrors
+    /// the `Http` variant in `FulcioError` so callers can pattern-
+    /// match the same way across both sigstore-side clients.
+    #[error("HTTP transport error: {0}")]
+    Http(#[from] reqwest::Error),
+
+    /// Rekor returned a non-2xx status. The body is captured raw
+    /// because Rekor's error shape is not stable across versions —
+    /// surfaces both the status code (machine-actionable) and the
+    /// body (human-actionable) so on-call can diagnose without a
+    /// follow-up request.
+    #[error("rekor HTTP {status}: {body}")]
+    Status {
+        /// HTTP status code.
+        status: u16,
+        /// Response body, lossily UTF-8-decoded.
+        body: String,
+    },
 }
 
 /// Lower-case hex of a 32-byte digest. Used by `RekorError`'s

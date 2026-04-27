@@ -1,33 +1,52 @@
-# Manual-dispatch workflow that drives the skip-pass staging
-# integration test against `fulcio.sigstage.dev`.
+# Manual-dispatch staging tests for justsign.
 #
-# Why manual-only:
-#   * Staging Fulcio enforces rate quotas — a per-push run would
-#     burn budget shared with the wider Sigstore community.
-#   * The test SKIPs without `JUSTSIGN_OIDC_TOKEN`, so even forks
-#     that lack the secret won't fail; they will simply log a
-#     `SKIP: ...` line and return clean. That keeps the workflow
-#     safe to expose without leaking the token to PR runs.
+# These jobs talk to real Sigstore staging endpoints
+# (fulcio.sigstage.dev / rekor.sigstage.dev). They are gated to
+# `workflow_dispatch` only — never on push or pull_request — because:
 #
-# To run: GitHub UI -> Actions -> "CI (staging)" -> Run workflow.
+#   1. Staging enforces rate quotas; a per-push run would burn
+#      through budget shared with the wider Sigstore community.
+#   2. Fulcio requires a live OIDC token that cannot be minted by a
+#      stock GHA runner; the test SKIPs without
+#      `JUSTSIGN_OIDC_TOKEN` so forks lacking the secret stay clean.
+#   3. The default `cargo test` flow already prints a SKIP line and
+#      returns success when the corresponding env var is unset, so
+#      these jobs would silently mask wire-format drift if they ran
+#      every time.
+#
+# Run from the Actions tab → "Staging (manual)" → Run workflow.
 
-name: CI (staging)
+name: Staging (manual)
 
 on:
   workflow_dispatch:
 
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
 jobs:
-  test:
-    name: cargo test (staging)
+  fulcio:
+    name: cargo test (staging-fulcio)
     runs-on: ubuntu-latest
     env:
-      CARGO_TERM_COLOR: always
-      RUSTFLAGS: -D warnings
       JUSTSIGN_FULCIO_STAGING: "1"
       JUSTSIGN_OIDC_TOKEN: ${{ secrets.JUSTSIGN_OIDC_TOKEN }}
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: cargo test (staging skip-pass)
+      - name: cargo test (skip-pass)
         run: cargo test -p swe_justsign_fulcio test_http_fulcio_client_signs_cert_against_staging -- --nocapture
+
+  rekor:
+    name: cargo test (staging-rekor)
+    runs-on: ubuntu-latest
+    env:
+      JUSTSIGN_REKOR_STAGING: "1"
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test (skip-pass)
+        run: cargo test -p swe_justsign_rekor test_http_rekor_client_round_trips_against_staging -- --nocapture

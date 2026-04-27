@@ -48,7 +48,19 @@ use p256::pkcs8::{
     DecodePrivateKey, DecodePublicKey, EncodePrivateKey, EncodePublicKey, LineEnding,
 };
 use sign::spec::Bundle;
-use sign::{rekor::MockRekorClient, sign_blob, verify_blob, EcdsaP256Signer};
+use sign::{
+    rekor::{HttpRekorClient, MockRekorClient, RekorClient},
+    sign_blob, verify_blob, EcdsaP256Signer,
+};
+
+/// Default Rekor base URL when `--rekor` is passed without a value.
+///
+/// Sigstage staging — same hostname cosign uses for staging. We
+/// intentionally do NOT default to `rekor.sigstore.dev` (production)
+/// in v0 because (a) writes there are permanent, and (b) v0 keys
+/// are EOA-shaped, not Fulcio-issued, so production wouldn't accept
+/// them anyway.
+const DEFAULT_REKOR_URL: &str = "https://rekor.sigstage.dev";
 
 /// Top-level error type — prefer plain `String` over `thiserror`
 /// here because the CLI just renders the message and exits. Lower
@@ -83,7 +95,7 @@ pub fn print_usage<W: Write>(out: &mut W) -> std::io::Result<()> {
     )?;
     writeln!(
         out,
-        "  justsign sign-blob <file> --key <priv-pem-path> [--output-bundle <path>] [--rekor]"
+        "  justsign sign-blob <file> --key <priv-pem-path> \\\n      [--output-bundle <path>] [--rekor[=<url>]] [--mock-rekor]"
     )?;
     writeln!(
         out,
@@ -91,15 +103,23 @@ pub fn print_usage<W: Write>(out: &mut W) -> std::io::Result<()> {
     )?;
     writeln!(
         out,
-        "      --rekor uses an in-process mock Rekor (real HTTP client lands in v0.5)."
+        "      --rekor[=<url>] submits to a real Rekor; bare flag defaults to {DEFAULT_REKOR_URL}."
     )?;
     writeln!(
         out,
-        "  justsign verify-blob <bundle-path> --key <pub-pem-path>"
+        "      --mock-rekor uses an in-process mock Rekor (test-only; no transparency value)."
+    )?;
+    writeln!(
+        out,
+        "  justsign verify-blob <bundle-path> --key <pub-pem-path> [--rekor[=<url>]] [--mock-rekor]"
     )?;
     writeln!(
         out,
         "      verifies the bundle. Exit 0 on success, 1 on failure."
+    )?;
+    writeln!(
+        out,
+        "      --rekor[=<url>] re-checks the bundle's tlog inclusion proof; same default URL."
     )?;
     Ok(())
 }
@@ -176,12 +196,36 @@ pub fn cmd_public_key<W: Write>(args: &[String], out: &mut W) -> Result<(), CliE
     Ok(())
 }
 
+/// Selects which Rekor backend `sign-blob` / `verify-blob` should
+/// use. Concrete enum (not a `Box<dyn RekorClient>`) so the
+/// `--rekor` and `--mock-rekor` flags stay mutually exclusive at
+/// the parse layer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RekorChoice {
+    /// Caller did not pass any Rekor flag — no transparency.
+    None,
+    /// `--rekor[=<url>]` — real HTTP client at `url` (defaults to
+    /// the staging URL).
+    Http { url: String },
+    /// `--mock-rekor` — deterministic in-process mock; carries no
+    /// transparency value but pins the SPI shape for tests.
+    Mock,
+}
+
 /// Parsed `sign-blob` arg state.
 struct SignBlobArgs {
     file: String,
     key: String,
     output_bundle: Option<String>,
-    rekor: bool,
+    rekor: RekorChoice,
+}
+
+/// Parse the `--rekor[=<url>]` flag. Returns the URL to use.
+fn parse_rekor_flag(arg: &str) -> String {
+    match arg.split_once('=') {
+        Some((_, url)) if !url.is_empty() => url.to_string(),
+        _ => DEFAULT_REKOR_URL.to_string(),
+    }
 }
 
 fn parse_sign_blob_args(args: &[String]) -> Result<SignBlobArgs, CliError> {
@@ -189,17 +233,18 @@ fn parse_sign_blob_args(args: &[String]) -> Result<SignBlobArgs, CliError> {
         .first()
         .ok_or_else(|| {
             CliError(
-                "sign-blob requires <file> [--key <priv-pem>] [--output-bundle <path>] [--rekor]"
+                "sign-blob requires <file> [--key <priv-pem>] [--output-bundle <path>] [--rekor[=<url>]] [--mock-rekor]"
                     .to_string(),
             )
         })?
         .clone();
     let mut key: Option<String> = None;
     let mut output_bundle: Option<String> = None;
-    let mut rekor = false;
+    let mut rekor = RekorChoice::None;
     let mut i = 1;
     while i < args.len() {
-        match args[i].as_str() {
+        let arg = args[i].as_str();
+        match arg {
             "--key" => {
                 let v = args
                     .get(i + 1)
@@ -214,8 +259,24 @@ fn parse_sign_blob_args(args: &[String]) -> Result<SignBlobArgs, CliError> {
                 output_bundle = Some(v.clone());
                 i += 2;
             }
-            "--rekor" => {
-                rekor = true;
+            "--mock-rekor" => {
+                if rekor != RekorChoice::None {
+                    return Err(CliError(
+                        "--mock-rekor and --rekor are mutually exclusive".to_string(),
+                    ));
+                }
+                rekor = RekorChoice::Mock;
+                i += 1;
+            }
+            _ if arg == "--rekor" || arg.starts_with("--rekor=") => {
+                if rekor != RekorChoice::None {
+                    return Err(CliError(
+                        "--rekor and --mock-rekor are mutually exclusive".to_string(),
+                    ));
+                }
+                rekor = RekorChoice::Http {
+                    url: parse_rekor_flag(arg),
+                };
                 i += 1;
             }
             other => return Err(CliError(format!("unknown flag: {other}"))),
@@ -245,12 +306,22 @@ pub fn cmd_sign_blob<W: Write>(args: &[String], out: &mut W) -> Result<(), CliEr
         .map_err(|e| CliError(format!("parse PKCS#8 PEM private key: {e}")))?;
     let signer = EcdsaP256Signer::new(signing_key, None);
 
+    // Hold storage for whichever Rekor client variant is in play.
+    // Both branches are bound out-of-line so `rekor_arg` can borrow
+    // them through a `&dyn RekorClient` of matching lifetime.
     let mock_client;
-    let rekor_arg: Option<&dyn sign::rekor::RekorClient> = if parsed.rekor {
-        mock_client = MockRekorClient::new();
-        Some(&mock_client)
-    } else {
-        None
+    let http_client;
+    let rekor_arg: Option<&dyn RekorClient> = match &parsed.rekor {
+        RekorChoice::None => None,
+        RekorChoice::Mock => {
+            mock_client = MockRekorClient::new();
+            Some(&mock_client)
+        }
+        RekorChoice::Http { url } => {
+            http_client = HttpRekorClient::new(url.as_str())
+                .map_err(|e| CliError(format!("build Rekor client for {url}: {e}")))?;
+            Some(&http_client)
+        }
     };
 
     let bundle = sign_blob(
@@ -286,19 +357,25 @@ pub fn cmd_sign_blob<W: Write>(args: &[String], out: &mut W) -> Result<(), CliEr
 struct VerifyBlobArgs {
     bundle: String,
     key: String,
+    rekor: RekorChoice,
 }
 
 fn parse_verify_blob_args(args: &[String]) -> Result<VerifyBlobArgs, CliError> {
     let bundle = args
         .first()
         .ok_or_else(|| {
-            CliError("verify-blob requires <bundle-path> --key <pub-pem-path>".to_string())
+            CliError(
+                "verify-blob requires <bundle-path> --key <pub-pem-path> [--rekor[=<url>]] [--mock-rekor]"
+                    .to_string(),
+            )
         })?
         .clone();
     let mut key: Option<String> = None;
+    let mut rekor = RekorChoice::None;
     let mut i = 1;
     while i < args.len() {
-        match args[i].as_str() {
+        let arg = args[i].as_str();
+        match arg {
             "--key" => {
                 let v = args
                     .get(i + 1)
@@ -306,12 +383,32 @@ fn parse_verify_blob_args(args: &[String]) -> Result<VerifyBlobArgs, CliError> {
                 key = Some(v.clone());
                 i += 2;
             }
+            "--mock-rekor" => {
+                if rekor != RekorChoice::None {
+                    return Err(CliError(
+                        "--mock-rekor and --rekor are mutually exclusive".to_string(),
+                    ));
+                }
+                rekor = RekorChoice::Mock;
+                i += 1;
+            }
+            _ if arg == "--rekor" || arg.starts_with("--rekor=") => {
+                if rekor != RekorChoice::None {
+                    return Err(CliError(
+                        "--rekor and --mock-rekor are mutually exclusive".to_string(),
+                    ));
+                }
+                rekor = RekorChoice::Http {
+                    url: parse_rekor_flag(arg),
+                };
+                i += 1;
+            }
             other => return Err(CliError(format!("unknown flag: {other}"))),
         }
     }
     let key =
         key.ok_or_else(|| CliError("verify-blob requires --key <pub-pem-path>".to_string()))?;
-    Ok(VerifyBlobArgs { bundle, key })
+    Ok(VerifyBlobArgs { bundle, key, rekor })
 }
 
 /// `verify-blob <bundle-path> --key <pub-pem-path>` — verify the
@@ -330,11 +427,26 @@ pub fn cmd_verify_blob<W: Write>(args: &[String], out: &mut W) -> Result<(), Cli
     let verifying_key = VerifyingKey::from_public_key_pem(&pub_pem)
         .map_err(|e| CliError(format!("parse SPKI PEM public key: {e}")))?;
 
-    // No Rekor verification at the CLI layer in v0 — the embedded
-    // mock-Rekor proof is a witness, not a transparency root.
-    // Real Rekor proof verification ships with the HTTP client in
-    // v0.5.
-    verify_blob(&bundle, &[verifying_key], None)
+    // Rekor verification at the CLI layer is OPT-IN: the bundle's
+    // embedded inclusion proof is re-checked against its own root
+    // when the operator passes `--rekor` (real client) or
+    // `--mock-rekor` (test-only).
+    let mock_client;
+    let http_client;
+    let rekor_arg: Option<&dyn RekorClient> = match &parsed.rekor {
+        RekorChoice::None => None,
+        RekorChoice::Mock => {
+            mock_client = MockRekorClient::new();
+            Some(&mock_client)
+        }
+        RekorChoice::Http { url } => {
+            http_client = HttpRekorClient::new(url.as_str())
+                .map_err(|e| CliError(format!("build Rekor client for {url}: {e}")))?;
+            Some(&http_client)
+        }
+    };
+
+    verify_blob(&bundle, &[verifying_key], rekor_arg)
         .map_err(|e| CliError(format!("verify_blob: {e}")))?;
 
     writeln!(out, "OK").map_err(|e| CliError(format!("write: {e}")))?;
@@ -603,15 +715,17 @@ mod tests {
         );
     }
 
-    /// `sign-blob --rekor` attaches at least one tlog entry to the
-    /// emitted bundle. Uses the in-process mock Rekor — no HTTP.
+    /// `sign-blob --mock-rekor` attaches at least one tlog entry to
+    /// the emitted bundle. Uses the in-process mock — no HTTP.
     ///
-    /// Bug it catches: the `--rekor` flag forgotten in the parser
-    /// (silently ignored, so the bundle has empty tlog_entries)
-    /// or a path that constructed the mock client but didn't pass
-    /// it to `sign_blob`.
+    /// Bug it catches: the `--mock-rekor` flag forgotten in the
+    /// parser (silently ignored, so the bundle has empty
+    /// tlog_entries) or a path that constructed the mock client
+    /// but didn't pass it to `sign_blob`. We test against the mock
+    /// rather than `--rekor` because `--rekor` defaults to a real
+    /// HTTPS URL — exercising it here would hit the network.
     #[test]
-    fn test_cli_sign_blob_with_rekor_flag_attaches_tlog_entry() {
+    fn test_cli_sign_blob_with_mock_rekor_flag_attaches_tlog_entry() {
         let dir = Tempdir::new("rekor");
         let prefix = dir.join_str("witness");
         let mut sink = Vec::new();
@@ -628,7 +742,7 @@ mod tests {
                 priv_path,
                 "--output-bundle".into(),
                 bundle_path.clone(),
-                "--rekor".into(),
+                "--mock-rekor".into(),
             ],
             &mut sink,
         )
@@ -638,13 +752,95 @@ mod tests {
         let bundle = Bundle::decode_json(&bytes).unwrap();
         assert!(
             !bundle.verification_material.tlog_entries.is_empty(),
-            "--rekor must attach at least one tlog entry, got 0"
+            "--mock-rekor must attach at least one tlog entry, got 0"
         );
         let tlog = &bundle.verification_material.tlog_entries[0];
         assert_eq!(tlog.kind_version.kind, "hashedrekord");
         assert!(
             tlog.inclusion_proof.is_some(),
             "tlog entry must carry an inclusion proof"
+        );
+    }
+
+    /// `sign-blob --rekor=<url>` parses the embedded URL and routes
+    /// to `HttpRekorClient` — confirmed by the parser, not by a
+    /// network call. We bind a non-routable URL and assert the
+    /// failure path goes through `HttpRekorClient::submit` (a
+    /// transport / DNS / connect error), NOT through any code path
+    /// that would silently succeed.
+    ///
+    /// Bug it catches: `--rekor=<url>` falling through to the bare
+    /// `--rekor` arm (defaulting to staging) and silently sending
+    /// to the wrong server, or a parser that drops the value and
+    /// silently picks `RekorChoice::None`.
+    #[test]
+    fn test_cli_sign_blob_with_rekor_url_routes_to_http_client() {
+        let dir = Tempdir::new("rekor-url");
+        let prefix = dir.join_str("k");
+        let mut sink = Vec::new();
+        cmd_generate_key_pair(std::slice::from_ref(&prefix), &mut sink).unwrap();
+        let priv_path = format!("{prefix}.key");
+
+        let payload_path = dir.join_str("payload.bin");
+        std::fs::write(&payload_path, b"witness me").unwrap();
+        let bundle_path = dir.join_str("bundle.json");
+
+        // RFC 6761 reserved TLD `.invalid` — guaranteed not to
+        // resolve, so we exercise the wiring without sending real
+        // traffic. The error MUST come from the Rekor submit path.
+        let err = cmd_sign_blob(
+            &[
+                payload_path,
+                "--key".into(),
+                priv_path,
+                "--output-bundle".into(),
+                bundle_path,
+                "--rekor=https://nonexistent.invalid".into(),
+            ],
+            &mut sink,
+        )
+        .expect_err("non-routable Rekor URL must surface a typed error");
+        assert!(
+            err.0.contains("sign_blob") || err.0.contains("Rekor"),
+            "error must name the sign/Rekor step, got: {}",
+            err.0
+        );
+    }
+
+    /// `--rekor` and `--mock-rekor` are mutually exclusive — passing
+    /// both surfaces a typed error rather than silently picking one.
+    ///
+    /// Bug it catches: a parser ordering bug where the second flag
+    /// silently overwrites the first would let a test claim
+    /// "transparency" while actually using the mock (or vice
+    /// versa). The mutual-exclusion check is the only thing
+    /// stopping that confusion at the CLI surface.
+    #[test]
+    fn test_cli_sign_blob_with_both_rekor_flags_returns_error() {
+        let dir = Tempdir::new("both-rekor");
+        let prefix = dir.join_str("k");
+        let mut sink = Vec::new();
+        cmd_generate_key_pair(std::slice::from_ref(&prefix), &mut sink).unwrap();
+        let priv_path = format!("{prefix}.key");
+
+        let payload_path = dir.join_str("payload.bin");
+        std::fs::write(&payload_path, b"data").unwrap();
+
+        let err = cmd_sign_blob(
+            &[
+                payload_path,
+                "--key".into(),
+                priv_path,
+                "--rekor".into(),
+                "--mock-rekor".into(),
+            ],
+            &mut sink,
+        )
+        .expect_err("mixing --rekor and --mock-rekor MUST surface an error");
+        assert!(
+            err.0.contains("mutually exclusive"),
+            "error must explain the conflict, got: {}",
+            err.0
         );
     }
 

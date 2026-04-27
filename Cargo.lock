@@ -1238,6 +1238,7 @@ name = "swe_justsign_rekor"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "reqwest",
  "serde",
  "serde_json",
  "sha2",
