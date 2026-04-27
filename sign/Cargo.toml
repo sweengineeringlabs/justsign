@@ -17,11 +17,25 @@ name = "sign"
 path = "src/lib.rs"
 
 [dependencies]
-thiserror = { workspace = true }
-spec      = { workspace = true }
-fulcio    = { workspace = true }
-tuf       = { workspace = true }
-rekor     = { workspace = true }
+thiserror  = { workspace = true }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+spec       = { workspace = true }
+fulcio     = { workspace = true }
+tuf        = { workspace = true }
+rekor      = { workspace = true }
+
+# RustCrypto stack — versions match `swe_justsign_fulcio` so cargo
+# resolves a single copy of each crate in the dependency tree.
+p256      = { version = "0.13", default-features = false, features = ["std", "ecdsa", "pkcs8"] }
+signature = { version = "2", default-features = false, features = ["std"] }
+sha2      = { version = "0.10", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+# Deterministic RNG so the ECDSA round-trip test produces a stable
+# keypair across runs. Same crate fulcio uses for the same reason.
+rand_chacha = { version = "0.3", default-features = false }
+rand_core   = { version = "0.6", default-features = false }
 
 [lints]
 workspace = true

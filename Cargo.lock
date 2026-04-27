@@ -1209,6 +1209,13 @@ dependencies = [
 name = "swe_justsign_sign"
 version = "0.1.0"
 dependencies = [
+ "p256",
+ "rand_chacha 0.3.1",
+ "rand_core 0.6.4",
+ "serde",
+ "serde_json",
+ "sha2",
+ "signature",
  "swe_justsign_fulcio",
  "swe_justsign_rekor",
  "swe_justsign_spec",
