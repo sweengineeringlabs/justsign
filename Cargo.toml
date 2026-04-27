@@ -8,12 +8,12 @@ license      = "Apache-2.0"
 repository   = "https://github.com/sweengineeringlabs/justsign"
 homepage     = "https://github.com/sweengineeringlabs/justsign"
 authors      = ["SWE Engineering Labs"]
-# 1.86 because the active dep graph requires it: base64ct 1.7+
-# wants edition2024 (Cargo 1.85), and reqwest → idna →
-# icu_collections 2.x declares rust-version "1.86". Pinning back
-# is whack-a-mole; track the ecosystem instead. Same MSRV justoci
-# landed on.
-rust-version = "1.86"
+# 1.88 because the active dep graph requires it: base64ct 1.7+
+# wants edition2024 (Cargo 1.85), reqwest → idna → icu_collections
+# 2.x declared 1.86, and rcgen → time/time-core (dev-dep, transitive)
+# now declare 1.88. Pinning back is whack-a-mole; track the
+# ecosystem instead.
+rust-version = "1.88"
 
 [workspace.dependencies]
 # `version` is required next to `path` so `cargo publish` can resolve
