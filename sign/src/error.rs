@@ -61,6 +61,17 @@ pub enum SignError {
     /// distinguish a malformed-predicate bug from a signer failure.
     #[error("statement encode: {0}")]
     StatementEncode(#[from] StatementEncodeError),
+
+    /// Caller passed an empty cert chain to [`crate::sign_blob_keyless`].
+    /// Mirrors [`VerifyError::EmptyCertChain`] on the verifier side:
+    /// keyless bundles need at least the leaf, so we reject upfront
+    /// rather than emit a structurally-valid bundle whose
+    /// `verification_material.certificate.certificates` is empty
+    /// (which the keyless verifier would later reject as
+    /// `EmptyCertChain` anyway). Caught at the producer boundary so
+    /// callers see the same typed error on both sides of the loop.
+    #[error("cert chain is empty (keyless signing requires a leaf cert)")]
+    EmptyCertChain,
 }
 
 /// Failure surface of [`crate::verify_blob`].

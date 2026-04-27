@@ -65,9 +65,9 @@ use p256::ecdsa::{Signature as P256Signature, VerifyingKey};
 use rekor::{HashedRekord, HashedRekordHash, LogEntry, PublicKey, RekorClient};
 use sha2::{Digest, Sha256};
 use spec::{
-    Bundle, BundleContent, Checkpoint, Envelope, HashOutput, InclusionProof, KindVersion,
-    Signature as DsseSignature, Statement, Subject, TlogEntry, VerificationMaterial,
-    IN_TOTO_STATEMENT_V1_TYPE, SIGSTORE_BUNDLE_V0_3_MEDIA_TYPE,
+    Bundle, BundleContent, Certificate as SpecCertificate, Checkpoint, Envelope, HashOutput,
+    InclusionProof, KindVersion, Signature as DsseSignature, Statement, Subject, TlogEntry,
+    VerificationMaterial, IN_TOTO_STATEMENT_V1_TYPE, SIGSTORE_BUNDLE_V0_3_MEDIA_TYPE,
 };
 use std::collections::BTreeMap;
 
@@ -140,6 +140,81 @@ pub fn sign_blob(
         },
         content: BundleContent::DsseEnvelope(envelope),
     })
+}
+
+/// Sign `payload` with the given [`Signer`] and emit a keyless
+/// [`spec::Bundle`] carrying the supplied Fulcio-issued cert chain.
+///
+/// This is the producer counterpart of [`verify_blob_keyless`]: that
+/// verifier expects the bundle's `verification_material.certificate`
+/// to contain the chain whose leaf carries the public part of the
+/// key the DSSE signature was produced with. [`sign_blob`] hardcodes
+/// that field to `None` (cert chains are a "v0.5 concern" there);
+/// `sign_blob_keyless` closes the loop so a Fulcio-keyed signer can
+/// emit a bundle the keyless verifier accepts end-to-end.
+///
+/// Inputs:
+///
+/// * `payload` / `payload_type` / `signer` / `rekor` — same shape and
+///   meaning as [`sign_blob`]. The DSSE + PAE + Rekor flow is
+///   identical; only the cert-chain attachment is new.
+/// * `cert_chain_der` — DER-encoded cert chain, **leaf at index 0**,
+///   intermediates following. Same shape as the input
+///   [`verify_blob_keyless`] reads out of the bundle. The function
+///   does NOT cryptographically validate that the leaf's
+///   SubjectPublicKeyInfo matches the signer's verifying key — that
+///   coupling is the caller's responsibility (typically: the caller
+///   generated the keypair, requested a Fulcio cert for it, and
+///   passes both into this call). Surfacing a "leaf-vs-key drift"
+///   error would require a parser this crate doesn't currently host
+///   for v0.
+///
+/// Errors:
+///
+/// * [`SignError::EmptyCertChain`] — `cert_chain_der.is_empty()`.
+///   Rejected upfront so we never emit a bundle whose
+///   `certificate.certificates` is an empty `Vec` — that bundle
+///   would be structurally valid wire-wise but the keyless verifier
+///   would reject it as [`VerifyError::EmptyCertChain`] anyway.
+///   Mirroring the verifier's typed surface here means producer +
+///   verifier agree on one error name for one failure mode.
+/// * [`SignError::Signer`] / [`SignError::RekorSubmit`] /
+///   [`SignError::BundleEncode`] — inherited from [`sign_blob`]; same
+///   construction sites, same meanings.
+pub fn sign_blob_keyless(
+    payload: &[u8],
+    payload_type: &str,
+    signer: &dyn Signer,
+    cert_chain_der: &[Vec<u8>],
+    rekor: Option<&dyn RekorClient>,
+) -> Result<Bundle, SignError> {
+    // 1. Reject empty chains BEFORE doing any signing work — no point
+    //    consuming a Rekor submission slot for a bundle we're going
+    //    to fail to assemble. Mirrors `verify_blob_keyless`'s
+    //    `EmptyCertChain` exit on the consumer side so the
+    //    producer/verifier loop reports the same failure name on the
+    //    same condition.
+    if cert_chain_der.is_empty() {
+        return Err(SignError::EmptyCertChain);
+    }
+
+    // 2. Run the existing v0 sign path. PAE / signature / Rekor /
+    //    media-type / envelope shape are byte-identical to
+    //    `sign_blob` — we deliberately reuse it instead of
+    //    duplicating the flow so future fixes (e.g. PAE-shape
+    //    changes) only land in one place.
+    let mut bundle = sign_blob(payload, payload_type, signer, rekor)?;
+
+    // 3. Attach the caller-supplied cert chain. The wire field is
+    //    `Option<Certificate> { certificates: Vec<Vec<u8>> }`;
+    //    `cert_chain_der` is `&[Vec<u8>]` with leaf at index 0 — the
+    //    same convention `verify_blob_keyless` reads out — so we
+    //    clone straight through with no re-ordering.
+    bundle.verification_material.certificate = Some(SpecCertificate {
+        certificates: cert_chain_der.to_vec(),
+    });
+
+    Ok(bundle)
 }
 
 /// Verify a [`spec::Bundle`] previously produced by [`sign_blob`]
@@ -1836,5 +1911,245 @@ mod tests {
             Some(&client),
         )
         .expect("attestation with rekor must verify end-to-end");
+    }
+
+    // ── Keyless signing (issue #16, Phase A) ─────────────────────
+    //
+    // The producer counterpart of `verify_blob_keyless`. These tests
+    // assert the wire shape of `sign_blob_keyless` (the cert chain
+    // really lands in `verification_material.certificate`), the
+    // negative path (empty chain rejected as a typed error), and the
+    // round-trip through `verify_blob_keyless` so we know the
+    // producer + verifier loop closes end-to-end.
+
+    use p256::ecdsa::SigningKey as KeylessSigningKey;
+    use p256::pkcs8::DecodePrivateKey as _;
+    use rcgen::{
+        BasicConstraints, CertificateParams, DnType, IsCa, KeyPair, KeyUsagePurpose, SanType,
+        PKCS_ECDSA_P256_SHA256,
+    };
+
+    /// Three-level synthetic chain bundled with the leaf's signing
+    /// key. Mirrors `keyless_tests::build_keyless_fixture` but lives
+    /// in this module so the producer-side tests don't reach across
+    /// `#[cfg(test)]` module boundaries.
+    struct KeylessSignFixture {
+        chain_der: Vec<Vec<u8>>,
+        root_der: Vec<u8>,
+        leaf_signing_key: KeylessSigningKey,
+    }
+
+    /// Build a real Fulcio-shaped chain (root → intermediate → leaf)
+    /// where the leaf's SubjectPublicKeyInfo holds a P-256 key whose
+    /// private half we retain so the caller can produce a DSSE
+    /// signature that the leaf actually attests to.
+    fn build_keyless_sign_fixture() -> KeylessSignFixture {
+        let root_kp = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("root kp");
+        let mut root_params = CertificateParams::new(Vec::<String>::new()).expect("root params");
+        root_params
+            .distinguished_name
+            .push(DnType::CommonName, "sign-blob-keyless-root");
+        root_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        root_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+        let root_cert = root_params.self_signed(&root_kp).expect("root self-sign");
+        let root_der = root_cert.der().to_vec();
+
+        let intermediate_kp =
+            KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("intermediate kp");
+        let mut intermediate_params =
+            CertificateParams::new(Vec::<String>::new()).expect("intermediate params");
+        intermediate_params
+            .distinguished_name
+            .push(DnType::CommonName, "sign-blob-keyless-intermediate");
+        intermediate_params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
+        intermediate_params.key_usages =
+            vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+        let intermediate_cert = intermediate_params
+            .signed_by(&intermediate_kp, &root_cert, &root_kp)
+            .expect("intermediate sign");
+        let intermediate_der = intermediate_cert.der().to_vec();
+
+        let leaf_kp = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("leaf kp");
+        // rcgen keeps the leaf private half as PKCS#8 DER; re-import
+        // as a `p256::ecdsa::SigningKey` so the producer-side signer
+        // we feed `sign_blob_keyless` produces signatures verifiable
+        // against the leaf cert's SPKI.
+        let leaf_pkcs8_der = leaf_kp.serialize_der();
+        let leaf_signing_key = KeylessSigningKey::from_pkcs8_der(&leaf_pkcs8_der)
+            .expect("leaf PKCS#8 → p256 SigningKey");
+
+        let mut leaf_params = CertificateParams::new(Vec::<String>::new()).expect("leaf params");
+        leaf_params
+            .distinguished_name
+            .push(DnType::CommonName, "sign-blob-keyless-leaf");
+        leaf_params.is_ca = IsCa::NoCa;
+        leaf_params.subject_alt_names = vec![SanType::Rfc822Name(
+            "sign-blob-keyless@example.com"
+                .to_string()
+                .try_into()
+                .expect("email IA5"),
+        )];
+        let leaf_cert = leaf_params
+            .signed_by(&leaf_kp, &intermediate_cert, &intermediate_kp)
+            .expect("leaf sign");
+        let leaf_der = leaf_cert.der().to_vec();
+
+        KeylessSignFixture {
+            chain_der: vec![leaf_der, intermediate_der],
+            root_der,
+            leaf_signing_key,
+        }
+    }
+
+    /// Bug it catches: a producer that "succeeds" in attaching a
+    /// cert chain but actually leaves
+    /// `verification_material.certificate = None` (e.g. forgets the
+    /// mutate step, or builds a fresh `VerificationMaterial` and
+    /// drops the chain on the floor). The keyless verifier would
+    /// then reject every bundle this producer emits with
+    /// `EmptyCertChain` even though the input chain was non-empty.
+    #[test]
+    fn test_sign_blob_keyless_attaches_cert_chain_to_bundle() {
+        let signer = MockSigner::new(canned_signature(), Some("k1".into()));
+        let chain: Vec<Vec<u8>> = vec![
+            b"leaf-der-bytes".to_vec(),
+            b"intermediate-der-bytes".to_vec(),
+        ];
+
+        let bundle = sign_blob_keyless(b"payload", "text/plain", &signer, &chain, None).unwrap();
+
+        // Bundle MUST carry the chain we passed in, in source order
+        // (leaf at index 0). Anything else means the producer
+        // re-ordered or dropped certs.
+        let cert = bundle
+            .verification_material
+            .certificate
+            .as_ref()
+            .expect("cert chain must be Some");
+        assert_eq!(cert.certificates, chain, "chain must round-trip exactly");
+
+        // Wire shape stays a DSSE envelope — keyless attaches a cert
+        // chain, it does NOT change the content arm.
+        match &bundle.content {
+            BundleContent::DsseEnvelope(env) => {
+                assert_eq!(env.payload_type, "text/plain");
+                assert_eq!(env.payload, b"payload");
+            }
+            other => panic!("expected DsseEnvelope, got {other:?}"),
+        }
+        assert_eq!(bundle.media_type, SIGSTORE_BUNDLE_V0_3_MEDIA_TYPE);
+    }
+
+    /// Bug it catches: a producer that silently emitted a
+    /// structurally-valid bundle whose `certificate.certificates` is
+    /// an empty `Vec`. The keyless verifier WOULD eventually reject
+    /// it with `EmptyCertChain`, but only after the bundle was
+    /// pushed to a registry / sent over the wire / submitted to
+    /// Rekor. Catching it at the producer boundary saves a Rekor
+    /// submission slot AND surfaces the same typed error name on
+    /// both sides of the loop.
+    #[test]
+    fn test_sign_blob_keyless_rejects_empty_chain() {
+        let signer = MockSigner::new(canned_signature(), None);
+        let empty: &[Vec<u8>] = &[];
+
+        let err = sign_blob_keyless(b"payload", "text/plain", &signer, empty, None)
+            .expect_err("empty cert chain MUST surface a typed error before any signing happens");
+        assert!(
+            matches!(err, SignError::EmptyCertChain),
+            "expected SignError::EmptyCertChain, got {err:?}"
+        );
+    }
+
+    /// Bug it catches: any drift between producer and verifier wire
+    /// shapes — chain ordering, cert byte preservation, DSSE
+    /// signature derivation under the leaf key — would fail this
+    /// round-trip even though both halves "look right" in isolation.
+    /// This is the load-bearing end-to-end smoke that justified
+    /// adding the function in the first place: closing the loop
+    /// `verify_blob_keyless` left open.
+    #[test]
+    fn test_sign_blob_keyless_round_trips_through_verify_blob_keyless() {
+        let fx = build_keyless_sign_fixture();
+
+        // Re-import the leaf key so the signer owns its own copy.
+        // SigningKey is not Clone, so we go through to_bytes →
+        // from_bytes — same path keyless_tests uses.
+        let leaf_signing_key_clone = KeylessSigningKey::from_bytes(&fx.leaf_signing_key.to_bytes())
+            .expect("re-import leaf key");
+        let signer = EcdsaP256Signer::new(leaf_signing_key_clone, Some("leaf".into()));
+
+        let payload = b"keyless producer round-trip";
+        let bundle = sign_blob_keyless(payload, "text/plain", &signer, &fx.chain_der, None)
+            .expect("sign_blob_keyless");
+
+        // Independent verification: the bundle this producer emitted
+        // satisfies the keyless verifier when handed the same root
+        // anchor that signed the chain.
+        verify_blob_keyless(&bundle, std::slice::from_ref(&fx.root_der), None, None)
+            .expect("keyless producer + verifier must close the loop");
+    }
+
+    /// Bug it catches: a `sign_blob_keyless` impl that constructed
+    /// its own bundle from scratch (instead of delegating to
+    /// `sign_blob`) and "forgot" to thread the rekor argument. The
+    /// resulting bundle would carry the cert chain but no tlog
+    /// entries — silently downgrading transparency for every
+    /// keyless caller.
+    #[test]
+    fn test_sign_blob_keyless_with_rekor_attaches_tlog_entry() {
+        let signer = MockSigner::new(canned_signature(), None);
+        let client = MockRekorClient::new();
+        let chain: Vec<Vec<u8>> = vec![b"leaf-der".to_vec()];
+
+        let bundle = sign_blob_keyless(
+            b"witnessed keyless payload",
+            "text/plain",
+            &signer,
+            &chain,
+            Some(&client),
+        )
+        .unwrap();
+
+        // tlog entry mirrors what `sign_blob` emits — the keyless
+        // path adds a chain on top of, not instead of, transparency.
+        assert_eq!(bundle.verification_material.tlog_entries.len(), 1);
+        let tlog = &bundle.verification_material.tlog_entries[0];
+        assert_eq!(tlog.log_index, 0);
+        assert_eq!(tlog.kind_version.kind, "hashedrekord");
+        let proof = tlog.inclusion_proof.as_ref().unwrap();
+        assert_eq!(proof.tree_size, 1);
+
+        // Cert chain is still there alongside the tlog.
+        let cert = bundle
+            .verification_material
+            .certificate
+            .as_ref()
+            .expect("chain must coexist with tlog");
+        assert_eq!(cert.certificates, chain);
+    }
+
+    /// Bug it catches: a `sign_blob_keyless` that ignored its
+    /// `payload_type` argument and hardcoded `text/plain` (or
+    /// `application/vnd.in-toto+json`) into the envelope. A keyless
+    /// in-toto attestation would then arrive with the wrong wrapper
+    /// type — `verify_attestation`'s `WrongPayloadType` gate would
+    /// reject it. Pin a non-trivial value here to catch the
+    /// regression directly.
+    #[test]
+    fn test_sign_blob_keyless_payload_type_round_trips() {
+        let signer = MockSigner::new(canned_signature(), None);
+        let chain: Vec<Vec<u8>> = vec![b"leaf-der".to_vec()];
+        let payload_type = "application/vnd.in-toto+json";
+
+        let bundle =
+            sign_blob_keyless(b"{\"_type\":\"...\"}", payload_type, &signer, &chain, None).unwrap();
+
+        match &bundle.content {
+            BundleContent::DsseEnvelope(env) => {
+                assert_eq!(env.payload_type, payload_type);
+            }
+            other => panic!("expected DsseEnvelope, got {other:?}"),
+        }
     }
 }
