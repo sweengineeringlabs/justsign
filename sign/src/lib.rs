@@ -64,6 +64,16 @@ pub use error::{OciError, SignError, VerifyError};
 pub use sbom::{sign_cyclonedx, sign_spdx, verify_cyclonedx, verify_spdx};
 pub use signer::{EcdsaP256Signer, MockSigner, Signer, SignerError};
 
+// Per-algorithm signer re-exports (issue #12). Each is feature-gated
+// so the default build still surfaces only the P-256 surface — same
+// posture as the KMS / PKCS#11 signers above.
+#[cfg(feature = "ecdsa-p384")]
+pub use signer::EcdsaP384Signer;
+#[cfg(feature = "ed25519")]
+pub use signer::Ed25519Signer;
+#[cfg(feature = "secp256k1")]
+pub use signer::Secp256k1Signer;
+
 // Per-provider KMS signer re-exports. Each is feature-gated so the
 // default build surfaces no KMS types and pulls no KMS deps (there
 // are no KMS deps in v0; the gating keeps the surface honest as
@@ -85,7 +95,7 @@ pub use slsa::{
 pub use spec::{CYCLONEDX_BOM_V1_5_PREDICATE_TYPE, SPDX_DOCUMENT_V2_3_PREDICATE_TYPE};
 
 use p256::ecdsa::signature::Verifier as _;
-use p256::ecdsa::{Signature as P256Signature, VerifyingKey};
+use p256::ecdsa::Signature as P256Signature;
 
 use rekor::{HashedRekord, HashedRekordHash, LogEntry, PublicKey, RekorClient};
 use sha2::{Digest, Sha256};
@@ -102,6 +112,148 @@ use std::collections::BTreeMap;
 /// distinguish "this DSSE wraps an attestation Statement" from
 /// "this DSSE wraps an arbitrary blob".
 pub const IN_TOTO_PAYLOAD_TYPE: &str = "application/vnd.in-toto+json";
+
+/// Algorithm-tagged verifying key passed to [`verify_blob`] (and
+/// every higher-level verifier that composes on top of it).
+///
+/// Each variant wraps the per-algorithm verifying key from the
+/// matching RustCrypto crate and is gated behind the same feature
+/// flag that pulls that crate in. The default build only surfaces
+/// the [`VerifyingKey::P256`] variant — adding `ed25519`,
+/// `ecdsa-p384`, or `secp256k1` to the feature list lights up the
+/// other variants.
+///
+/// # Why an enum and not a trait object
+///
+/// The variants disagree on signature wire shape:
+///
+/// * P-256 / P-384 / secp256k1 — DER-encoded ECDSA, parsed via
+///   `Signature::from_der`.
+/// * Ed25519 — raw 64-byte concatenation of `r || s`, parsed via
+///   `Signature::from_bytes`.
+///
+/// A trait object hiding both behind one `verify(&[u8], &[u8])`
+/// would force every caller to pre-encode the signature into one
+/// universal shape, which doesn't exist. The enum lets
+/// [`verify_blob`]'s match arm reach for the right parser per
+/// variant.
+///
+/// # Why this is a v0 BREAKING change
+///
+/// `verify_blob`'s `trusted_keys` parameter previously took
+/// `&[p256::ecdsa::VerifyingKey]`. v0.2 takes `&[VerifyingKey]` of
+/// this enum — every caller MUST wrap their key in the matching
+/// variant (e.g. `VerifyingKey::P256(vk)`). The breakage is
+/// localised; the v0 surface is small enough that updating
+/// callers in-tree is cheaper than carrying both APIs forever.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VerifyingKey {
+    /// ECDSA over NIST P-256, DER-encoded signatures, SHA-256
+    /// digest. The default-on variant — present in every build.
+    P256(p256::ecdsa::VerifyingKey),
+
+    /// Ed25519 PureEd25519 (RFC 8032), raw 64-byte signatures.
+    /// Gated on the `ed25519` feature.
+    #[cfg(feature = "ed25519")]
+    Ed25519(ed25519_dalek::VerifyingKey),
+
+    /// ECDSA over NIST P-384, DER-encoded signatures, SHA-384
+    /// digest. Gated on the `ecdsa-p384` feature.
+    #[cfg(feature = "ecdsa-p384")]
+    P384(p384::ecdsa::VerifyingKey),
+
+    /// ECDSA over secp256k1 (Bitcoin / Ethereum curve), DER-encoded
+    /// signatures, SHA-256 digest. Gated on the `secp256k1` feature.
+    #[cfg(feature = "secp256k1")]
+    K256(k256::ecdsa::VerifyingKey),
+}
+
+impl From<p256::ecdsa::VerifyingKey> for VerifyingKey {
+    /// `From` lift so existing P-256 callers can still write
+    /// `&[vk.into()]` instead of explicitly typing
+    /// `VerifyingKey::P256(vk)`. Kept narrow on purpose — we do
+    /// NOT provide a `From<&[u8]>` because the byte shape is
+    /// algorithm-specific and that would re-introduce the exact
+    /// dispatch ambiguity the enum exists to remove.
+    fn from(vk: p256::ecdsa::VerifyingKey) -> Self {
+        VerifyingKey::P256(vk)
+    }
+}
+
+#[cfg(feature = "ed25519")]
+impl From<ed25519_dalek::VerifyingKey> for VerifyingKey {
+    fn from(vk: ed25519_dalek::VerifyingKey) -> Self {
+        VerifyingKey::Ed25519(vk)
+    }
+}
+
+#[cfg(feature = "ecdsa-p384")]
+impl From<p384::ecdsa::VerifyingKey> for VerifyingKey {
+    fn from(vk: p384::ecdsa::VerifyingKey) -> Self {
+        VerifyingKey::P384(vk)
+    }
+}
+
+#[cfg(feature = "secp256k1")]
+impl From<k256::ecdsa::VerifyingKey> for VerifyingKey {
+    fn from(vk: k256::ecdsa::VerifyingKey) -> Self {
+        VerifyingKey::K256(vk)
+    }
+}
+
+/// Try to verify `pae_bytes` under `key` against the algorithm-
+/// specific signature shape carried in `sig_bytes`. Returns `true`
+/// iff the parse + verify both succeed.
+///
+/// Held as an internal helper so [`verify_blob`]'s outer loop stays
+/// readable: it iterates `(envelope.signatures × trusted_keys)` and
+/// shorts on the first hit. The per-algorithm sig-shape parsing
+/// lives here, in one place.
+///
+/// Bug it pre-empts: a verifier that handed an Ed25519
+/// signature's 64 bytes to `P256Signature::from_der` would always
+/// fail on shape (raw bytes aren't valid DER), but a verifier that
+/// handed a DER ECDSA signature to `Ed25519Signature::from_bytes`
+/// would either fail on length (DER ECDSA-P256 sigs are typically
+/// 70-72 bytes, not 64) — meaning a regression where the enum
+/// dispatch matched the WRONG arm would silently reject every
+/// signature. The cross-algorithm rejection tests below catch
+/// exactly this regression.
+fn try_verify(key: &VerifyingKey, pae_bytes: &[u8], sig_bytes: &[u8]) -> bool {
+    match key {
+        VerifyingKey::P256(vk) => match P256Signature::from_der(sig_bytes) {
+            Ok(sig) => vk.verify(pae_bytes, &sig).is_ok(),
+            Err(_) => false,
+        },
+        #[cfg(feature = "ed25519")]
+        VerifyingKey::Ed25519(vk) => {
+            // Ed25519 sigs are exactly 64 bytes; `from_slice`
+            // returns an error on any other length. We do NOT
+            // accept DER here — RFC 8032 has no DER form.
+            use ed25519_dalek::Verifier as _;
+            match ed25519_dalek::Signature::from_slice(sig_bytes) {
+                Ok(sig) => vk.verify(pae_bytes, &sig).is_ok(),
+                Err(_) => false,
+            }
+        }
+        #[cfg(feature = "ecdsa-p384")]
+        VerifyingKey::P384(vk) => {
+            use p384::ecdsa::signature::Verifier as _;
+            match p384::ecdsa::Signature::from_der(sig_bytes) {
+                Ok(sig) => vk.verify(pae_bytes, &sig).is_ok(),
+                Err(_) => false,
+            }
+        }
+        #[cfg(feature = "secp256k1")]
+        VerifyingKey::K256(vk) => {
+            use k256::ecdsa::signature::Verifier as _;
+            match k256::ecdsa::Signature::from_der(sig_bytes) {
+                Ok(sig) => vk.verify(pae_bytes, &sig).is_ok(),
+                Err(_) => false,
+            }
+        }
+    }
+}
 
 /// Sign `payload` with the given [`Signer`] and return a
 /// [`spec::Bundle`].
@@ -278,24 +430,22 @@ pub fn verify_blob(
     // key still gets tried against every key — DSSE keyids are
     // hints, not auth bindings, and a verifier holding the right
     // key still verifies even if the keyid was wrong.
+    //
+    // Algorithm dispatch: each `(sig, key)` pair routes through
+    // [`try_verify`], which picks the right sig-shape parser per
+    // `VerifyingKey` variant. A signature whose bytes don't parse
+    // as ANY trusted key's algorithm shape is treated the same as
+    // a parse-but-doesn't-verify outcome — both surface as
+    // `SignatureInvalid` with `keyid` echoing the last failing
+    // entry.
     let mut last_failing_keyid: Option<String> = None;
     let mut any_valid = false;
-    for sig in &envelope.signatures {
-        let parsed = match P256Signature::from_der(&sig.sig) {
-            Ok(p) => p,
-            Err(_) => {
-                // Not a valid DER ECDSA-P256 signature. Track its
-                // keyid for the eventual error and move on.
-                last_failing_keyid = sig.keyid.clone();
-                continue;
+    'outer: for sig in &envelope.signatures {
+        for key in trusted_keys {
+            if try_verify(key, &pae_bytes, &sig.sig) {
+                any_valid = true;
+                break 'outer;
             }
-        };
-        let validated = trusted_keys
-            .iter()
-            .any(|vk| vk.verify(&pae_bytes, &parsed).is_ok());
-        if validated {
-            any_valid = true;
-            break;
         }
         last_failing_keyid = sig.keyid.clone();
     }
@@ -903,7 +1053,14 @@ pub fn verify_blob_keyless(
     //        leaf's key,
     //      - if `rekor` is Some, every tlog entry's inclusion proof
     //        re-verifies against its claimed root.
-    verify_blob(bundle, &[leaf_vk], rekor)
+    //
+    //    The cert chain's leaf VK is always P-256 in v0 (Fulcio
+    //    issues P-256 leaves); the wrap into `VerifyingKey::P256`
+    //    is a typed lift, not a re-key. When Fulcio adds non-P-256
+    //    leaf algorithms (issue tracked separately), this site
+    //    grows a match — the chain walk would surface the leaf's
+    //    algorithm via a typed `cert_chain::LeafKey` enum.
+    verify_blob(bundle, &[VerifyingKey::P256(leaf_vk)], rekor)
 }
 
 #[cfg(test)]
@@ -1241,7 +1398,7 @@ mod tests {
         // Deterministic keypair so the test isn't flaky.
         let mut rng = ChaCha20Rng::from_seed([0x42; 32]);
         let sk = SigningKey::random(&mut rng);
-        let vk = *sk.verifying_key();
+        let vk = VerifyingKey::P256(*sk.verifying_key());
 
         let signer = EcdsaP256Signer::new(sk, Some("test-key".into()));
         let payload = b"production-grade payload bytes \xF0\x9F\x9A\x80";
@@ -1262,7 +1419,7 @@ mod tests {
     fn test_verify_blob_rejects_tampered_payload() {
         let mut rng = ChaCha20Rng::from_seed([0x11; 32]);
         let sk = SigningKey::random(&mut rng);
-        let vk = *sk.verifying_key();
+        let vk = VerifyingKey::P256(*sk.verifying_key());
         let signer = EcdsaP256Signer::new(sk, None);
 
         let mut bundle = sign_blob(b"original payload", "text/plain", &signer, None).unwrap();
@@ -1290,7 +1447,7 @@ mod tests {
     fn test_verify_blob_rejects_wrong_signature() {
         let mut rng = ChaCha20Rng::from_seed([0x22; 32]);
         let sk = SigningKey::random(&mut rng);
-        let vk = *sk.verifying_key();
+        let vk = VerifyingKey::P256(*sk.verifying_key());
         let signer = EcdsaP256Signer::new(sk, Some("bit-flip".into()));
 
         let mut bundle = sign_blob(b"the payload", "text/plain", &signer, None).unwrap();
@@ -1353,7 +1510,7 @@ mod tests {
     fn test_verify_blob_with_rekor_verifies_inclusion_proof() {
         let mut rng = ChaCha20Rng::from_seed([0x33; 32]);
         let sk = SigningKey::random(&mut rng);
-        let vk = *sk.verifying_key();
+        let vk = VerifyingKey::P256(*sk.verifying_key());
         let signer = EcdsaP256Signer::new(sk, None);
         let client = MockRekorClient::new();
 
@@ -1375,7 +1532,7 @@ mod tests {
     fn test_verify_blob_without_rekor_client_skips_proof_check() {
         let mut rng = ChaCha20Rng::from_seed([0x44; 32]);
         let sk = SigningKey::random(&mut rng);
-        let vk = *sk.verifying_key();
+        let vk = VerifyingKey::P256(*sk.verifying_key());
         let signer = EcdsaP256Signer::new(sk, None);
         let client = MockRekorClient::new();
 
@@ -1398,7 +1555,7 @@ mod tests {
     fn test_verify_blob_with_rekor_client_and_no_tlog_returns_no_tlog_entry() {
         let mut rng = ChaCha20Rng::from_seed([0x55; 32]);
         let sk = SigningKey::random(&mut rng);
-        let vk = *sk.verifying_key();
+        let vk = VerifyingKey::P256(*sk.verifying_key());
         let signer = EcdsaP256Signer::new(sk, None);
         let client = MockRekorClient::new();
 
@@ -1444,7 +1601,7 @@ mod tests {
     fn test_sign_blob_with_multibyte_payload_type_round_trips() {
         let mut rng = ChaCha20Rng::from_seed([0x66; 32]);
         let sk = SigningKey::random(&mut rng);
-        let vk = *sk.verifying_key();
+        let vk = VerifyingKey::P256(*sk.verifying_key());
         let signer = EcdsaP256Signer::new(sk, None);
 
         // Mostly-ASCII media type but with a non-ASCII byte to
@@ -1464,7 +1621,7 @@ mod tests {
     fn test_verify_blob_succeeds_with_correct_key_even_when_keyid_differs() {
         let mut rng = ChaCha20Rng::from_seed([0x77; 32]);
         let sk = SigningKey::random(&mut rng);
-        let vk = *sk.verifying_key();
+        let vk = VerifyingKey::P256(*sk.verifying_key());
         let signer = EcdsaP256Signer::new(sk, Some("the-signer-said-this".into()));
 
         let bundle = sign_blob(b"hi", "x/y", &signer, None).unwrap();
@@ -1529,7 +1686,7 @@ mod tests {
     fn test_verify_oci_rejects_layer_digest_mismatch() {
         let mut rng = ChaCha20Rng::from_seed([0x99; 32]);
         let sk = SigningKey::random(&mut rng);
-        let vk = *sk.verifying_key();
+        let vk = VerifyingKey::P256(*sk.verifying_key());
         let signer = EcdsaP256Signer::new(sk, None);
 
         let subject_digest =
@@ -1571,7 +1728,7 @@ mod tests {
         // an otherwise-correct shape, then drive verify_oci.
         let mut rng = ChaCha20Rng::from_seed([0xAA; 32]);
         let sk = SigningKey::random(&mut rng);
-        let vk = *sk.verifying_key();
+        let vk = VerifyingKey::P256(*sk.verifying_key());
         let signer = EcdsaP256Signer::new(sk, None);
 
         let subject_digest =
@@ -1614,7 +1771,7 @@ mod tests {
     fn test_sign_oci_then_verify_oci_round_trips() {
         let mut rng = ChaCha20Rng::from_seed([0xBB; 32]);
         let sk = SigningKey::random(&mut rng);
-        let vk = *sk.verifying_key();
+        let vk = VerifyingKey::P256(*sk.verifying_key());
         let signer = EcdsaP256Signer::new(sk, Some("rt-key".into()));
 
         let subject_digest =
@@ -1656,7 +1813,7 @@ mod tests {
     fn test_sign_oci_with_rekor_attaches_tlog_entry() {
         let mut rng = ChaCha20Rng::from_seed([0xCC; 32]);
         let sk = SigningKey::random(&mut rng);
-        let vk = *sk.verifying_key();
+        let vk = VerifyingKey::P256(*sk.verifying_key());
         let signer = EcdsaP256Signer::new(sk, None);
         let client = MockRekorClient::new();
 
@@ -1713,7 +1870,7 @@ mod tests {
     fn test_attest_then_verify_attestation_round_trips() {
         let mut rng = ChaCha20Rng::from_seed([0xA0; 32]);
         let sk = SigningKey::random(&mut rng);
-        let vk = *sk.verifying_key();
+        let vk = VerifyingKey::P256(*sk.verifying_key());
         let signer = EcdsaP256Signer::new(sk, Some("attest-key".into()));
 
         let predicate = serde_json::json!({ "foo": "bar" });
@@ -1766,7 +1923,7 @@ mod tests {
     fn test_verify_attestation_rejects_wrong_predicate_type() {
         let mut rng = ChaCha20Rng::from_seed([0xA1; 32]);
         let sk = SigningKey::random(&mut rng);
-        let vk = *sk.verifying_key();
+        let vk = VerifyingKey::P256(*sk.verifying_key());
         let signer = EcdsaP256Signer::new(sk, None);
 
         let bundle = attest(
@@ -1801,7 +1958,7 @@ mod tests {
     fn test_verify_attestation_rejects_subject_digest_mismatch() {
         let mut rng = ChaCha20Rng::from_seed([0xA2; 32]);
         let sk = SigningKey::random(&mut rng);
-        let vk = *sk.verifying_key();
+        let vk = VerifyingKey::P256(*sk.verifying_key());
         let signer = EcdsaP256Signer::new(sk, None);
 
         let bundle = attest(
@@ -1843,7 +2000,7 @@ mod tests {
     fn test_verify_attestation_with_subject_check_disabled() {
         let mut rng = ChaCha20Rng::from_seed([0xA3; 32]);
         let sk = SigningKey::random(&mut rng);
-        let vk = *sk.verifying_key();
+        let vk = VerifyingKey::P256(*sk.verifying_key());
         let signer = EcdsaP256Signer::new(sk, None);
 
         let bundle = attest(
@@ -1876,7 +2033,7 @@ mod tests {
     fn test_verify_attestation_rejects_payload_type_mismatch() {
         let mut rng = ChaCha20Rng::from_seed([0xA4; 32]);
         let sk = SigningKey::random(&mut rng);
-        let vk = *sk.verifying_key();
+        let vk = VerifyingKey::P256(*sk.verifying_key());
         let signer = EcdsaP256Signer::new(sk, None);
 
         // Sign a non-attestation blob.
@@ -1907,7 +2064,7 @@ mod tests {
     fn test_attest_with_rekor_attaches_tlog_entry() {
         let mut rng = ChaCha20Rng::from_seed([0xA5; 32]);
         let sk = SigningKey::random(&mut rng);
-        let vk = *sk.verifying_key();
+        let vk = VerifyingKey::P256(*sk.verifying_key());
         let signer = EcdsaP256Signer::new(sk, None);
         let client = MockRekorClient::new();
 
@@ -2176,5 +2333,253 @@ mod tests {
             }
             other => panic!("expected DsseEnvelope, got {other:?}"),
         }
+    }
+}
+
+// =====================================================================
+// Multi-algorithm signer / verifier tests (issue #12).
+//
+// One module per algorithm, each gated behind the same feature flag
+// that pulls the algorithm's RustCrypto crate in. Each module pins
+// THREE properties:
+//
+// * Constructor + `key_id()` smoke — the signer holds the optional
+//   key_id verbatim and surfaces it through the trait method.
+//   Catches regressions where `Signer::key_id` returned `None`
+//   unconditionally, or returned a clone of a different field.
+//
+// * Round-trip — `sign_blob` with the algorithm's signer, then
+//   `verify_blob` with `VerifyingKey::<Algo>(...)` succeeds. Catches
+//   sig-shape regressions (e.g. an Ed25519 signer that returned DER,
+//   or a P-384 signer that returned raw r||s).
+//
+// * Cross-algorithm rejection — sign with algorithm A, hand the
+//   bundle to a verifier wired with `VerifyingKey::<B>(...)`, expect
+//   `SignatureInvalid`. THIS is the load-bearing test: it catches a
+//   regression in `try_verify`'s match dispatch where a wrong arm
+//   would silently accept a signature meant for a different
+//   algorithm — the worst possible failure mode for a multi-algo
+//   verifier.
+//
+// Tests live OUTSIDE the existing `mod tests` so the `cfg(feature)`
+// gates are clean (each module only compiles when its feature is
+// enabled — no nested `cfg` inside an unrelated module).
+// =====================================================================
+
+#[cfg(all(test, feature = "ed25519"))]
+mod ed25519_tests {
+    use super::*;
+    use ed25519_dalek::SigningKey as Ed25519SigningKey;
+    use rand_chacha::ChaCha20Rng;
+    use rand_core::SeedableRng;
+
+    /// Deterministic signing key. Ed25519 derives a 32-byte
+    /// secret-scalar seed, hashes it through SHA-512 to get the
+    /// real signing scalar — a fixed seed is enough for round-trip
+    /// tests without dragging a real RNG into the suite.
+    fn ed25519_signing_key() -> Ed25519SigningKey {
+        let mut rng = ChaCha20Rng::from_seed([0xE0; 32]);
+        Ed25519SigningKey::generate(&mut rng)
+    }
+
+    /// Bug it catches: an `Ed25519Signer::new` impl that swapped
+    /// the `key_id` argument for some other field (e.g. derived a
+    /// hex-encoded public key) would surface here as a non-equal
+    /// `key_id()` return. Also catches `Signer::key_id` regressions
+    /// where the trait method returned `None` unconditionally.
+    #[test]
+    fn test_ed25519_signer_constructor_and_key_id_round_trip() {
+        let key = ed25519_signing_key();
+        let signer = Ed25519Signer::new(key, Some("ed-key-1".into()));
+        assert_eq!(signer.key_id(), Some("ed-key-1".into()));
+
+        // Re-construct with no key_id to pin the negative case.
+        let key2 = ed25519_signing_key();
+        let signer_anon = Ed25519Signer::new(key2, None);
+        assert_eq!(signer_anon.key_id(), None);
+    }
+
+    /// Bug it catches: an Ed25519 signer that returned DER-encoded
+    /// bytes (instead of raw 64-byte `r||s`) would fail
+    /// `Signature::from_slice`'s strict-length check on the
+    /// verifier side. Symmetric: a verifier dispatching Ed25519 to
+    /// `Signature::from_der` would never accept a real Ed25519
+    /// signature. Round-trip nails both regressions.
+    #[test]
+    fn test_ed25519_sign_blob_round_trips_through_verify_blob() {
+        let key = ed25519_signing_key();
+        let vk = VerifyingKey::Ed25519(key.verifying_key());
+        let signer = Ed25519Signer::new(key, Some("ed-rt".into()));
+
+        let bundle = sign_blob(b"ed25519 payload", "text/plain", &signer, None).unwrap();
+        verify_blob(&bundle, &[vk], None).expect("ed25519 round-trip must verify");
+    }
+
+    /// Bug it catches: a regression in the `try_verify` match where
+    /// `VerifyingKey::Ed25519` accidentally tried to parse the
+    /// signature bytes as DER (or routed to the P-256 arm). The
+    /// signer signs Ed25519, the verifier holds a P-256 key —
+    /// expectation is `SignatureInvalid`. A test that "passes" here
+    /// when it shouldn't would mean the dispatch is mis-routing
+    /// algorithms at runtime — the single worst bug a multi-algo
+    /// verifier can ship.
+    #[test]
+    fn test_ed25519_signed_bundle_rejected_by_p256_verifier() {
+        let key = ed25519_signing_key();
+        let signer = Ed25519Signer::new(key, Some("ed-x".into()));
+
+        let bundle = sign_blob(b"cross-reject", "text/plain", &signer, None).unwrap();
+
+        // Build an unrelated P-256 verifying key. The signer used
+        // Ed25519, so this MUST reject.
+        let mut rng = ChaCha20Rng::from_seed([0xE1; 32]);
+        let p256_sk = p256::ecdsa::SigningKey::random(&mut rng);
+        let p256_vk = VerifyingKey::P256(*p256_sk.verifying_key());
+
+        let err = verify_blob(&bundle, &[p256_vk], None)
+            .expect_err("ed25519-signed bundle MUST NOT verify under a P-256 trusted key");
+        assert!(
+            matches!(err, VerifyError::SignatureInvalid { .. }),
+            "expected SignatureInvalid, got {err:?}"
+        );
+    }
+}
+
+#[cfg(all(test, feature = "ecdsa-p384"))]
+mod p384_tests {
+    use super::*;
+    use rand_chacha::ChaCha20Rng;
+    use rand_core::SeedableRng;
+
+    fn p384_signing_key() -> p384::ecdsa::SigningKey {
+        let mut rng = ChaCha20Rng::from_seed([0xF0; 32]);
+        p384::ecdsa::SigningKey::random(&mut rng)
+    }
+
+    /// Bug it catches: same class as the P-256 / Ed25519
+    /// constructor smoke — a `key_id` plumbed through wrongly
+    /// would surface here. Distinct test per algorithm because
+    /// the construction site is per-type (separate impls).
+    #[test]
+    fn test_p384_signer_constructor_and_key_id_round_trip() {
+        let key = p384_signing_key();
+        let signer = EcdsaP384Signer::new(key, Some("p384-key-1".into()));
+        assert_eq!(signer.key_id(), Some("p384-key-1".into()));
+
+        let key2 = p384_signing_key();
+        let signer_anon = EcdsaP384Signer::new(key2, None);
+        assert_eq!(signer_anon.key_id(), None);
+    }
+
+    /// Bug it catches: a P-384 signer that ran SHA-256 (P-256's
+    /// digest) instead of SHA-384 would mis-hash the PAE — the
+    /// verifier side runs SHA-384 internally, so the signature
+    /// would never reconstruct. Round-trip is the load-bearing
+    /// signal that the curve / digest pair is correctly wired.
+    #[test]
+    fn test_p384_sign_blob_round_trips_through_verify_blob() {
+        let key = p384_signing_key();
+        let vk = VerifyingKey::P384(*key.verifying_key());
+        let signer = EcdsaP384Signer::new(key, Some("p384-rt".into()));
+
+        let bundle = sign_blob(b"p384 payload", "text/plain", &signer, None).unwrap();
+        verify_blob(&bundle, &[vk], None).expect("p384 round-trip must verify");
+    }
+
+    /// Bug it catches: a `try_verify` regression that routed
+    /// `VerifyingKey::P384` through the P-256 arm would happen to
+    /// accept some signatures (DER decode succeeds) but verify
+    /// against the WRONG curve. Sign with P-384, verify with a
+    /// P-256 trusted key — must reject as `SignatureInvalid`.
+    #[test]
+    fn test_p384_signed_bundle_rejected_by_p256_verifier() {
+        let key = p384_signing_key();
+        let signer = EcdsaP384Signer::new(key, Some("p384-x".into()));
+
+        let bundle = sign_blob(b"cross-reject", "text/plain", &signer, None).unwrap();
+
+        let mut rng = ChaCha20Rng::from_seed([0xF1; 32]);
+        let p256_sk = p256::ecdsa::SigningKey::random(&mut rng);
+        let p256_vk = VerifyingKey::P256(*p256_sk.verifying_key());
+
+        let err = verify_blob(&bundle, &[p256_vk], None)
+            .expect_err("p384-signed bundle MUST NOT verify under a P-256 trusted key");
+        assert!(
+            matches!(err, VerifyError::SignatureInvalid { .. }),
+            "expected SignatureInvalid, got {err:?}"
+        );
+    }
+}
+
+#[cfg(all(test, feature = "secp256k1"))]
+mod k256_tests {
+    use super::*;
+    use rand_chacha::ChaCha20Rng;
+    use rand_core::SeedableRng;
+
+    fn k256_signing_key() -> k256::ecdsa::SigningKey {
+        let mut rng = ChaCha20Rng::from_seed([0x6C; 32]);
+        k256::ecdsa::SigningKey::random(&mut rng)
+    }
+
+    /// Bug it catches: a `Secp256k1Signer::new` whose `key_id`
+    /// plumbing got silently dropped (e.g. constructor took the
+    /// argument but didn't store it). Same shape as the other
+    /// algorithms' constructor smokes, repeated because the
+    /// construction site is per-type.
+    #[test]
+    fn test_secp256k1_signer_constructor_and_key_id_round_trip() {
+        let key = k256_signing_key();
+        let signer = Secp256k1Signer::new(key, Some("k256-key-1".into()));
+        assert_eq!(signer.key_id(), Some("k256-key-1".into()));
+
+        let key2 = k256_signing_key();
+        let signer_anon = Secp256k1Signer::new(key2, None);
+        assert_eq!(signer_anon.key_id(), None);
+    }
+
+    /// Bug it catches: secp256k1 and P-256 both run SHA-256 over
+    /// the input AND emit DER signatures of the same shape — so
+    /// a verifier that mixed up the curve at the math layer
+    /// (verifying secp256k1 sigs against a P-256 base point) would
+    /// silently fail every signature even though the wire bytes
+    /// look identical to the P-256 path. The round-trip pins the
+    /// curve binding correctly.
+    #[test]
+    fn test_secp256k1_sign_blob_round_trips_through_verify_blob() {
+        let key = k256_signing_key();
+        let vk = VerifyingKey::K256(*key.verifying_key());
+        let signer = Secp256k1Signer::new(key, Some("k256-rt".into()));
+
+        let bundle = sign_blob(b"secp256k1 payload", "text/plain", &signer, None).unwrap();
+        verify_blob(&bundle, &[vk], None).expect("secp256k1 round-trip must verify");
+    }
+
+    /// Bug it catches: this is the most insidious cross-rejection
+    /// case in the suite — secp256k1 and P-256 share their
+    /// SHA-256 digest AND DER signature wire shape. A `try_verify`
+    /// regression that routed `VerifyingKey::K256` through the
+    /// P-256 arm would happily DER-decode the signature and then
+    /// run the verify against the wrong base point. Most signatures
+    /// would still fail (different curve), but the "happens to
+    /// validate" failure mode is non-zero. Pinning rejection here
+    /// keeps the dispatch honest.
+    #[test]
+    fn test_secp256k1_signed_bundle_rejected_by_p256_verifier() {
+        let key = k256_signing_key();
+        let signer = Secp256k1Signer::new(key, Some("k256-x".into()));
+
+        let bundle = sign_blob(b"cross-reject", "text/plain", &signer, None).unwrap();
+
+        let mut rng = ChaCha20Rng::from_seed([0x6D; 32]);
+        let p256_sk = p256::ecdsa::SigningKey::random(&mut rng);
+        let p256_vk = VerifyingKey::P256(*p256_sk.verifying_key());
+
+        let err = verify_blob(&bundle, &[p256_vk], None)
+            .expect_err("secp256k1-signed bundle MUST NOT verify under a P-256 trusted key");
+        assert!(
+            matches!(err, VerifyError::SignatureInvalid { .. }),
+            "expected SignatureInvalid, got {err:?}"
+        );
     }
 }

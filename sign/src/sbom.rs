@@ -27,12 +27,11 @@
 //! verifiers in sequence (or unwrap the bundle and use the lower-
 //! level [`crate::verify_attestation`] directly).
 
-use p256::ecdsa::VerifyingKey;
 use rekor::RekorClient;
 use spec::Bundle;
 
 use crate::{
-    attest, verify_attestation, SignError, Signer, VerifiedAttestation, VerifyError,
+    attest, verify_attestation, SignError, Signer, VerifiedAttestation, VerifyError, VerifyingKey,
     CYCLONEDX_BOM_V1_5_PREDICATE_TYPE, SPDX_DOCUMENT_V2_3_PREDICATE_TYPE,
 };
 
@@ -239,7 +238,7 @@ mod tests {
     fn test_sign_cyclonedx_then_verify_cyclonedx_round_trips() {
         let mut rng = ChaCha20Rng::from_seed([0xB0; 32]);
         let sk = SigningKey::random(&mut rng);
-        let vk = *sk.verifying_key();
+        let vk = VerifyingKey::P256(*sk.verifying_key());
         let signer = EcdsaP256Signer::new(sk, Some("cyclonedx-key".into()));
 
         let sbom = sample_cyclonedx_bom();
@@ -278,7 +277,7 @@ mod tests {
     fn test_sign_spdx_then_verify_spdx_round_trips() {
         let mut rng = ChaCha20Rng::from_seed([0xB1; 32]);
         let sk = SigningKey::random(&mut rng);
-        let vk = *sk.verifying_key();
+        let vk = VerifyingKey::P256(*sk.verifying_key());
         let signer = EcdsaP256Signer::new(sk, Some("spdx-key".into()));
 
         let sbom = sample_spdx_document();
@@ -314,7 +313,7 @@ mod tests {
     fn test_verify_cyclonedx_rejects_spdx_bundle() {
         let mut rng = ChaCha20Rng::from_seed([0xB2; 32]);
         let sk = SigningKey::random(&mut rng);
-        let vk = *sk.verifying_key();
+        let vk = VerifyingKey::P256(*sk.verifying_key());
         let signer = EcdsaP256Signer::new(sk, None);
 
         let bundle = sign_spdx(
@@ -350,7 +349,7 @@ mod tests {
     fn test_verify_spdx_rejects_cyclonedx_bundle() {
         let mut rng = ChaCha20Rng::from_seed([0xB3; 32]);
         let sk = SigningKey::random(&mut rng);
-        let vk = *sk.verifying_key();
+        let vk = VerifyingKey::P256(*sk.verifying_key());
         let signer = EcdsaP256Signer::new(sk, None);
 
         let bundle = sign_cyclonedx(
@@ -388,7 +387,7 @@ mod tests {
     fn test_verify_cyclonedx_rejects_subject_digest_mismatch() {
         let mut rng = ChaCha20Rng::from_seed([0xB4; 32]);
         let sk = SigningKey::random(&mut rng);
-        let vk = *sk.verifying_key();
+        let vk = VerifyingKey::P256(*sk.verifying_key());
         let signer = EcdsaP256Signer::new(sk, None);
 
         let bundle = sign_cyclonedx(
@@ -424,7 +423,7 @@ mod tests {
     fn test_verify_cyclonedx_with_subject_check_disabled() {
         let mut rng = ChaCha20Rng::from_seed([0xB5; 32]);
         let sk = SigningKey::random(&mut rng);
-        let vk = *sk.verifying_key();
+        let vk = VerifyingKey::P256(*sk.verifying_key());
         let signer = EcdsaP256Signer::new(sk, None);
 
         let sbom = sample_cyclonedx_bom();
@@ -463,7 +462,7 @@ mod tests {
         // by its private counterpart.
         let mut rng_b = ChaCha20Rng::from_seed([0xB7; 32]);
         let sk_b = SigningKey::random(&mut rng_b);
-        let vk_b = *sk_b.verifying_key();
+        let vk_b = VerifyingKey::P256(*sk_b.verifying_key());
 
         let bundle = sign_cyclonedx(
             SUBJECT_NAME,
@@ -498,7 +497,7 @@ mod tests {
     fn test_sign_cyclonedx_with_rekor_attaches_tlog_entry() {
         let mut rng = ChaCha20Rng::from_seed([0xB8; 32]);
         let sk = SigningKey::random(&mut rng);
-        let vk = *sk.verifying_key();
+        let vk = VerifyingKey::P256(*sk.verifying_key());
         let signer = EcdsaP256Signer::new(sk, None);
         let client = MockRekorClient::new();
 

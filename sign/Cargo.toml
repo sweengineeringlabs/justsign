@@ -34,6 +34,15 @@ vault-transit = []
 # platform-specific shared library (.so / .dll / .dylib) loaded at
 # runtime by path.
 pkcs11 = ["dep:cryptoki"]
+# Additional signing / verifying algorithms (issue #12). Each one
+# is opt-in so the default build still pulls only `p256` from the
+# RustCrypto stack — same posture as the KMS / PKCS#11 features.
+# `verify_blob`'s `VerifyingKey` enum surfaces the gated variants
+# behind matching `cfg`s; producers add their per-algo signer types
+# only when the feature is enabled.
+ed25519     = ["dep:ed25519-dalek"]
+ecdsa-p384  = ["dep:p384"]
+secp256k1   = ["dep:k256"]
 
 [dependencies]
 thiserror  = { workspace = true }
@@ -65,6 +74,23 @@ spki      = { version = "0.7", default-features = false, features = ["std"] }
 # from a caller-supplied path at runtime, so this dep adds no
 # platform-specific build-time linkage.
 cryptoki  = { version = "0.10", optional = true }
+
+# Additional algorithm crates (issue #12). Each is gated behind its
+# matching feature so the default build pulls none of them. Versions
+# are picked to align with the rest of the RustCrypto stack already
+# in this workspace (`p256` 0.13, `signature` 2). Mirroring the
+# `p256` line shape exactly keeps cargo's resolver from picking
+# duplicate copies of `signature` / `digest` / `ecdsa`.
+#
+# * `ed25519-dalek` 2 — Ed25519 (raw 64-byte sigs, no DER). `pkcs8`
+#   so we can re-import from PKCS#8 PEM the same way the existing
+#   keypair-loading flow does. `rand_core` so callers can call
+#   `SigningKey::generate(&mut rng)` in tests.
+# * `p384` 0.13 — ECDSA over the NIST P-384 curve, DER signatures.
+# * `k256` 0.13 — ECDSA over secp256k1, DER signatures.
+ed25519-dalek = { version = "2", optional = true, default-features = false, features = ["std", "pkcs8", "rand_core"] }
+p384          = { version = "0.13", optional = true, default-features = false, features = ["std", "ecdsa", "pkcs8"] }
+k256          = { version = "0.13", optional = true, default-features = false, features = ["std", "ecdsa", "pkcs8"] }
 
 [dev-dependencies]
 # Deterministic RNG so the ECDSA round-trip test produces a stable

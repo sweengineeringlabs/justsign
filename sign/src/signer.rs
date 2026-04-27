@@ -225,3 +225,171 @@ impl Signer for MockSigner {
         Ok(self.canned.clone())
     }
 }
+
+// ---------------------------------------------------------------
+// Additional algorithm signers (issue #12).
+//
+// Each one mirrors `EcdsaP256Signer`'s shape exactly: hold the
+// signing key by value + an optional `key_id`, expose `new`, redact
+// the key in `Debug`, and produce raw signature bytes from the
+// PAE. Verifiers in `crate::lib::verify_blob` route by matching the
+// `VerifyingKey` enum variant — see that function for the wire
+// shape each algorithm produces (DER for ECDSA P-384 / secp256k1,
+// raw 64-byte for Ed25519).
+// ---------------------------------------------------------------
+
+/// Ed25519 signer over the PureEd25519 scheme (RFC 8032).
+///
+/// Wraps `ed25519_dalek::SigningKey`. The signer itself does NOT
+/// pre-hash — Ed25519's signing path consumes the message bytes
+/// directly and runs SHA-512 internally as part of the
+/// deterministic-nonce derivation. We hand it the raw PAE bytes,
+/// matching what every other DSSE Ed25519 signer in the wider
+/// ecosystem (cosign, in-toto-attestation Go libs) does.
+///
+/// Returns the raw 64-byte signature (`r || s`). Verifiers in
+/// [`crate::verify_blob`] reconstruct via
+/// `ed25519_dalek::Signature::from_bytes`.
+#[cfg(feature = "ed25519")]
+pub struct Ed25519Signer {
+    key: ed25519_dalek::SigningKey,
+    key_id: Option<String>,
+}
+
+#[cfg(feature = "ed25519")]
+impl Ed25519Signer {
+    /// Construct from an already-loaded `SigningKey`. As with
+    /// [`EcdsaP256Signer::new`], the signer has no opinion on how
+    /// the key was materialised — random, PKCS#8-loaded, or
+    /// extracted from another flow.
+    pub fn new(key: ed25519_dalek::SigningKey, key_id: Option<String>) -> Self {
+        Self { key, key_id }
+    }
+}
+
+#[cfg(feature = "ed25519")]
+impl std::fmt::Debug for Ed25519Signer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Same redaction rule as EcdsaP256Signer — never log secret
+        // material, even at Debug level.
+        f.debug_struct("Ed25519Signer")
+            .field("key_id", &self.key_id)
+            .field("key", &"<redacted>")
+            .finish()
+    }
+}
+
+#[cfg(feature = "ed25519")]
+impl Signer for Ed25519Signer {
+    fn key_id(&self) -> Option<String> {
+        self.key_id.clone()
+    }
+
+    fn sign(&self, pae_bytes: &[u8]) -> Result<Vec<u8>, SignerError> {
+        // `ed25519_dalek::SigningKey` implements `signature::Signer`
+        // for the PureEd25519 scheme — it consumes the message
+        // bytes directly. Returning raw `r||s` (64 bytes) keeps the
+        // wire encoding aligned with what cosign + in-toto-attestation
+        // emit; the verifier reconstructs via `Signature::from_bytes`.
+        use ed25519_dalek::Signer as _;
+        let sig: ed25519_dalek::Signature = self.key.sign(pae_bytes);
+        Ok(sig.to_bytes().to_vec())
+    }
+}
+
+/// ECDSA-with-SHA384 signer over the P-384 curve.
+///
+/// Wraps `p384::ecdsa::SigningKey`. Mirrors [`EcdsaP256Signer`]
+/// byte-for-byte: the `signature::Signer` impl runs SHA-384 over
+/// the input internally, and we return DER-encoded signature
+/// bytes so verifiers can reconstruct via
+/// `p384::ecdsa::Signature::from_der`.
+#[cfg(feature = "ecdsa-p384")]
+pub struct EcdsaP384Signer {
+    key: p384::ecdsa::SigningKey,
+    key_id: Option<String>,
+}
+
+#[cfg(feature = "ecdsa-p384")]
+impl EcdsaP384Signer {
+    /// Construct from an already-loaded `SigningKey`. See
+    /// [`EcdsaP256Signer::new`] — the contract is identical.
+    pub fn new(key: p384::ecdsa::SigningKey, key_id: Option<String>) -> Self {
+        Self { key, key_id }
+    }
+}
+
+#[cfg(feature = "ecdsa-p384")]
+impl std::fmt::Debug for EcdsaP384Signer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EcdsaP384Signer")
+            .field("key_id", &self.key_id)
+            .field("key", &"<redacted>")
+            .finish()
+    }
+}
+
+#[cfg(feature = "ecdsa-p384")]
+impl Signer for EcdsaP384Signer {
+    fn key_id(&self) -> Option<String> {
+        self.key_id.clone()
+    }
+
+    fn sign(&self, pae_bytes: &[u8]) -> Result<Vec<u8>, SignerError> {
+        // P-384's `signature::Signer` impl runs SHA-384 internally,
+        // mirroring the P-256/SHA-256 contract one curve up. DER
+        // encoding stays standard for ECDSA signatures.
+        use p384::ecdsa::signature::Signer as _;
+        let sig: p384::ecdsa::Signature = self.key.sign(pae_bytes);
+        Ok(sig.to_der().as_bytes().to_vec())
+    }
+}
+
+/// ECDSA-with-SHA256 signer over the secp256k1 curve.
+///
+/// Wraps `k256::ecdsa::SigningKey`. Same shape as
+/// [`EcdsaP256Signer`]: SHA-256 is run internally by the
+/// `signature::Signer` impl, output is DER-encoded. The curve
+/// differs (Bitcoin / Ethereum default) but the wire encoding for
+/// the signature is identical — verifiers reconstruct via
+/// `k256::ecdsa::Signature::from_der`.
+#[cfg(feature = "secp256k1")]
+pub struct Secp256k1Signer {
+    key: k256::ecdsa::SigningKey,
+    key_id: Option<String>,
+}
+
+#[cfg(feature = "secp256k1")]
+impl Secp256k1Signer {
+    /// Construct from an already-loaded `SigningKey`. See
+    /// [`EcdsaP256Signer::new`] — the contract is identical.
+    pub fn new(key: k256::ecdsa::SigningKey, key_id: Option<String>) -> Self {
+        Self { key, key_id }
+    }
+}
+
+#[cfg(feature = "secp256k1")]
+impl std::fmt::Debug for Secp256k1Signer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Secp256k1Signer")
+            .field("key_id", &self.key_id)
+            .field("key", &"<redacted>")
+            .finish()
+    }
+}
+
+#[cfg(feature = "secp256k1")]
+impl Signer for Secp256k1Signer {
+    fn key_id(&self) -> Option<String> {
+        self.key_id.clone()
+    }
+
+    fn sign(&self, pae_bytes: &[u8]) -> Result<Vec<u8>, SignerError> {
+        // secp256k1's `signature::Signer` impl runs SHA-256 over
+        // the input internally; DER encoding is the standard wire
+        // form for ECDSA. Same shape as EcdsaP256Signer.
+        use k256::ecdsa::signature::Signer as _;
+        let sig: k256::ecdsa::Signature = self.key.sign(pae_bytes);
+        Ok(sig.to_der().as_bytes().to_vec())
+    }
+}

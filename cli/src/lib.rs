@@ -43,14 +43,14 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::Path;
 
-use p256::ecdsa::{SigningKey, VerifyingKey};
+use p256::ecdsa::{SigningKey, VerifyingKey as P256VerifyingKey};
 use p256::pkcs8::{
     DecodePrivateKey, DecodePublicKey, EncodePrivateKey, EncodePublicKey, LineEnding,
 };
 use sign::spec::Bundle;
 use sign::{
     rekor::{HttpRekorClient, MockRekorClient, RekorClient},
-    sign_blob, verify_blob, EcdsaP256Signer,
+    sign_blob, verify_blob, EcdsaP256Signer, VerifyingKey,
 };
 
 /// Default Rekor base URL when `--rekor` is passed without a value.
@@ -424,8 +424,15 @@ pub fn cmd_verify_blob<W: Write>(args: &[String], out: &mut W) -> Result<(), Cli
 
     let pub_pem = std::fs::read_to_string(Path::new(&parsed.key))
         .map_err(|e| CliError(format!("read {}: {e}", parsed.key)))?;
-    let verifying_key = VerifyingKey::from_public_key_pem(&pub_pem)
+    // The CLI's v0 surface only knows how to parse P-256 SPKI PEM
+    // (mirrors what `cosign generate-key-pair` writes). Multi-algo
+    // verification is available via the library API (`sign::VerifyingKey`
+    // is a typed enum across P-256 / Ed25519 / P-384 / secp256k1 behind
+    // their respective features), but the CLI's --key flag is P-256
+    // until issue #13 wires algorithm detection from PEM headers.
+    let p256_vk = P256VerifyingKey::from_public_key_pem(&pub_pem)
         .map_err(|e| CliError(format!("parse SPKI PEM public key: {e}")))?;
+    let verifying_key = VerifyingKey::P256(p256_vk);
 
     // Rekor verification at the CLI layer is OPT-IN: the bundle's
     // embedded inclusion proof is re-checked against its own root

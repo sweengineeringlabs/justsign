@@ -26,9 +26,7 @@ use spec::{Bundle, Subject};
 use spec::SlsaProvenanceV1;
 pub use spec::SLSA_PROVENANCE_V1_PREDICATE_TYPE;
 
-use p256::ecdsa::VerifyingKey;
-
-use crate::{attest, verify_attestation, SignError, Signer, VerifyError};
+use crate::{attest, verify_attestation, SignError, Signer, VerifyError, VerifyingKey};
 
 /// Result of [`verify_slsa_provenance`] — the typed predicate plus
 /// the subjects the Statement names.
@@ -243,7 +241,7 @@ mod tests {
     fn test_sign_then_verify_slsa_provenance_round_trips_typed_predicate() {
         let mut rng = ChaCha20Rng::from_seed([0xB0; 32]);
         let sk = SigningKey::random(&mut rng);
-        let vk = *sk.verifying_key();
+        let vk = VerifyingKey::P256(*sk.verifying_key());
         let signer = EcdsaP256Signer::new(sk, Some("slsa-key".into()));
 
         let original = sample_provenance();
@@ -296,7 +294,7 @@ mod tests {
     fn test_verify_slsa_provenance_rejects_non_slsa_predicate_type() {
         let mut rng = ChaCha20Rng::from_seed([0xB1; 32]);
         let sk = SigningKey::random(&mut rng);
-        let vk = *sk.verifying_key();
+        let vk = VerifyingKey::P256(*sk.verifying_key());
         let signer = EcdsaP256Signer::new(sk, None);
 
         // Sign with an SPDX-typed predicate via the lower-level
@@ -342,7 +340,7 @@ mod tests {
         // signature MUST fail to verify under it.
         let mut rng_trust = ChaCha20Rng::from_seed([0xB3; 32]);
         let trust_sk = SigningKey::random(&mut rng_trust);
-        let trust_vk = *trust_sk.verifying_key();
+        let trust_vk = VerifyingKey::P256(*trust_sk.verifying_key());
 
         let bundle = sign_slsa_provenance(
             SUBJECT_NAME,
@@ -381,7 +379,7 @@ mod tests {
         // `sign_blob` so the DSSE signature is valid.
         let mut rng = ChaCha20Rng::from_seed([0xB4; 32]);
         let sk = SigningKey::random(&mut rng);
-        let vk = *sk.verifying_key();
+        let vk = VerifyingKey::P256(*sk.verifying_key());
         let signer = EcdsaP256Signer::new(sk, None);
 
         let mut digest = BTreeMap::new();
@@ -428,7 +426,7 @@ mod tests {
     fn test_verify_slsa_provenance_subject_digest_gate_routes_correctly() {
         let mut rng = ChaCha20Rng::from_seed([0xB5; 32]);
         let sk = SigningKey::random(&mut rng);
-        let vk = *sk.verifying_key();
+        let vk = VerifyingKey::P256(*sk.verifying_key());
         let signer = EcdsaP256Signer::new(sk, None);
 
         let bundle = sign_slsa_provenance(
@@ -444,7 +442,7 @@ mod tests {
         // Pinning the wrong digest must reject.
         let err = verify_slsa_provenance(
             &bundle,
-            &[vk],
+            std::slice::from_ref(&vk),
             Some((SUBJECT_DIGEST_ALGO, OTHER_DIGEST_HEX)),
             None,
         )
@@ -482,7 +480,7 @@ mod tests {
     fn test_sign_and_verify_slsa_provenance_with_rekor_witnesses_end_to_end() {
         let mut rng = ChaCha20Rng::from_seed([0xB6; 32]);
         let sk = SigningKey::random(&mut rng);
-        let vk = *sk.verifying_key();
+        let vk = VerifyingKey::P256(*sk.verifying_key());
         let signer = EcdsaP256Signer::new(sk, None);
         let client = MockRekorClient::new();
 
@@ -538,7 +536,7 @@ mod tests {
         // SLSA-shaped JSON but with `payload_type = "text/plain"`.
         let mut rng = ChaCha20Rng::from_seed([0xB7; 32]);
         let sk = SigningKey::random(&mut rng);
-        let vk = *sk.verifying_key();
+        let vk = VerifyingKey::P256(*sk.verifying_key());
         let signer = EcdsaP256Signer::new(sk, None);
 
         let mut digest = BTreeMap::new();
