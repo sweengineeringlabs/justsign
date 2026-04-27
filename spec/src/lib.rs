@@ -18,6 +18,7 @@
 pub mod dsse;
 pub mod in_toto;
 pub mod sigstore_bundle;
+pub mod slsa;
 
 pub use dsse::{
     pae, Envelope, EnvelopeDecodeError, EnvelopeEncodeError, Signature, DSSE_PAE_PREFIX,
@@ -31,4 +32,9 @@ pub use sigstore_bundle::{
     Bundle, BundleContent, BundleDecodeError, BundleEncodeError, Certificate, Checkpoint,
     HashOutput, InclusionPromise, InclusionProof, KindVersion, MessageSignature,
     TimestampVerificationData, TlogEntry, VerificationMaterial, SIGSTORE_BUNDLE_V0_3_MEDIA_TYPE,
+};
+
+pub use slsa::{
+    BuildDefinition, BuildMetadata, Builder, ResourceDescriptor, RunDetails, SlsaProvenanceV1,
+    SLSA_PROVENANCE_V1_PREDICATE_TYPE,
 };

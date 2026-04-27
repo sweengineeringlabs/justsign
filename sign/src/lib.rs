@@ -47,9 +47,14 @@ pub mod cert_chain;
 mod error;
 pub mod oci;
 mod signer;
+pub mod slsa;
 
 pub use error::{OciError, SignError, VerifyError};
 pub use signer::{EcdsaP256Signer, MockSigner, Signer, SignerError};
+pub use slsa::{
+    sign_slsa_provenance, verify_slsa_provenance, VerifiedSlsaProvenance,
+    SLSA_PROVENANCE_V1_PREDICATE_TYPE,
+};
 
 use p256::ecdsa::signature::Verifier as _;
 use p256::ecdsa::{Signature as P256Signature, VerifyingKey};
