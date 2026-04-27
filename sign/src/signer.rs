@@ -47,6 +47,56 @@ pub enum SignerError {
     /// treating it as a generic signing failure).
     #[error("signer stub: {0}")]
     Stubbed(String),
+
+    /// Loading a PKCS#11 provider shared library failed. `path`
+    /// echoes the exact module path the caller asked us to load —
+    /// a wrong path is the single most common operator mistake on
+    /// this surface (typo, missing package, wrong arch), and a
+    /// failure that swallows the path is undiagnosable from logs
+    /// alone. `cause` carries the underlying loader error
+    /// message (varies by OS — `libloading`'s `dlopen` /
+    /// `LoadLibraryW` text). String-typed because PKCS#11 backends
+    /// surface error chains differently across versions and we
+    /// don't want to leak `cryptoki`'s error tree through this
+    /// crate's public API. (Field is named `cause` rather than
+    /// `source` to avoid `thiserror`'s implicit `Error::source()`
+    /// wiring, which requires the field to implement
+    /// `std::error::Error` — `String` does not.)
+    #[error("pkcs11 module load failed: path={path}: {cause}")]
+    ModuleLoad {
+        /// Module path the caller passed in (e.g.
+        /// `/usr/lib/softhsm/libsofthsm2.so`,
+        /// `C:\\Program Files\\YubiKey PIV\\libykcs11.dll`).
+        path: String,
+        /// Underlying loader error message.
+        cause: String,
+    },
+
+    /// A PKCS#11 call after the module was loaded returned an
+    /// error. Construction sites: `C_Initialize`, `C_OpenSession`,
+    /// `C_Login`, `C_FindObjectsInit/C_FindObjects`, `C_SignInit`,
+    /// `C_Sign`. The `cause` string is the cryptoki-formatted
+    /// message — it includes the failing function name and the
+    /// PKCS#11 return code (e.g. `Function::Sign: PKCS11 error:
+    /// CKR_DATA_LEN_RANGE`), which is the minimum operators need
+    /// to route a token-side failure.
+    #[error("pkcs11: {cause}")]
+    Pkcs11 {
+        /// Underlying cryptoki error message (function + return code).
+        cause: String,
+    },
+
+    /// `C_FindObjects` returned zero matches for the configured
+    /// `CKA_LABEL`. Distinct from [`SignerError::Pkcs11`] because
+    /// it's an operator-fixable identity / configuration error,
+    /// not a token-state error: the caller asked us to sign with
+    /// a key the token doesn't carry. Echoing the label back means
+    /// a typo in config surfaces immediately.
+    #[error("pkcs11: no key found with label {label:?}")]
+    KeyNotFound {
+        /// The label the caller configured.
+        label: String,
+    },
 }
 
 /// Contract a key-bearing signer must satisfy.

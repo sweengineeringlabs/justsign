@@ -29,6 +29,11 @@ aws-kms       = []
 gcp-kms       = []
 azure-kv      = []
 vault-transit = []
+# Hardware key signing via PKCS#11 modules (YubiKey, smartcards,
+# HSMs, SoftHSM2 for tests). Pulls in the cryptoki binding;
+# platform-specific shared library (.so / .dll / .dylib) loaded at
+# runtime by path.
+pkcs11 = ["dep:cryptoki"]
 
 [dependencies]
 thiserror  = { workspace = true }
@@ -53,6 +58,13 @@ x509-cert = { version = "0.2", default-features = false, features = ["std", "pem
 der       = { version = "0.7", default-features = false, features = ["std", "oid"] }
 const-oid = { version = "0.9", default-features = false }
 spki      = { version = "0.7", default-features = false, features = ["std"] }
+
+# PKCS#11 hardware key signing — gated behind the `pkcs11` feature.
+# `cryptoki` wraps the standard PKCS#11 C API; the actual provider
+# library (libsofthsm2, libykcs11, vendor HSM .dll, etc.) is loaded
+# from a caller-supplied path at runtime, so this dep adds no
+# platform-specific build-time linkage.
+cryptoki  = { version = "0.10", optional = true }
 
 [dev-dependencies]
 # Deterministic RNG so the ECDSA round-trip test produces a stable

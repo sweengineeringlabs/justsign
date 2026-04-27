@@ -50,3 +50,81 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: cargo test (skip-pass)
         run: cargo test -p swe_justsign_rekor test_http_rekor_client_round_trips_against_staging -- --nocapture
+
+  pkcs11:
+    name: cargo test (pkcs11 + softhsm2)
+    runs-on: ubuntu-latest
+    # Linux-only because:
+    #   - softhsm2 is the standard test fixture and ships as an
+    #     apt package; equivalent install on macOS/Windows runners
+    #     is more invasive and adds no signal here.
+    #   - The Pkcs11Signer code itself is portable (cryptoki loads
+    #     .so / .dll / .dylib at runtime); we'd be testing the
+    #     fixture, not the signer.
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install SoftHSM2 + opensc
+        # softhsm2     — software PKCS#11 token (provides
+        #                /usr/lib/softhsm/libsofthsm2.so).
+        # opensc       — provides pkcs11-tool, used below to mint
+        #                the ECDSA P-256 keypair on the token.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends softhsm2 opensc
+
+      - name: Initialise token + mint ECDSA P-256 key
+        # softhsm2-util reassigns the slot id on init, so we read
+        # back the new id with `softhsm2-util --show-slots` and
+        # parse the first slot whose label matches.
+        #
+        # Mechanism: ECDSA P-256 — we ask pkcs11-tool to generate
+        # the keypair on the token, attaching CKA_LABEL=justsign-e2e
+        # so the test's JUSTSIGN_SOFTHSM_KEY_LABEL env var points at
+        # exactly that key.
+        run: |
+          set -euxo pipefail
+          mkdir -p "${HOME}/softhsm2-tokens"
+          cat > "${HOME}/softhsm2.conf" <<EOF
+          directories.tokendir = ${HOME}/softhsm2-tokens
+          objectstore.backend = file
+          log.level = INFO
+          EOF
+          export SOFTHSM2_CONF="${HOME}/softhsm2.conf"
+
+          softhsm2-util --init-token --free \
+            --label justsign-e2e \
+            --so-pin 1234 --pin 5678
+
+          # Discover the post-init slot id. softhsm2-util prints
+          # one slot per token; the label we just set is unique.
+          SLOT=$(softhsm2-util --show-slots \
+            | awk '/^Slot [0-9]+/ { slot=$2 } /Label:[[:space:]]+justsign-e2e/ { print slot; exit }')
+          echo "softhsm slot: ${SLOT}"
+
+          pkcs11-tool \
+            --module /usr/lib/softhsm/libsofthsm2.so \
+            --token-label justsign-e2e \
+            --pin 5678 \
+            --keypairgen \
+            --key-type EC:prime256v1 \
+            --label justsign-e2e \
+            --usage-sign
+
+          # Export for the test step. GHA's $GITHUB_ENV is the only
+          # cross-step way to push env vars from a shell step.
+          {
+            echo "SOFTHSM2_CONF=${HOME}/softhsm2.conf"
+            echo "JUSTSIGN_SOFTHSM_LIB=/usr/lib/softhsm/libsofthsm2.so"
+            echo "JUSTSIGN_SOFTHSM_PIN=5678"
+            echo "JUSTSIGN_SOFTHSM_KEY_LABEL=justsign-e2e"
+            echo "JUSTSIGN_SOFTHSM_SLOT_ID=${SLOT}"
+          } >> "${GITHUB_ENV}"
+
+      - name: cargo test (pkcs11 e2e)
+        run: |
+          cargo test -p swe_justsign_sign --features pkcs11 \
+            test_pkcs11_signer_signs_against_softhsm_when_configured \
+            -- --nocapture

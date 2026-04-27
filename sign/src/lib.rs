@@ -57,6 +57,9 @@ pub mod sbom;
 mod signer;
 pub mod slsa;
 
+#[cfg(feature = "pkcs11")]
+pub mod pkcs11;
+
 pub use error::{OciError, SignError, VerifyError};
 pub use sbom::{sign_cyclonedx, sign_spdx, verify_cyclonedx, verify_spdx};
 pub use signer::{EcdsaP256Signer, MockSigner, Signer, SignerError};
@@ -73,6 +76,8 @@ pub use kms::azure::AzureKeyVaultSigner;
 pub use kms::gcp::GcpKmsSigner;
 #[cfg(feature = "vault-transit")]
 pub use kms::vault::VaultTransitSigner;
+#[cfg(feature = "pkcs11")]
+pub use pkcs11::Pkcs11Signer;
 pub use slsa::{
     sign_slsa_provenance, verify_slsa_provenance, VerifiedSlsaProvenance,
     SLSA_PROVENANCE_V1_PREDICATE_TYPE,
