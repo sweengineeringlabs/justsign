@@ -1,0 +1,12 @@
+[book]
+title = "justsign"
+description = "Pure-Rust Sigstore client, producer, and verifier"
+authors = ["SWE Engineering Labs"]
+language = "en"
+src = "docs"
+multilingual = false
+
+[output.html]
+default-theme = "rust"
+git-repository-url = "https://github.com/sweengineeringlabs/justsign"
+edit-url-template = "https://github.com/sweengineeringlabs/justsign/edit/main/{path}"
