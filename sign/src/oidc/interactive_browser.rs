@@ -65,7 +65,7 @@ pub const DEFAULT_CLIENT_ID: &str = "sigstore";
 /// before giving up. 60 seconds matches cosign's default; long
 /// enough for a fresh TOTP, short enough that an operator who
 /// closes the tab doesn't leak a hung process.
-const REDIRECT_TIMEOUT: Duration = Duration::from_secs(60);
+const REDIRECT_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Cap response-body capture at 4 KiB on token-endpoint errors.
 const MAX_ERROR_BODY_BYTES: usize = 4096;
@@ -126,14 +126,36 @@ impl OidcProvider for InteractiveBrowserOidcProvider {
 
         let redirect_uri = format!("http://localhost:{actual_port}/");
         let state = random_state();
-        let auth_url =
-            build_authorization_url(&self.issuer_url, &self.client_id, &redirect_uri, &state);
 
-        // 2. Open browser. Failure isn't fatal — print the URL so
-        //    the operator can paste it. Any later listener-side
-        //    failure is the actually-blocking error.
+        // PKCE per RFC 7636. Sigstore's broker REQUIRES it (S256).
+        // The verifier stays in-process; the challenge goes on the
+        // auth URL; the verifier travels with the token-endpoint
+        // exchange so the broker can confirm we hold the matching
+        // pre-image.
+        let code_verifier = random_code_verifier();
+        let code_challenge = code_challenge_s256(&code_verifier);
+
+        // OIDC discovery: find the authorization_endpoint up front.
+        // Different issuers put auth at different paths (Dex puts it
+        // at <issuer>/auth; others put it elsewhere). Discovery is
+        // the only standards-compliant way to find these. Hardcoding
+        // the issuer URL as the auth URL only works if the issuer
+        // happens to put auth at its own root — Sigstore does not.
+        let endpoints = discover_endpoints(&self.issuer_url)?;
+        let auth_url = build_authorization_url(
+            &endpoints.authorization_endpoint,
+            &self.client_id,
+            &redirect_uri,
+            &state,
+            &code_challenge,
+        );
+
+        // 2. Open browser. Always print the URL too — on Windows the
+        //    `open` crate may return success without a visible browser
+        //    window (default-handler launches into the background).
+        eprintln!("oidc: open this URL in a browser to authenticate:\n{auth_url}");
         if let Err(e) = open::that(&auth_url) {
-            eprintln!("oidc: failed to open browser ({e}); paste this URL manually:\n{auth_url}");
+            eprintln!("oidc: failed to open browser ({e}); paste the URL above manually");
         }
 
         // 3. Wait for the redirect with a hard deadline. We CANNOT
@@ -159,31 +181,44 @@ impl OidcProvider for InteractiveBrowserOidcProvider {
             .cloned()
             .ok_or_else(|| OidcError::Http("redirect missing 'code' param".to_string()))?;
 
-        // 4. Exchange the code for an id_token. Two HTTPS calls:
-        //    discovery, then the token endpoint. Both use the
-        //    blocking reqwest client.
-        let token_endpoint = discover_token_endpoint(&self.issuer_url)?;
-        exchange_code(&token_endpoint, &self.client_id, &code, &redirect_uri)
+        // 4. Exchange the code for an id_token. The token_endpoint
+        //    came from the discovery doc fetched at step 1; reuse it
+        //    rather than re-running discovery. Pass the PKCE
+        //    code_verifier so the broker can confirm we hold the
+        //    pre-image of the challenge it saw at step 1.
+        exchange_code(
+            &endpoints.token_endpoint,
+            &self.client_id,
+            &code,
+            &redirect_uri,
+            &code_verifier,
+        )
     }
 }
 
 /// Build the OAuth 2.0 authorization URL the browser is sent to.
 /// Pure function — pulled out so the test suite can pin its shape
 /// without driving a real browser.
+///
+/// `issuer_url` here is actually the discovered `authorization_endpoint`
+/// — Dex-like issuers put it at `<issuer-base>/auth`, not at the
+/// issuer base directly.
 fn build_authorization_url(
-    issuer_url: &str,
+    auth_endpoint: &str,
     client_id: &str,
     redirect_uri: &str,
     state: &str,
+    code_challenge: &str,
 ) -> String {
     // Manual encoding of the redirect_uri's `:` and `/` — not strictly
     // required by the OAuth spec (browsers tolerate raw values) but
     // a number of OIDC issuers reject malformed query strings out of
     // an abundance of caution. We URL-encode the redirect URI only;
-    // client_id, scope, state are all alphanumeric in practice.
+    // client_id, scope, state, code_challenge are all alphanumeric
+    // (or PKCE base64url) in practice.
     let encoded_redirect = url_encode(redirect_uri);
     format!(
-        "{issuer_url}?client_id={client_id}&response_type=code&scope=openid+email&redirect_uri={encoded_redirect}&state={state}"
+        "{auth_endpoint}?client_id={client_id}&response_type=code&scope=openid+email&redirect_uri={encoded_redirect}&state={state}&code_challenge={code_challenge}&code_challenge_method=S256"
     )
 }
 
@@ -217,6 +252,55 @@ fn random_state() -> String {
     let mut out = String::with_capacity(32);
     for b in buf {
         out.push_str(&format!("{b:02x}"));
+    }
+    out
+}
+
+/// Generate a PKCE `code_verifier` per RFC 7636 §4.1: 43-128 chars
+/// from the unreserved set `[A-Za-z0-9._~-]`. We emit 64 hex chars
+/// (32 bytes of CSPRNG entropy → 64 hex), well within range and
+/// trivially unreserved-set-conformant. Sigstore's broker enforces
+/// PKCE S256.
+fn random_code_verifier() -> String {
+    use rand_core::{OsRng, RngCore};
+    let mut buf = [0u8; 32];
+    OsRng.fill_bytes(&mut buf);
+    let mut out = String::with_capacity(64);
+    for b in buf {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
+}
+
+/// Compute the PKCE `code_challenge` for the S256 method:
+/// `BASE64URL(SHA256(code_verifier))`, no padding.
+fn code_challenge_s256(verifier: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(verifier.as_bytes());
+    base64url_no_pad(&digest)
+}
+
+/// Tiny base64url-no-pad encoder for the 32-byte SHA-256 digest used
+/// by PKCE S256. Avoids pulling the `base64` crate for a single
+/// fixed-length input. RFC 4648 §5 alphabet: A-Z a-z 0-9 - _.
+fn base64url_no_pad(input: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut out = String::with_capacity((input.len() * 4 + 2) / 3);
+    let chunks = input.chunks(3);
+    for chunk in chunks {
+        let n = chunk.len();
+        let b0 = chunk[0];
+        let b1 = if n > 1 { chunk[1] } else { 0 };
+        let b2 = if n > 2 { chunk[2] } else { 0 };
+        let triple: u32 = ((b0 as u32) << 16) | ((b1 as u32) << 8) | (b2 as u32);
+        out.push(ALPHABET[((triple >> 18) & 0x3f) as usize] as char);
+        out.push(ALPHABET[((triple >> 12) & 0x3f) as usize] as char);
+        if n > 1 {
+            out.push(ALPHABET[((triple >> 6) & 0x3f) as usize] as char);
+        }
+        if n > 2 {
+            out.push(ALPHABET[(triple & 0x3f) as usize] as char);
+        }
     }
     out
 }
@@ -353,9 +437,10 @@ pub fn validate_state(params: &HashMap<String, String>, expected: &str) -> Resul
 }
 
 /// Wire shape of the OIDC discovery doc we care about. The full doc
-/// is large; we only deserialise the `token_endpoint` field.
+/// is large; we only deserialise the endpoint URLs we use.
 #[derive(Debug, Deserialize)]
 struct OidcDiscoveryDoc {
+    authorization_endpoint: String,
     token_endpoint: String,
 }
 
@@ -368,7 +453,21 @@ struct TokenEndpointResponse {
 
 /// Hit `<issuer>/.well-known/openid-configuration` and pull the
 /// `token_endpoint`. Pulled out for unit-test coverage.
+///
+/// Backwards-compatible wrapper around [`discover_endpoints`].
 pub fn discover_token_endpoint(issuer_url: &str) -> Result<String, OidcError> {
+    discover_endpoints(issuer_url).map(|d| d.token_endpoint)
+}
+
+/// Hit `<issuer>/.well-known/openid-configuration` and return the
+/// authorization + token endpoint URLs together. Used by the
+/// interactive browser flow which needs BOTH (auth endpoint to
+/// open the browser at, token endpoint to exchange the code).
+///
+/// The OIDC spec doesn't pin the path layout — Dex puts auth at
+/// `<issuer>/auth` while other issuers put it elsewhere. Discovery
+/// is the only standards-compliant way to find these.
+fn discover_endpoints(issuer_url: &str) -> Result<OidcDiscoveryDoc, OidcError> {
     let discovery_url = format!("{issuer_url}/.well-known/openid-configuration");
     let client = reqwest::blocking::Client::builder()
         .build()
@@ -386,19 +485,24 @@ pub fn discover_token_endpoint(issuer_url: &str) -> Result<String, OidcError> {
             body,
         });
     }
-    let doc: OidcDiscoveryDoc = resp
-        .json()
-        .map_err(|e| OidcError::Http(format!("decode discovery doc: {e}")))?;
-    Ok(doc.token_endpoint)
+    resp.json::<OidcDiscoveryDoc>()
+        .map_err(|e| OidcError::Http(format!("decode discovery doc: {e}")))
 }
 
 /// POST the auth code to the token endpoint and pull out
 /// `id_token`. Pulled out for unit-test coverage.
+///
+/// PKCE: the `code_verifier` is the pre-image of the
+/// `code_challenge` that travelled on the auth URL. The token
+/// endpoint hashes it (SHA-256) and compares to the stored
+/// challenge to confirm the same client that initiated the flow is
+/// the one redeeming the code.
 pub fn exchange_code(
     token_endpoint: &str,
     client_id: &str,
     code: &str,
     redirect_uri: &str,
+    code_verifier: &str,
 ) -> Result<String, OidcError> {
     let client = reqwest::blocking::Client::builder()
         .build()
@@ -410,6 +514,7 @@ pub fn exchange_code(
         ("code", code),
         ("client_id", client_id),
         ("redirect_uri", redirect_uri),
+        ("code_verifier", code_verifier),
     ];
     let resp = client
         .post(token_endpoint)
@@ -479,6 +584,7 @@ mod tests {
             "client-1",
             "http://localhost:1234/",
             "deadbeef",
+            "challenge123",
         );
         assert!(url.starts_with("https://issuer.example/auth?"), "got {url}");
         assert!(url.contains("client_id=client-1"), "got {url}");
@@ -620,6 +726,7 @@ mod tests {
             "client-1",
             "auth-code-xyz",
             "http://localhost:1234/",
+            "verifier-deadbeef",
         )
         .expect("exchange must succeed");
         assert_eq!(id_token, "eyJ.id-tok.sig");

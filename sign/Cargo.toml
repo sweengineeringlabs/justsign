@@ -78,6 +78,12 @@ der       = { version = "0.7", default-features = false, features = ["std", "oid
 const-oid = { version = "0.9", default-features = false }
 spki      = { version = "0.7", default-features = false, features = ["std"] }
 
+# PEM encoding for the leaf cert when keyless flows submit to
+# Rekor — Rekor's hashedrekord publicKey.content needs a PEM
+# string (it base64s on its side); raw DER bytes get rejected as
+# "invalid public key: failure decoding PEM".
+pem        = { version = "3", default-features = false, features = ["std"] }
+
 # PKCS#11 hardware key signing — gated behind the `pkcs11` feature.
 # `cryptoki` wraps the standard PKCS#11 C API; the actual provider
 # library (libsofthsm2, libykcs11, vendor HSM .dll, etc.) is loaded

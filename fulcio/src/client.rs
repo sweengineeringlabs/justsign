@@ -159,9 +159,17 @@ impl FulcioClient for HttpFulcioClient {
         // than dragging a dedicated struct into the public surface
         // for v0; the shape is small and the protobuf-derived names
         // are quirky enough that a hand-rolled JSON body is clearer.
+        //
+        // certificateSigningRequest is typed `bytes` in the Fulcio
+        // protobuf, which protobuf-JSON encodes as standard-base64.
+        // Sending the raw PEM string surfaces as
+        // `proto: invalid value for bytes field` from production
+        // Fulcio (staging is more lenient). Encode the PEM bytes.
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        let csr_b64 = STANDARD.encode(csr.pem.as_bytes());
         let body = serde_json::json!({
             "credentials": { "oidcIdentityToken": oidc_token },
-            "certificateSigningRequest": csr.pem,
+            "certificateSigningRequest": csr_b64,
         });
 
         let url = format!("{}/api/v2/signingCert", self.base_url);
@@ -202,9 +210,17 @@ impl FulcioClient for HttpFulcioClient {
 fn looks_like_pem(bytes: &[u8]) -> bool {
     // Cheap sniff — good enough for v0; real content negotiation
     // would key off the response Content-Type.
-    bytes
-        .windows(b"-----BEGIN".len())
-        .any(|w| w == b"-----BEGIN")
+    //
+    // Must START with a BEGIN marker. Earlier the heuristic was
+    // "contains BEGIN anywhere", which false-positived on JSON
+    // bodies whose values contain PEM strings as JSON-escaped
+    // (`-----BEGIN CERTIFICATE-----\n...`) — those need the JSON
+    // path so the `\n` escapes get unwrapped to real newlines.
+    let mut i = 0;
+    while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\r' || bytes[i] == b'\n') {
+        i += 1;
+    }
+    bytes[i..].starts_with(b"-----BEGIN")
 }
 
 fn extract_pem_from_json(bytes: &[u8]) -> Result<String, FulcioError> {

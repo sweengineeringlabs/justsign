@@ -52,6 +52,13 @@ sha2      = { version = "0.10", default-features = false, features = ["oid"] }
 # PEM split for the cert chain Fulcio returns.
 pem       = { version = "3", default-features = false, features = ["std"] }
 
+# Base64 encoding for the CSR field on the Fulcio v2 wire. The
+# protobuf field is `bytes`, which JSON-encodes as base64 — Fulcio
+# rejects raw-PEM-string bodies with "invalid value for bytes
+# field". Same crate the rest of the workspace uses; pinned via
+# the workspace [dependencies] block.
+base64    = { workspace = true }
+
 # HTTP — `blocking` is the v0 default. The non-blocking `Client`
 # surface ships in `reqwest` regardless of the `blocking` feature
 # (the `blocking` feature *adds* `reqwest::blocking::Client` on top

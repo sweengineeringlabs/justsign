@@ -311,9 +311,14 @@ pub fn sign_blob(
         }],
     };
 
-    // 3. Optional Rekor submission.
+    // 3. Optional Rekor submission. v0 sign_blob has no Fulcio
+    //    cert in scope, so the rekor entry's publicKey is empty;
+    //    real Rekor rejects this. Static-key flows that need
+    //    transparency should use a MockRekorClient or move to a
+    //    real-pubkey-binding API in v0.5. The keyless flow
+    //    (sign_blob_keyless) drives the cert-PEM-bearing path.
     let tlog_entries = if let Some(client) = rekor {
-        let entry = build_hashed_rekord(payload, &sig_bytes);
+        let entry = build_hashed_rekord(payload, &sig_bytes, Vec::new());
         let log_entry = client.submit(&entry)?;
         vec![log_entry_to_tlog_entry(&log_entry)]
     } else {
@@ -389,23 +394,52 @@ pub fn sign_blob_keyless(
         return Err(SignError::EmptyCertChain);
     }
 
-    // 2. Run the existing v0 sign path. PAE / signature / Rekor /
-    //    media-type / envelope shape are byte-identical to
-    //    `sign_blob` — we deliberately reuse it instead of
-    //    duplicating the flow so future fixes (e.g. PAE-shape
-    //    changes) only land in one place.
-    let mut bundle = sign_blob(payload, payload_type, signer, rekor)?;
+    // 2. PAE + sign. Same flow as sign_blob; inlined here so the
+    //    keyless rekor submission can pin the leaf-cert PEM into the
+    //    hashedrekord publicKey field (real Rekor rejects empty
+    //    pubkeys with "invalid public key: failure decoding PEM";
+    //    cosign keyless writes the leaf cert here, and we match).
+    let pae_bytes = spec::pae(payload_type.as_bytes(), payload);
+    let sig_bytes = signer
+        .sign(&pae_bytes)
+        .map_err(|e| SignError::Signer(e.to_string()))?;
+    let key_id = signer.key_id();
+    let envelope = Envelope {
+        payload_type: payload_type.to_string(),
+        payload: payload.to_vec(),
+        signatures: vec![DsseSignature {
+            keyid: key_id.clone(),
+            sig: sig_bytes.clone(),
+        }],
+    };
 
-    // 3. Attach the caller-supplied cert chain. The wire field is
-    //    `Option<Certificate> { certificates: Vec<Vec<u8>> }`;
-    //    `cert_chain_der` is `&[Vec<u8>]` with leaf at index 0 — the
-    //    same convention `verify_blob_keyless` reads out — so we
-    //    clone straight through with no re-ordering.
-    bundle.verification_material.certificate = Some(SpecCertificate {
-        certificates: cert_chain_der.to_vec(),
-    });
+    // 3. PEM-encode the leaf cert for Rekor's hashedrekord
+    //    publicKey.content. The leaf is at index 0 of the chain;
+    //    DER bytes wrap into a `CERTIFICATE` PEM block.
+    let leaf_pem = pem::encode(&pem::Pem::new("CERTIFICATE", cert_chain_der[0].clone()));
 
-    Ok(bundle)
+    // 4. Optional Rekor submission, with the leaf cert pinned as the
+    //    publicKey.
+    let tlog_entries = if let Some(client) = rekor {
+        let entry = build_hashed_rekord(payload, &sig_bytes, leaf_pem.into_bytes());
+        let log_entry = client.submit(&entry)?;
+        vec![log_entry_to_tlog_entry(&log_entry)]
+    } else {
+        Vec::new()
+    };
+
+    // 5. Bundle with the cert chain attached.
+    Ok(Bundle {
+        media_type: SIGSTORE_BUNDLE_V0_3_MEDIA_TYPE.to_string(),
+        verification_material: VerificationMaterial {
+            certificate: Some(SpecCertificate {
+                certificates: cert_chain_der.to_vec(),
+            }),
+            tlog_entries,
+            timestamp_verification_data: None,
+        },
+        content: BundleContent::DsseEnvelope(envelope),
+    })
 }
 
 /// Verify a [`spec::Bundle`] previously produced by [`sign_blob`]
@@ -556,16 +590,25 @@ fn verify_tlog_entry(tlog: &TlogEntry) -> Result<(), VerifyError> {
 /// Build the `hashedrekord` body for a (payload, signature) pair.
 ///
 /// Rekor never sees the raw payload — only its SHA-256 digest.
-/// The `publicKey` field is left empty in v0 because we don't yet
-/// have a Fulcio cert / static key bound to the signer; v0.5 will
-/// populate it from the `Signer` SPI.
-fn build_hashed_rekord(payload: &[u8], sig_bytes: &[u8]) -> HashedRekord {
+///
+/// `pubkey_pem_for_rekor` carries the public key Rekor pins to the
+/// entry. It's encoded as PEM bytes (Rekor base64s the value on its
+/// side at the JSON wire). Empty bytes mean "no public key" — used
+/// only by callers driving `sign_blob` in a static-key flow with a
+/// MockRekorClient (real Rekor rejects empty pubkeys with
+/// `invalid public key: failure decoding PEM`). The keyless flow
+/// (`sign_blob_keyless`) populates this with the leaf cert PEM.
+fn build_hashed_rekord(
+    payload: &[u8],
+    sig_bytes: &[u8],
+    pubkey_pem_for_rekor: Vec<u8>,
+) -> HashedRekord {
     let digest = Sha256::digest(payload);
     HashedRekord {
         signature: rekor::Signature {
             content: sig_bytes.to_vec(),
             public_key: PublicKey {
-                content: Vec::new(),
+                content: pubkey_pem_for_rekor,
             },
         },
         data: rekor::Data {
