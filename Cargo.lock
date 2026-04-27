@@ -1420,6 +1420,7 @@ version = "0.1.0"
 dependencies = [
  "ed25519-dalek",
  "hex",
+ "p256",
  "rand_core 0.6.4",
  "reqwest",
  "serde",

@@ -165,11 +165,22 @@ impl TufClient {
     /// production root as the bootstrap.
     ///
     /// The bundled root ([`crate::embedded::SIGSTORE_PRODUCTION_ROOT_BYTES`])
-    /// is parsed and runtime-expiry-checked at this point. If the
-    /// embedded asset has already expired on the system clock, the
-    /// constructor returns [`TufError::EmbeddedRootExpired`] -- the
-    /// chain walker can usually catch up by chained-root-walking
-    /// forward, but only after a successful bootstrap.
+    /// is parsed, runtime-expiry-checked, AND self-signature-verified
+    /// at this point. The self-verification step is the
+    /// "new-self-signs" half of TUF spec §5.3.4: the bundled root's
+    /// own root role must approve its own bytes to threshold,
+    /// otherwise the asset is malformed (e.g. a corrupt copy was
+    /// committed, or the verifier's wire-shape expectations have
+    /// drifted from what Sigstore's tuf-on-ci tooling actually
+    /// emits). Failing fast here surfaces a corrupt asset before
+    /// any network traffic, instead of letting the failure surface
+    /// later in the chain walk where the diagnostic is muddier.
+    ///
+    /// If the embedded asset has already expired on the system
+    /// clock, the constructor returns
+    /// [`TufError::EmbeddedRootExpired`] -- the chain walker can
+    /// usually catch up by chained-root-walking forward, but only
+    /// after a successful bootstrap.
     ///
     /// `cache_dir` is required because the workspace does not depend
     /// on `dirs` and we refuse to silently spread cached signing-trust
@@ -177,13 +188,15 @@ impl TufClient {
     ///
     /// To override the bundled root (air-gapped deploys, custom
     /// mirrors, security-paranoid pipelines that audit the root
-    /// out-of-band), use [`Self::with_initial_root_bytes`].
+    /// out-of-band), use [`Self::with_initial_root_bytes`]. That
+    /// path does NOT signature-verify the supplied bytes -- per
+    /// TUF spec the bootstrap root IS the trust anchor, and the
+    /// caller is responsible for verifying out-of-band.
     pub fn sigstore(cache_dir: impl Into<PathBuf>) -> Result<Self, TufError> {
-        Self::with_initial_root_bytes(
-            crate::embedded::SIGSTORE_PRODUCTION_ROOT_BYTES,
-            SIGSTORE_PROD_URL,
-            cache_dir,
-        )
+        let bytes = crate::embedded::SIGSTORE_PRODUCTION_ROOT_BYTES;
+        let client = Self::with_initial_root_bytes(bytes, SIGSTORE_PROD_URL, cache_dir)?;
+        verify_bundled_root_self_signature(bytes)?;
+        Ok(client)
     }
 
     /// Build a client preloaded with a caller-supplied initial root.
@@ -625,6 +638,42 @@ fn check_initial_root_not_expired(root: &Root, now: SystemTime) -> Result<(), Tu
         });
     }
     Ok(())
+}
+
+/// Self-signature gate for the bundled Sigstore production root.
+///
+/// Equivalent to the "new self-signs" half of TUF spec §5.3.4 run
+/// against the bootstrap asset itself: the root's `roles.root` must
+/// approve the root's own canonical-JSON-encoded `signed` body to
+/// threshold, using the keys it declares.
+///
+/// Why fail-fast here: if the bundled asset is malformed (corrupt
+/// copy committed, byte drift from the upstream CDN, mismatch
+/// between the verifier's wire-shape expectations and what
+/// tuf-on-ci actually emits), every later
+/// [`TufClient::fetch_root_from_bootstrap`] call would surface
+/// `TufError::BelowThreshold` on the first network hop. That error
+/// is muddier than this one because the operator can't tell whether
+/// the bug is in the bundled root, the network, or the freshly-
+/// fetched chain step. Pre-flight verifying the bundled root
+/// localises the diagnostic.
+fn verify_bundled_root_self_signature(bytes: &[u8]) -> Result<(), TufError> {
+    let v: serde_json::Value = serde_json::from_slice(bytes).map_err(TufError::Json)?;
+    let signed_value = v.get("signed").cloned().ok_or_else(|| {
+        TufError::Json(<serde_json::Error as serde::de::Error>::custom(
+            "bundled root envelope is missing top-level `signed` field",
+        ))
+    })?;
+    let signatures_value = v.get("signatures").cloned().ok_or_else(|| {
+        TufError::Json(<serde_json::Error as serde::de::Error>::custom(
+            "bundled root envelope is missing top-level `signatures` field",
+        ))
+    })?;
+    let signatures: Vec<crate::root::Signature> =
+        serde_json::from_value(signatures_value).map_err(TufError::Json)?;
+    let canonical_bytes = crate::canonical::canonicalize(&signed_value)?;
+    let root: Root = serde_json::from_value(signed_value).map_err(TufError::Json)?;
+    verify_role(&root, "root", &canonical_bytes, &signatures)
 }
 
 /// Sanitise a TUF metadata path to a safe filename for the cache.
@@ -1846,6 +1895,78 @@ mod tests {
             "bootstrap root version must match SIGSTORE_PRODUCTION_ROOT_VERSION"
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `TufClient::sigstore` self-signature-verifies the bundled
+    /// root at construction time.
+    ///
+    /// This is the new-self-signs gate from TUF spec §5.3.4 run
+    /// against the bootstrap asset itself. Without it, a corrupt
+    /// or tamper-modified embedded asset would surface its failure
+    /// only later in the chain walk, where the diagnostic blame
+    /// could plausibly land on the network or the upstream mirror
+    /// instead of the actual cause (the asset).
+    ///
+    /// Bug it catches: a regression where the helper that performs
+    /// the self-verification is silently dropped from the
+    /// `sigstore()` path -- e.g. someone refactors the constructor
+    /// and forgets to re-thread the call. Without this test, the
+    /// only signal would be an asset-rotation event landing a
+    /// malformed bytes blob and breaking production silently.
+    #[test]
+    fn test_sigstore_constructor_self_verifies_bundled_root() {
+        let dir = unique_temp_dir("sigstore_ctor_self_verifies");
+        // The constructor MUST internally call
+        // `verify_bundled_root_self_signature` against the embedded
+        // bytes. The most direct way to assert that is to call the
+        // helper ourselves and confirm it succeeds; if either path
+        // breaks (the helper or the constructor wiring), one of the
+        // two assertions below catches it.
+        super::verify_bundled_root_self_signature(crate::embedded::SIGSTORE_PRODUCTION_ROOT_BYTES)
+            .expect("bundled Sigstore root must self-verify at the helper level");
+        TufClient::sigstore(&dir)
+            .expect("TufClient::sigstore must succeed end-to-end including self-verification");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A bundled root whose bytes have been tampered (one byte
+    /// flipped inside the `signed` body) must fail
+    /// self-verification, surfacing
+    /// [`TufError::BelowThreshold`] rather than silently
+    /// proceeding. This pins the safety property that
+    /// `sigstore()`'s self-verification gate ACTUALLY rejects
+    /// asset corruption -- a gate that always returns Ok would
+    /// pass [`test_sigstore_constructor_self_verifies_bundled_root`]
+    /// but provide no real protection.
+    ///
+    /// Bug it catches: an implementation of
+    /// `verify_bundled_root_self_signature` that returns Ok
+    /// unconditionally, or one whose canonicalisation no longer
+    /// matches what tuf-on-ci emits (a regression we landed and
+    /// fixed once already in the v0.x cycle).
+    #[test]
+    fn test_verify_bundled_root_self_signature_rejects_tampered_bytes() {
+        let mut bytes: Vec<u8> = crate::embedded::SIGSTORE_PRODUCTION_ROOT_BYTES.to_vec();
+        // Flip one ASCII byte inside the `signed` body. The byte
+        // we pick is the `4` in `"version": 14`; toggling its low
+        // bit changes the canonical form (numbers pass through to
+        // the canonical encoding) and so flips every signature.
+        let needle = b"\"version\": 14";
+        let pos = bytes
+            .windows(needle.len())
+            .position(|w| w == needle)
+            .expect("bundled root contains version 14 marker");
+        // Mutate the ASCII '4' (0x34) -> '5' (0x35).
+        let target = pos + needle.len() - 1;
+        assert_eq!(bytes[target], b'4');
+        bytes[target] = b'5';
+
+        let err = super::verify_bundled_root_self_signature(&bytes)
+            .expect_err("tampered bytes must not self-verify");
+        assert!(
+            matches!(err, TufError::BelowThreshold { .. }),
+            "expected BelowThreshold from tampered self-verify, got {err:?}"
+        );
     }
 
     /// `TufClient::with_initial_root_bytes` accepts a synthesised

@@ -1,9 +1,7 @@
-//! OLPC canonical JSON encoder for TUF metadata.
+//! Canonical JSON encoder for TUF metadata.
 //!
-//! TUF specifies that signatures cover the **OLPC canonical JSON**
-//! form of the `signed` object — sorted keys, no insignificant
-//! whitespace, a specific minimal string-escape policy, and integer
-//! number formatting. Real TUF clients re-canonicalise on every
+//! TUF specifies that signatures cover the **canonical JSON** form
+//! of the `signed` object. Real TUF clients re-canonicalise on every
 //! verify; live Sigstore TUF metadata is NOT pre-canonicalised on
 //! the wire, so a working verifier MUST be able to compute the
 //! canonical form itself.
@@ -12,32 +10,39 @@
 //!
 //! - TUF spec §4.2.1 "Canonical JSON":
 //!   <https://theupdateframework.io/specification/latest/#canonical-json>
-//! - OLPC canonical JSON wiki page:
-//!   <http://wiki.laptop.org/go/Canonical_JSON>
-//! - RFC 8259 §7 "Strings" (the base JSON grammar from which the
-//!   minimal-escape rule below is carved):
-//!   <https://www.rfc-editor.org/rfc/rfc8259#section-7>
+//! - The TUF spec defers the precise encoder to securesystemslib's
+//!   `encode_canonical`, which is the de-facto canonical form
+//!   emitted by every shipping TUF producer (tuf-on-ci, python-tuf,
+//!   go-tuf). The OLPC canonical-JSON wiki page is a strict
+//!   superset that does NOT match what TUF producers actually
+//!   sign over -- empirically, the bundled Sigstore production
+//!   root v14 fails to verify against an OLPC-style re-emit but
+//!   passes against the securesystemslib form below.
 //!
 //! # Encoding rules (the contract this module implements)
 //!
 //! 1. **No insignificant whitespace.** No spaces, tabs, or newlines
 //!    appear outside string values.
-//! 2. **Object keys sorted by UTF-16 code units.** This is the OLPC
-//!    subtlety: the comparison is over each key's UTF-16 encoding
-//!    (the units `&str::encode_utf16()` produces), NOT over its raw
-//!    UTF-8 byte order. The two differ for any non-ASCII key.
-//! 3. **Strings: minimal RFC 8259 escapes only.**
-//!    - Required shorthand escapes: `\\`, `\"`, `\b`, `\t`, `\n`,
-//!      `\f`, `\r`.
-//!    - Other control bytes in the range U+0000..U+001F are emitted
-//!      as `\u00XX` with lowercase hex.
-//!    - U+007F (DEL) and everything from U+0080 upward pass through
-//!      as their UTF-8 byte sequences. Non-ASCII is NOT escaped to
-//!      `\uXXXX`; over-escaping would produce a different canonical
-//!      form than another conformant implementation.
-//!    - Supplementary-plane characters (U+10000..U+10FFFF) are
-//!      emitted as their 4-byte UTF-8 sequence, never as a
-//!      `\uXXXX\uXXXX` surrogate pair.
+//! 2. **Object keys sorted by UTF-16 code units.** The comparison
+//!    is over each key's UTF-16 encoding (the units
+//!    `&str::encode_utf16()` produces), NOT over its raw UTF-8
+//!    byte order. The two differ for any non-ASCII key.
+//! 3. **Strings: minimal escapes only — backslash and double-quote.**
+//!    - `\\` for U+005C (REVERSE SOLIDUS).
+//!    - `\"` for U+0022 (QUOTATION MARK).
+//!    - **Every other byte passes through verbatim**, including the
+//!      RFC 8259 control bytes U+0000..U+001F (LF, TAB, etc.) and
+//!      multibyte UTF-8 sequences. This produces **technically
+//!      invalid JSON** for strings containing control bytes, but it
+//!      matches what securesystemslib's `encode_canonical` emits
+//!      and what every shipping TUF producer signs over. Sigstore's
+//!      v14 root, for instance, has PEM-encoded public keys whose
+//!      JSON-decoded value contains literal LF (0x0A) bytes; if we
+//!      escaped those to `\n`, the canonical bytes would diverge
+//!      from what Sigstore's signers hashed and every signature
+//!      would fail to verify.
+//!    - Supplementary-plane characters (U+10000..U+10FFFF) pass
+//!      through as their 4-byte UTF-8 sequence.
 //! 4. **Numbers: integers only.** TUF metadata's schema has no
 //!    floating-point fields; emitting one would force us to pick an
 //!    IEEE-754-to-decimal rendering that two implementations are
@@ -180,27 +185,20 @@ fn write_string(out: &mut Vec<u8>, s: &str) {
     out.push(b'"');
     for ch in s.chars() {
         match ch {
-            // Required RFC 8259 escapes that have shorthand forms.
+            // securesystemslib's `encode_canonical` escapes ONLY
+            // backslash and double-quote. Every other byte passes
+            // through verbatim, including U+0000..U+001F control
+            // bytes. The result is technically invalid JSON when a
+            // control byte appears in a string value, but it
+            // matches what TUF producers (tuf-on-ci, python-tuf,
+            // go-tuf via securesystemslib) actually sign over --
+            // any wider escape rule would diverge from the bytes
+            // those producers hashed and every signature would
+            // fail to verify. See module docs for the specific
+            // load-bearing case (PEM-encoded public keys whose
+            // JSON-decoded value carries literal LF bytes).
             '\\' => out.extend_from_slice(b"\\\\"),
             '"' => out.extend_from_slice(b"\\\""),
-            '\u{0008}' => out.extend_from_slice(b"\\b"),
-            '\u{0009}' => out.extend_from_slice(b"\\t"),
-            '\u{000A}' => out.extend_from_slice(b"\\n"),
-            '\u{000C}' => out.extend_from_slice(b"\\f"),
-            '\u{000D}' => out.extend_from_slice(b"\\r"),
-            // Other control bytes U+0000..U+001F: required by RFC
-            // 8259 to be escaped, but no shorthand exists. Use
-            // \u00XX with lowercase hex.
-            c if (c as u32) < 0x20 => {
-                // Safe: we're in 0x00..=0x1F, so the lowercase hex
-                // form fits in two digits.
-                let _ = write!(out, "\\u{:04x}", c as u32);
-            }
-            // Everything else — including U+007F DEL, all printable
-            // ASCII, and all non-ASCII — passes through as its
-            // UTF-8 bytes. RFC 8259's required escape set ends at
-            // U+001F; over-escaping would produce a different
-            // canonical form than another conformant impl.
             c => {
                 let mut buf = [0u8; 4];
                 let encoded = c.encode_utf8(&mut buf);
@@ -335,33 +333,42 @@ mod tests {
         assert_eq!(bytes, b"\"\"");
     }
 
-    /// A string containing a literal newline byte must be escaped to
-    /// `\n` in the output. The input has one byte (0x0A); the output
-    /// has two (`\` then `n`).
+    /// A string containing a literal newline byte (0x0A) passes
+    /// through verbatim — NOT escaped to `\n`. This matches
+    /// securesystemslib's `encode_canonical` and is what every
+    /// shipping TUF producer signs over.
     ///
-    /// Bug it catches: passing control bytes through unescaped
-    /// breaks JSON validity outright (RFC 8259 §7 forbids unescaped
-    /// U+0000..U+001F in string literals).
+    /// Bug it catches: a regression to RFC-8259 / OLPC-style
+    /// escaping would diverge from what Sigstore's tuf-on-ci
+    /// actually emits. The bundled v14 production root carries
+    /// PEM-encoded public keys whose JSON-decoded value contains
+    /// literal LF bytes; escaping those to `\n` makes every ECDSA
+    /// signature fail to verify (see
+    /// `crate::root::tests::test_verify_role_against_bundled_sigstore_v14_self_signature`).
     #[test]
-    fn test_canonicalize_string_with_newline_emits_backslash_n_escape() {
+    fn test_canonicalize_string_with_newline_passes_through_verbatim() {
         let v = json!("a\nb");
         let bytes = canonicalize(&v).unwrap();
-        // Output is the 6 bytes: " a \ n b "
-        assert_eq!(bytes, b"\"a\\nb\"");
+        // Output is the 5 bytes: " a 0x0A b "
+        assert_eq!(bytes, b"\"a\nb\"");
     }
 
-    /// All RFC 8259 shorthand escapes round-trip to their two-char
-    /// forms.
+    /// Backslash and double-quote ARE escaped (the only two
+    /// characters securesystemslib's canonical encoder escapes);
+    /// every other byte that RFC 8259 would conventionally write
+    /// as a shorthand escape passes through verbatim.
     ///
-    /// Bug it catches: a partial escape table missing one of the
-    /// shorthands (e.g. `\f` is the formfeed, easy to forget) would
-    /// fall through to the `\u00XX` branch and produce
-    /// canonically-different output from a complete impl.
+    /// Bug it catches: a partial revert that re-introduced any
+    /// of the RFC-8259 shorthands (`\b`, `\t`, `\n`, `\f`, `\r`)
+    /// would diverge from securesystemslib and break signature
+    /// verification on every TUF root that contains those bytes
+    /// in a string value.
     #[test]
-    fn test_canonicalize_string_with_all_shorthand_escapes_emits_two_char_forms() {
+    fn test_canonicalize_string_only_backslash_and_quote_escaped() {
         let v = json!("\u{0008}\u{0009}\u{000A}\u{000C}\u{000D}\"\\");
         let bytes = canonicalize(&v).unwrap();
-        assert_eq!(bytes, b"\"\\b\\t\\n\\f\\r\\\"\\\\\"");
+        // Five raw control bytes, then \", then \\.
+        assert_eq!(bytes, b"\"\x08\x09\x0A\x0C\x0D\\\"\\\\\"");
     }
 
     /// Non-ASCII characters in a string pass through as their UTF-8

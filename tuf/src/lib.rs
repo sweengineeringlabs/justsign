@@ -42,24 +42,28 @@
 //!
 //! - **Delegations.** No delegated targets traversal —
 //!   [`Targets::delegations`] is preserved as raw JSON.
-//! - **ECDSA / RSA keys.** Ed25519-only, see "Cryptography" below.
+//! - **RSA keys.** Not on the wire for any role this verifier is
+//!   asked about; see "Cryptography" below.
 //!
 //! # Cryptography
 //!
-//! v0 supports **Ed25519 only**.
+//! Two signature schemes are supported. Algorithm dispatch in
+//! [`verify_role`] routes on the key's `scheme` field:
 //!
-//! - `keytype = "ed25519"`, `scheme = "ed25519"`
-//! - `keyval.public` is a hex-encoded 32-byte Ed25519 public key
-//!   (lowercase hex, no `0x` prefix — TUF convention).
+//! - **Ed25519** (`scheme = "ed25519"`). `keyval.public` is a
+//!   lowercase-hex 32-byte raw public key (TUF convention; not PEM,
+//!   not DER, not base64). `signature.sig` is a lowercase-hex
+//!   64-byte raw signature.
+//! - **ECDSA P-256, SHA-256** (`scheme = "ecdsa-sha2-nistp256"`).
+//!   `keyval.public` is either a PEM-encoded `SubjectPublicKeyInfo`
+//!   (Sigstore's tuf-on-ci shape, used by the bundled v14 production
+//!   root) OR a hex-encoded SEC1 elliptic-curve point (newer
+//!   python-tuf shape). `signature.sig` is a lowercase-hex
+//!   DER-encoded `ECDSA-Sig-Value`.
 //!
-//! ECDSA roots (`keytype = "ecdsa-sha2-nistp256"`) are rejected by
-//! [`verify_role`] with [`TufError::UnsupportedKeyType`]. Sigstore's
-//! current production root (v14) uses ECDSA P-256 keys, so a live
-//! chained-root walk against the bundled root will surface
-//! [`TufError::UnsupportedKeyType`] until ECDSA verification lands.
-//! The bundled-root parse path itself (the [`Root`] deserialiser) is
-//! algorithm-agnostic; only signature verification is gated on
-//! Ed25519 today. Adding ECDSA support is tracked separately.
+//! Any other `scheme` value surfaces [`TufError::UnsupportedKeyType`].
+//! The dispatch is exhaustive: there is no silent fall-through to
+//! the Ed25519 path on an unrecognised scheme.
 //!
 //! # Canonical-JSON
 //!

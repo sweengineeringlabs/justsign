@@ -24,6 +24,15 @@ spec          = { workspace = true }
 ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
 hex           = { version = "0.4", default-features = false, features = ["std"] }
 
+# ECDSA over the NIST P-256 curve. The bundled Sigstore production
+# root v14 (issue #27 asset) declares its root role keys as
+# `scheme = "ecdsa-sha2-nistp256"`, so the verifier's algorithm
+# dispatch in `root::verify_role` needs `p256::ecdsa` to validate
+# them. Version + feature set are byte-for-byte identical to
+# `swe_justsign_sign` and `swe_justsign_fulcio` so cargo resolves a
+# single copy of the RustCrypto stack across the workspace.
+p256          = { version = "0.13", default-features = false, features = ["std", "ecdsa", "pkcs8", "pem"] }
+
 # SHA-256 for cross-checking role hashes (timestamp pins snapshot,
 # snapshot pins targets). Already a transitive dep via ed25519-dalek;
 # pinning it directly mirrors the workspace pattern (rekor/sign/cli

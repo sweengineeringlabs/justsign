@@ -4,7 +4,16 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+// `Verifier` is the `signature::Verifier` trait re-exported by both
+// `ed25519_dalek` and `p256::ecdsa::signature`. Importing it through
+// `ed25519_dalek` brings the trait into scope for ALL VerifyingKey
+// types in this module (Ed25519 + ECDSA P-256), since `signature`
+// is a single trait crate that both algorithm crates re-export
+// from. A second `use p256::ecdsa::signature::Verifier as _` would
+// be redundant and triggers a `unused_imports` warning.
 use ed25519_dalek::{Signature as Ed25519Signature, Verifier, VerifyingKey};
+use p256::ecdsa::{Signature as P256Signature, VerifyingKey as P256VerifyingKey};
+use p256::pkcs8::DecodePublicKey;
 use serde::{Deserialize, Serialize};
 
 /// Opaque key identifier — TUF uses lowercase hex of a hash over the
@@ -334,51 +343,26 @@ pub fn verify_role(
                 keyid: sig.keyid.clone(),
             })?;
 
-        // v0: Ed25519 only. ECDSA roots get a typed error so the
-        // caller can route on it (e.g. fall back to a future v1
-        // verifier path).
-        if key.keytype != "ed25519" || key.scheme != "ed25519" {
-            return Err(TufError::UnsupportedKeyType {
-                keytype: key.keytype.clone(),
-                scheme: key.scheme.clone(),
-            });
-        }
+        // Algorithm dispatch. We route on `scheme` because that is
+        // the field the TUF spec ties to the verification algorithm
+        // (`keytype` is more of a key-family label and varies between
+        // producers: python-tuf emits `keytype = "ecdsa-sha2-nistp256"`
+        // for the same scheme that Sigstore's tuf-on-ci tooling
+        // labels `keytype = "ecdsa"`). Each known scheme gets its
+        // own arm; unknown schemes surface a typed error rather than
+        // silently falling through to the Ed25519 path.
+        let verified = match key.scheme.as_str() {
+            "ed25519" => verify_ed25519(key, sig, signed_bytes)?,
+            "ecdsa-sha2-nistp256" => verify_ecdsa_p256(key, sig, signed_bytes)?,
+            _ => {
+                return Err(TufError::UnsupportedKeyType {
+                    keytype: key.keytype.clone(),
+                    scheme: key.scheme.clone(),
+                });
+            }
+        };
 
-        let pk_bytes =
-            hex::decode(&key.keyval.public).map_err(|e| TufError::BadSignatureFormat {
-                detail: format!("public key hex decode: {e}"),
-            })?;
-        let pk_array: [u8; 32] =
-            pk_bytes
-                .as_slice()
-                .try_into()
-                .map_err(|_| TufError::BadSignatureFormat {
-                    detail: format!(
-                        "ed25519 public key must be 32 bytes, got {}",
-                        pk_bytes.len()
-                    ),
-                })?;
-        let verifying_key =
-            VerifyingKey::from_bytes(&pk_array).map_err(|e| TufError::BadSignatureFormat {
-                detail: format!("ed25519 public key invalid: {e}"),
-            })?;
-
-        let sig_bytes = hex::decode(&sig.sig).map_err(|e| TufError::BadSignatureFormat {
-            detail: format!("signature hex decode: {e}"),
-        })?;
-        let sig_array: [u8; 64] =
-            sig_bytes
-                .as_slice()
-                .try_into()
-                .map_err(|_| TufError::BadSignatureFormat {
-                    detail: format!(
-                        "ed25519 signature must be 64 bytes, got {}",
-                        sig_bytes.len()
-                    ),
-                })?;
-        let signature = Ed25519Signature::from_bytes(&sig_array);
-
-        if verifying_key.verify(signed_bytes, &signature).is_ok() {
+        if verified {
             valid_keyids.insert(sig.keyid.as_str());
         }
         // Bad signature bytes that are syntactically valid (right
@@ -397,6 +381,123 @@ pub fn verify_role(
             valid,
         })
     }
+}
+
+/// Run the Ed25519 verify path for one `(key, signature)` pair.
+///
+/// Returns `Ok(true)` on a syntactically-valid signature that passes
+/// verification, `Ok(false)` on a syntactically-valid signature that
+/// fails verification (does not count toward threshold but is not a
+/// hard error — matches TUF's tolerance of stale-key sigs during
+/// rotation), and `Err` on a structurally-broken sig/key (bad hex,
+/// wrong length, malformed key bytes).
+fn verify_ed25519(key: &Key, sig: &Signature, signed_bytes: &[u8]) -> Result<bool, TufError> {
+    let pk_bytes = hex::decode(&key.keyval.public).map_err(|e| TufError::BadSignatureFormat {
+        detail: format!("public key hex decode: {e}"),
+    })?;
+    let pk_array: [u8; 32] =
+        pk_bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| TufError::BadSignatureFormat {
+                detail: format!(
+                    "ed25519 public key must be 32 bytes, got {}",
+                    pk_bytes.len()
+                ),
+            })?;
+    let verifying_key =
+        VerifyingKey::from_bytes(&pk_array).map_err(|e| TufError::BadSignatureFormat {
+            detail: format!("ed25519 public key invalid: {e}"),
+        })?;
+
+    let sig_bytes = hex::decode(&sig.sig).map_err(|e| TufError::BadSignatureFormat {
+        detail: format!("signature hex decode: {e}"),
+    })?;
+    let sig_array: [u8; 64] =
+        sig_bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| TufError::BadSignatureFormat {
+                detail: format!(
+                    "ed25519 signature must be 64 bytes, got {}",
+                    sig_bytes.len()
+                ),
+            })?;
+    let signature = Ed25519Signature::from_bytes(&sig_array);
+    Ok(verifying_key.verify(signed_bytes, &signature).is_ok())
+}
+
+/// Run the ECDSA-P256-SHA256 verify path for one `(key, signature)`
+/// pair.
+///
+/// Wire format expected:
+///
+/// * `key.keyval.public` is either:
+///   1. A PEM-encoded `SubjectPublicKeyInfo` (`-----BEGIN PUBLIC KEY-----`
+///      ... `-----END PUBLIC KEY-----`). This is what Sigstore's
+///      tuf-on-ci tooling emits, and what the bundled v14
+///      production root carries (`keytype = "ecdsa"`,
+///      `scheme = "ecdsa-sha2-nistp256"`).
+///   2. A lowercase-hex SEC1 elliptic-curve point (typically the
+///      uncompressed `0x04 || X || Y` 65-byte form). This is what
+///      newer python-tuf metadata uses when it writes
+///      `keytype = "ecdsa-sha2-nistp256"`.
+///
+/// We try (1) first because it's the format the load-bearing
+/// bundled root uses; if (1) fails to parse we fall back to (2)
+/// so this verifier is interoperable with both major TUF
+/// producers.
+///
+/// * `sig.sig` is a lowercase-hex DER-encoded `ECDSA-Sig-Value`
+///   (a SEQUENCE of two INTEGERs). Per the TUF spec ECDSA-SHA256
+///   signs over the canonical `signed` bytes; the `p256` crate's
+///   `signature::Verifier::verify(msg, &sig)` impl hashes `msg`
+///   with SHA-256 internally and verifies the digest, so we hand
+///   it the raw `signed_bytes` directly — NOT a pre-computed
+///   digest.
+///
+/// Same return-value contract as [`verify_ed25519`].
+fn verify_ecdsa_p256(key: &Key, sig: &Signature, signed_bytes: &[u8]) -> Result<bool, TufError> {
+    let public = key.keyval.public.trim();
+
+    // (1) PEM SubjectPublicKeyInfo path — Sigstore tuf-on-ci shape.
+    let verifying_key = if public.starts_with("-----BEGIN") {
+        P256VerifyingKey::from_public_key_pem(public).map_err(|e| TufError::BadSignatureFormat {
+            detail: format!("ecdsa-p256 PEM SPKI public key invalid: {e}"),
+        })?
+    } else {
+        // (2) Hex SEC1 point path — python-tuf shape. We require
+        // ASCII hex (TUF convention is lowercase, but `hex::decode`
+        // is case-insensitive — we tolerate both since the wire is
+        // not under our control).
+        let pk_bytes = hex::decode(public).map_err(|e| TufError::BadSignatureFormat {
+            detail: format!("ecdsa-p256 SEC1 public key hex decode: {e}"),
+        })?;
+        P256VerifyingKey::from_sec1_bytes(&pk_bytes).map_err(|e| TufError::BadSignatureFormat {
+            detail: format!("ecdsa-p256 SEC1 public key invalid: {e}"),
+        })?
+    };
+
+    // The TUF wire form for ECDSA signatures is hex-encoded DER. An
+    // empty `sig` string is a real shape we see on the wire (an
+    // unprovisioned signer in a multi-signer root role) -- treat
+    // it as "this signer didn't contribute" rather than "the
+    // entire document is malformed", same way an incorrect sig
+    // doesn't bubble out of `verify_role`. Only structural-format
+    // errors (bad hex, malformed DER) bubble.
+    if sig.sig.is_empty() {
+        return Ok(false);
+    }
+
+    let sig_bytes = hex::decode(&sig.sig).map_err(|e| TufError::BadSignatureFormat {
+        detail: format!("ecdsa-p256 signature hex decode: {e}"),
+    })?;
+    let signature =
+        P256Signature::from_der(&sig_bytes).map_err(|e| TufError::BadSignatureFormat {
+            detail: format!("ecdsa-p256 DER signature parse: {e}"),
+        })?;
+
+    Ok(verifying_key.verify(signed_bytes, &signature).is_ok())
 }
 
 /// Convenience: verify a `root.json` is self-signed by the keys
@@ -621,31 +722,37 @@ mod tests {
         }
     }
 
-    /// Negative: ECDSA keys are explicitly rejected in v0 with a
-    /// typed error.
+    /// Negative: a `scheme` value the verifier does not implement
+    /// (e.g. `"rsassa-pss-sha256"`) surfaces a typed
+    /// `UnsupportedKeyType` error rather than silently falling
+    /// through to one of the supported algorithms.
     ///
-    /// Bug it catches: silently treating an ECDSA key as ed25519
-    /// (wrong byte length → BadSignatureFormat) would mask the real
-    /// "this is the wrong algorithm" issue. Distinct typed error
-    /// lets the caller route on it.
+    /// Bug it catches: a dispatch that uses `if scheme == "ed25519"
+    /// { ... } else { ecdsa path }` would route an unknown scheme to
+    /// the ECDSA arm and surface a less-actionable
+    /// BadSignatureFormat. The match-with-explicit-default-arm
+    /// shape forces every unknown scheme to the typed error.
     #[test]
-    fn test_verify_role_ecdsa_keytype_rejected_with_unsupported_error() {
+    fn test_verify_role_unknown_scheme_returns_unsupported_key_type() {
         let (mut root, signed, _sks) = build_test_root(1, 1);
         let key = root.keys.get_mut("k0").unwrap();
-        key.keytype = "ecdsa-sha2-nistp256".into();
-        key.scheme = "ecdsa-sha2-nistp256".into();
+        key.keytype = "rsa".into();
+        key.scheme = "rsassa-pss-sha256".into();
 
         // Provide a syntactically-plausible (but irrelevant) sig so
-        // the verifier reaches the keytype check.
+        // the verifier reaches the scheme dispatch.
         let fake_sig = Signature {
             keyid: "k0".into(),
             sig: hex::encode([0u8; 64]),
         };
         let err = verify_self_signed(&root, &signed, &[fake_sig]).unwrap_err();
-        assert!(
-            matches!(err, TufError::UnsupportedKeyType { .. }),
-            "got {err:?}"
-        );
+        match err {
+            TufError::UnsupportedKeyType { keytype, scheme } => {
+                assert_eq!(keytype, "rsa");
+                assert_eq!(scheme, "rsassa-pss-sha256");
+            }
+            other => panic!("expected UnsupportedKeyType, got {other:?}"),
+        }
     }
 
     /// Negative: signature whose keyid is allowed for the role but
@@ -764,5 +871,515 @@ mod tests {
         let serde_err = serde_json::from_slice::<Root>(bad_json).unwrap_err();
         let tuf_err: TufError = serde_err.into();
         assert!(matches!(tuf_err, TufError::Json(_)), "got {tuf_err:?}");
+    }
+
+    // ----- ECDSA P-256 dispatch (issue #37) -----------------------
+
+    /// Build a 1-of-1 root whose sole key is an ECDSA P-256 key
+    /// supplied by the caller, with the given keytype/scheme labels
+    /// and `keyval.public` text. Returns the parsed Root and the
+    /// (synthesised) `signed` bytes. Mirrors `build_test_root` for
+    /// the ECDSA case but lets each test pick its own wire shape so
+    /// we can exercise both the PEM SPKI and the hex SEC1 paths.
+    fn build_ecdsa_root(
+        keyid: &str,
+        keytype: &str,
+        scheme: &str,
+        public_str: String,
+    ) -> (Root, Vec<u8>) {
+        let mut keys = BTreeMap::new();
+        keys.insert(
+            keyid.to_string(),
+            Key {
+                keytype: keytype.to_string(),
+                scheme: scheme.to_string(),
+                keyval: KeyVal { public: public_str },
+            },
+        );
+        let mut roles = BTreeMap::new();
+        roles.insert(
+            "root".into(),
+            Role {
+                keyids: vec![keyid.to_string()],
+                threshold: 1,
+            },
+        );
+        let root = Root {
+            type_field: "root".into(),
+            spec_version: "1.0.31".into(),
+            version: 1,
+            expires: "2099-01-01T00:00:00Z".into(),
+            keys,
+            roles,
+            consistent_snapshot: true,
+        };
+        let signed_bytes = serde_json::to_vec(&root).unwrap();
+        (root, signed_bytes)
+    }
+
+    /// Smoke: existing Ed25519 path is untouched by the ECDSA
+    /// dispatch refactor.
+    ///
+    /// Bug it catches: a refactor that accidentally changed the
+    /// Ed25519 verify path while adding ECDSA support — for
+    /// example, swapping the `verify_ed25519` helper's return
+    /// semantics from "Ok(true) on verify, Ok(false) on bad sig"
+    /// to "Err on bad sig" would silently break threshold-tolerance
+    /// of stale-key signatures during rotation.
+    #[test]
+    fn test_verify_role_ed25519_path_still_works_after_ecdsa_refactor() {
+        let (root, signed, sks) = build_test_root(1, 1);
+        let sig = sign_with(&sks[0], "k0", &signed);
+        verify_self_signed(&root, &signed, &[sig]).unwrap();
+    }
+
+    /// Positive: an ECDSA P-256 signature over the exact signed
+    /// bytes verifies cleanly when the public key is shipped as
+    /// PEM-encoded SubjectPublicKeyInfo (the Sigstore tuf-on-ci
+    /// shape used by the bundled v14 production root).
+    ///
+    /// Bug it catches: a verifier that only handled the hex SEC1
+    /// public-key shape would reject the bundled root entirely;
+    /// this test pins the PEM SPKI parsing path that
+    /// `from_public_key_pem` opens up.
+    #[test]
+    fn test_verify_role_ecdsa_p256_pem_spki_valid_signature_accepted() {
+        use p256::ecdsa::signature::Signer as _;
+        use p256::ecdsa::SigningKey;
+        use p256::pkcs8::{EncodePublicKey, LineEnding};
+
+        let mut rng = rand_core::OsRng;
+        let sk = SigningKey::random(&mut rng);
+        let vk = sk.verifying_key();
+        let pem = vk.to_public_key_pem(LineEnding::LF).unwrap();
+
+        let (root, signed) = build_ecdsa_root("k0", "ecdsa", "ecdsa-sha2-nistp256", pem);
+        let sig: P256Signature = sk.sign(&signed);
+        let sig_hex = hex::encode(sig.to_der().as_bytes());
+        let sig = Signature {
+            keyid: "k0".into(),
+            sig: sig_hex,
+        };
+        verify_self_signed(&root, &signed, &[sig]).unwrap();
+    }
+
+    /// Positive: an ECDSA P-256 signature verifies when the public
+    /// key is shipped as a hex-encoded SEC1 uncompressed point (the
+    /// python-tuf `keytype = "ecdsa-sha2-nistp256"` shape).
+    ///
+    /// Bug it catches: a verifier that only handled the PEM SPKI
+    /// shape would reject any non-Sigstore TUF root that uses the
+    /// python-tuf wire format. This test pins the hex SEC1 path
+    /// that `from_sec1_bytes` opens up.
+    #[test]
+    fn test_verify_role_ecdsa_p256_hex_sec1_valid_signature_accepted() {
+        use p256::ecdsa::signature::Signer as _;
+        use p256::ecdsa::SigningKey;
+
+        let mut rng = rand_core::OsRng;
+        let sk = SigningKey::random(&mut rng);
+        let vk = sk.verifying_key();
+        // Uncompressed SEC1 form: 0x04 || X || Y, 65 bytes.
+        let sec1_hex = hex::encode(vk.to_encoded_point(false).as_bytes());
+
+        let (root, signed) =
+            build_ecdsa_root("k0", "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp256", sec1_hex);
+        let sig: P256Signature = sk.sign(&signed);
+        let sig_hex = hex::encode(sig.to_der().as_bytes());
+        let sig = Signature {
+            keyid: "k0".into(),
+            sig: sig_hex,
+        };
+        verify_self_signed(&root, &signed, &[sig]).unwrap();
+    }
+
+    /// Negative: an ECDSA P-256 signature over payload A is
+    /// rejected when the verifier is asked to check it against
+    /// payload B (one byte changed). Verifies that the SHA-256
+    /// pre-hash inside `signature::Verifier::verify` actually feeds
+    /// the supplied `signed_bytes` into the hash, not some
+    /// constant.
+    ///
+    /// Bug it catches: a verifier that fed the wrong byte slice to
+    /// `vk.verify` (e.g. accidentally hashed the role name, or an
+    /// empty slice) would accept any signature regardless of
+    /// payload.
+    #[test]
+    fn test_verify_role_ecdsa_p256_tampered_payload_rejected() {
+        use p256::ecdsa::signature::Signer as _;
+        use p256::ecdsa::SigningKey;
+        use p256::pkcs8::{EncodePublicKey, LineEnding};
+
+        let mut rng = rand_core::OsRng;
+        let sk = SigningKey::random(&mut rng);
+        let pem = sk
+            .verifying_key()
+            .to_public_key_pem(LineEnding::LF)
+            .unwrap();
+
+        let (root, signed) = build_ecdsa_root("k0", "ecdsa", "ecdsa-sha2-nistp256", pem);
+        let sig: P256Signature = sk.sign(&signed);
+        let sig_hex = hex::encode(sig.to_der().as_bytes());
+
+        // Tamper the payload AFTER signing -- the signature is over
+        // `signed`, but we hand the verifier `tampered`.
+        let mut tampered = signed.clone();
+        tampered[0] ^= 0xFF;
+
+        let sig = Signature {
+            keyid: "k0".into(),
+            sig: sig_hex,
+        };
+        let err = verify_self_signed(&root, &tampered, &[sig]).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                TufError::BelowThreshold {
+                    required: 1,
+                    valid: 0
+                }
+            ),
+            "got {err:?}"
+        );
+    }
+
+    /// Negative: a signature produced by ECDSA keypair A is
+    /// rejected when the role declares ECDSA keypair B's public
+    /// key.
+    ///
+    /// Bug it catches: a verifier that ignored the public key and
+    /// only checked sig structural validity would let a signer
+    /// without role authority pass the threshold.
+    #[test]
+    fn test_verify_role_ecdsa_p256_signature_from_wrong_key_rejected() {
+        use p256::ecdsa::signature::Signer as _;
+        use p256::ecdsa::SigningKey;
+        use p256::pkcs8::{EncodePublicKey, LineEnding};
+
+        let mut rng = rand_core::OsRng;
+        let signer_a = SigningKey::random(&mut rng);
+        let signer_b = SigningKey::random(&mut rng);
+
+        // Root authorises only signer_b's public key.
+        let pem_b = signer_b
+            .verifying_key()
+            .to_public_key_pem(LineEnding::LF)
+            .unwrap();
+        let (root, signed) = build_ecdsa_root("k0", "ecdsa", "ecdsa-sha2-nistp256", pem_b);
+
+        // But the supplied signature came from signer_a.
+        let sig: P256Signature = signer_a.sign(&signed);
+        let sig_hex = hex::encode(sig.to_der().as_bytes());
+        let sig = Signature {
+            keyid: "k0".into(),
+            sig: sig_hex,
+        };
+        let err = verify_self_signed(&root, &signed, &[sig]).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                TufError::BelowThreshold {
+                    required: 1,
+                    valid: 0
+                }
+            ),
+            "got {err:?}"
+        );
+    }
+
+    /// Positive: a 2-of-2 root with one Ed25519 signer + one ECDSA
+    /// P-256 signer succeeds when both contribute valid signatures.
+    /// Confirms the per-key dispatch in `verify_role` honours
+    /// each entry's own `scheme` rather than picking one for the
+    /// whole role.
+    ///
+    /// Bug it catches: a verifier that snapshotted the first key's
+    /// scheme and applied it to every signature would either reject
+    /// every ECDSA sig (if Ed25519 was first) or reject every
+    /// Ed25519 sig (if ECDSA was first).
+    #[test]
+    fn test_verify_role_mixed_threshold_with_ed25519_and_ecdsa_p256_succeeds() {
+        use ed25519_dalek::SigningKey as Ed25519SigningKey;
+        use p256::ecdsa::signature::Signer as P256Signer;
+        use p256::ecdsa::SigningKey as P256SigningKey;
+        use p256::pkcs8::{EncodePublicKey, LineEnding};
+
+        let mut rng = rand_core::OsRng;
+        let ed_sk = Ed25519SigningKey::generate(&mut rng);
+        let ec_sk = P256SigningKey::random(&mut rng);
+        let ec_pem = ec_sk
+            .verifying_key()
+            .to_public_key_pem(LineEnding::LF)
+            .unwrap();
+
+        let mut keys = BTreeMap::new();
+        keys.insert(
+            "ed".into(),
+            Key {
+                keytype: "ed25519".into(),
+                scheme: "ed25519".into(),
+                keyval: KeyVal {
+                    public: hex::encode(ed_sk.verifying_key().to_bytes()),
+                },
+            },
+        );
+        keys.insert(
+            "ec".into(),
+            Key {
+                keytype: "ecdsa".into(),
+                scheme: "ecdsa-sha2-nistp256".into(),
+                keyval: KeyVal { public: ec_pem },
+            },
+        );
+        let mut roles = BTreeMap::new();
+        roles.insert(
+            "root".into(),
+            Role {
+                keyids: vec!["ed".into(), "ec".into()],
+                threshold: 2,
+            },
+        );
+        let root = Root {
+            type_field: "root".into(),
+            spec_version: "1.0.31".into(),
+            version: 1,
+            expires: "2099-01-01T00:00:00Z".into(),
+            keys,
+            roles,
+            consistent_snapshot: true,
+        };
+        let signed = serde_json::to_vec(&root).unwrap();
+
+        let ed_sig_bytes = ed_sk.sign(&signed).to_bytes();
+        let ed_sig = Signature {
+            keyid: "ed".into(),
+            sig: hex::encode(ed_sig_bytes),
+        };
+        let ec_sig_value: P256Signature = ec_sk.sign(&signed);
+        let ec_sig = Signature {
+            keyid: "ec".into(),
+            sig: hex::encode(ec_sig_value.to_der().as_bytes()),
+        };
+        verify_self_signed(&root, &signed, &[ed_sig, ec_sig]).unwrap();
+    }
+
+    /// Negative: same mixed 2-of-2 root, but the ECDSA signature
+    /// is structurally valid DER over the wrong payload — only the
+    /// Ed25519 signer contributes, falling below threshold.
+    ///
+    /// Bug it catches: a verifier that bailed out on the first
+    /// algorithm-mismatch rather than counting per-key would
+    /// either fail-open (accept the bad ECDSA sig) or fail-closed
+    /// in the wrong place (return UnsupportedKeyType because of
+    /// the keytype label rather than BelowThreshold because of the
+    /// invalid sig). We want the threshold-arithmetic answer here.
+    #[test]
+    fn test_verify_role_mixed_threshold_with_one_invalid_ecdsa_sig_below_threshold() {
+        use ed25519_dalek::SigningKey as Ed25519SigningKey;
+        use p256::ecdsa::signature::Signer as P256Signer;
+        use p256::ecdsa::SigningKey as P256SigningKey;
+        use p256::pkcs8::{EncodePublicKey, LineEnding};
+
+        let mut rng = rand_core::OsRng;
+        let ed_sk = Ed25519SigningKey::generate(&mut rng);
+        let ec_sk = P256SigningKey::random(&mut rng);
+        let ec_pem = ec_sk
+            .verifying_key()
+            .to_public_key_pem(LineEnding::LF)
+            .unwrap();
+
+        let mut keys = BTreeMap::new();
+        keys.insert(
+            "ed".into(),
+            Key {
+                keytype: "ed25519".into(),
+                scheme: "ed25519".into(),
+                keyval: KeyVal {
+                    public: hex::encode(ed_sk.verifying_key().to_bytes()),
+                },
+            },
+        );
+        keys.insert(
+            "ec".into(),
+            Key {
+                keytype: "ecdsa".into(),
+                scheme: "ecdsa-sha2-nistp256".into(),
+                keyval: KeyVal { public: ec_pem },
+            },
+        );
+        let mut roles = BTreeMap::new();
+        roles.insert(
+            "root".into(),
+            Role {
+                keyids: vec!["ed".into(), "ec".into()],
+                threshold: 2,
+            },
+        );
+        let root = Root {
+            type_field: "root".into(),
+            spec_version: "1.0.31".into(),
+            version: 1,
+            expires: "2099-01-01T00:00:00Z".into(),
+            keys,
+            roles,
+            consistent_snapshot: true,
+        };
+        let signed = serde_json::to_vec(&root).unwrap();
+
+        let ed_sig_bytes = ed_sk.sign(&signed).to_bytes();
+        let ed_sig = Signature {
+            keyid: "ed".into(),
+            sig: hex::encode(ed_sig_bytes),
+        };
+        // ECDSA sig over a different message -- structurally valid
+        // DER, but won't verify against `signed`.
+        let ec_sig_value: P256Signature = ec_sk.sign(b"a different payload");
+        let ec_sig = Signature {
+            keyid: "ec".into(),
+            sig: hex::encode(ec_sig_value.to_der().as_bytes()),
+        };
+        let err = verify_self_signed(&root, &signed, &[ed_sig, ec_sig]).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                TufError::BelowThreshold {
+                    required: 2,
+                    valid: 1
+                }
+            ),
+            "got {err:?}"
+        );
+    }
+
+    /// Negative: an empty `sig` string on an ECDSA-scheme key
+    /// (which appears in real Sigstore root v14 metadata for an
+    /// unprovisioned signer slot) does not contribute to threshold,
+    /// but ALSO does not bubble out as a hard parse error.
+    ///
+    /// Bug it catches: an `is_empty` check accidentally placed
+    /// after the hex-decode would fail every empty sig with
+    /// BadSignatureFormat ("hex decode of empty string"). The
+    /// wire-format reality of multi-signer root metadata makes
+    /// silent-skip the right answer for this specific shape.
+    #[test]
+    fn test_verify_role_ecdsa_p256_empty_sig_is_silently_skipped() {
+        use p256::ecdsa::signature::Signer as _;
+        use p256::ecdsa::SigningKey;
+        use p256::pkcs8::{EncodePublicKey, LineEnding};
+
+        let mut rng = rand_core::OsRng;
+        let sk_a = SigningKey::random(&mut rng);
+        let sk_b = SigningKey::random(&mut rng);
+
+        let mut keys = BTreeMap::new();
+        keys.insert(
+            "a".into(),
+            Key {
+                keytype: "ecdsa".into(),
+                scheme: "ecdsa-sha2-nistp256".into(),
+                keyval: KeyVal {
+                    public: sk_a
+                        .verifying_key()
+                        .to_public_key_pem(LineEnding::LF)
+                        .unwrap(),
+                },
+            },
+        );
+        keys.insert(
+            "b".into(),
+            Key {
+                keytype: "ecdsa".into(),
+                scheme: "ecdsa-sha2-nistp256".into(),
+                keyval: KeyVal {
+                    public: sk_b
+                        .verifying_key()
+                        .to_public_key_pem(LineEnding::LF)
+                        .unwrap(),
+                },
+            },
+        );
+        let mut roles = BTreeMap::new();
+        roles.insert(
+            "root".into(),
+            Role {
+                keyids: vec!["a".into(), "b".into()],
+                threshold: 1,
+            },
+        );
+        let root = Root {
+            type_field: "root".into(),
+            spec_version: "1.0.31".into(),
+            version: 1,
+            expires: "2099-01-01T00:00:00Z".into(),
+            keys,
+            roles,
+            consistent_snapshot: true,
+        };
+        let signed = serde_json::to_vec(&root).unwrap();
+
+        // `a` contributes a real signature; `b` carries an empty
+        // sig string (the unprovisioned-signer shape we see on the
+        // Sigstore production root). Threshold 1 must be met by
+        // `a` alone.
+        let real_sig: P256Signature = sk_a.sign(&signed);
+        let real = Signature {
+            keyid: "a".into(),
+            sig: hex::encode(real_sig.to_der().as_bytes()),
+        };
+        let empty = Signature {
+            keyid: "b".into(),
+            sig: "".into(),
+        };
+        verify_self_signed(&root, &signed, &[real, empty]).unwrap();
+    }
+
+    /// LOAD-BEARING: the bundled Sigstore production root v14
+    /// (`tuf/assets/sigstore_prod.root.json`, ECDSA P-256, 5 keys,
+    /// threshold 3) self-verifies against the canonical-JSON form
+    /// of its `signed` object.
+    ///
+    /// This is the test issue #37 was filed to make pass. If it
+    /// fails, the bundled asset is non-functional: any
+    /// `TufClient::sigstore()` caller will surface
+    /// `TufError::BelowThreshold` (or worse, an algorithm error)
+    /// on the very first chain-walk step, blocking every keyless
+    /// verification flow that depends on a Sigstore root of trust.
+    ///
+    /// Bug it catches: a regression where the verifier's ECDSA
+    /// wire-shape expectations drift from what Sigstore's
+    /// tuf-on-ci tooling emits — e.g. expecting hex SEC1 instead
+    /// of PEM SPKI, or refusing `keytype = "ecdsa"` because the
+    /// TUF spec uses `"ecdsa-sha2-nistp256"`. The wire bytes for
+    /// the bundled root are pretty-printed with two-space indent
+    /// (NOT pre-canonicalised), so we re-canonicalise via the
+    /// approach-(a) [`crate::canonical::canonicalize`] path before
+    /// handing bytes to the verifier; this matches what the
+    /// production chain walk does for non-pre-canonicalised wire
+    /// payloads.
+    #[test]
+    fn test_verify_role_against_bundled_sigstore_v14_self_signature() {
+        let bytes = crate::embedded::SIGSTORE_PRODUCTION_ROOT_BYTES;
+        let envelope: serde_json::Value =
+            serde_json::from_slice(bytes).expect("bundled root parses as JSON");
+        let signed_value = envelope
+            .get("signed")
+            .cloned()
+            .expect("envelope has `signed`");
+        let signatures: Vec<Signature> = serde_json::from_value(
+            envelope
+                .get("signatures")
+                .cloned()
+                .expect("envelope has `signatures`"),
+        )
+        .expect("signatures vector deserialises");
+        let canonical_bytes =
+            crate::canonical::canonicalize(&signed_value).expect("bundled signed canonicalises");
+        let root: Root = serde_json::from_value(signed_value).expect("signed deserialises as Root");
+        verify_role(&root, "root", &canonical_bytes, &signatures).expect(
+            "bundled Sigstore production root v14 must self-verify against \
+             its own canonical-JSON `signed` form; if this assertion fires, \
+             the embedded asset is malformed or the verifier's ECDSA \
+             wire-shape expectations have drifted",
+        );
     }
 }
