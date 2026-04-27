@@ -47,12 +47,18 @@ use serde::{Deserialize, Serialize};
 
 use crate::dsse::Envelope;
 
-/// Canonical media type for v0.3 bundles. Verifiers should refuse
-/// bundles whose `media_type` doesn't start with the
-/// `application/vnd.dev.sigstore.bundle+json` prefix; we expose the
-/// constant so callers can do that check without typoing the string.
+/// Canonical media type for v0.3 bundles per the upstream
+/// protobuf-specs / sigstore-go convention:
+/// `application/vnd.dev.sigstore.bundle.v0.3+json` (the version
+/// segment is part of the suffix tree, not a `;version=` parameter).
+///
+/// The earlier `application/vnd.dev.sigstore.bundle+json;version=0.3`
+/// form was used by sigstore-go ≤ 0.5 and protobuf-specs ≤ 0.2;
+/// cosign 3.x and sigstore-go 0.6+ require the new form. Verifiers
+/// pinned to the old string will silently reject our bundles with
+/// "bundle does not contain cert for verification".
 pub const SIGSTORE_BUNDLE_V0_3_MEDIA_TYPE: &str =
-    "application/vnd.dev.sigstore.bundle+json;version=0.3";
+    "application/vnd.dev.sigstore.bundle.v0.3+json";
 
 /// Decoded Sigstore bundle.
 #[derive(Debug, Clone, PartialEq, Eq)]
