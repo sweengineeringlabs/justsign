@@ -74,11 +74,13 @@ Expected size: bundle is ~3-5 KB.
 The leaf cert's Subject Alternative Name is the Fulcio-embedded OIDC subject (your email, for Google ID tokens). Inspect with:
 
 ```sh
-jq -r '.verificationMaterial.x509CertificateChain.certificates[0].rawBytes' bundle.json \
+jq -r '.verificationMaterial.certificate.rawBytes' bundle.json \
   | base64 -d \
   | openssl x509 -inform DER -text -noout \
   | grep -A1 "Subject Alternative Name"
 ```
+
+Note: justsign emits the protobuf-specs v0.3 final singular `certificate` leaf shape (cosign 3.0+ requirement). For bundles produced by cosign 2.x or older sigstore-rs, the leaf lives under `verificationMaterial.x509CertificateChain.certificates[0].rawBytes` instead — substitute that path when inspecting legacy bundles.
 
 ### 5. Cross-verify with upstream cosign
 

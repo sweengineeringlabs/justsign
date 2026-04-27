@@ -2,6 +2,70 @@
 
 This document tracks API changes between justsign releases that require caller-side adjustment. Entries are in reverse chronological order (newest at the top).
 
+## post-v0.1.0 (#38) — bundle wire shape: singular `certificate` leaf, not `x509CertificateChain`
+
+**Affects**: downstream tools that parse the JSON bundle directly (jq, sigstore-go, sigstore-python, custom verifiers). The Rust API is unchanged.
+
+### What changed
+
+`Bundle::encode_json` now emits the cert material at the singular `verificationMaterial.certificate.rawBytes` (protobuf `X509Certificate` arm of the `VerificationMaterial.content` oneof — the shape protobuf-specs v0.3 final settled on after deprecating `x509_certificate_chain`).
+
+Before (#31 pin):
+
+```json
+{
+  "verificationMaterial": {
+    "x509CertificateChain": {
+      "certificates": [
+        { "rawBytes": "<base64 leaf DER>" },
+        { "rawBytes": "<base64 intermediate DER>" }
+      ]
+    }
+  }
+}
+```
+
+After (#38):
+
+```json
+{
+  "verificationMaterial": {
+    "certificate": { "rawBytes": "<base64 leaf DER>" }
+  }
+}
+```
+
+Only the leaf is emitted. Verifiers reconstruct intermediates and the trusted root from their TUF-validated trust anchors, not from the bundle.
+
+### Why we made the change
+
+cosign 3.0+ rejects bundles carrying `x509CertificateChain` with `bundle does not contain cert for verification, please provide public key`. Producing the deprecated arm makes every justsign-signed artifact unverifiable on cosign 3.x.
+
+### Caller-side impact
+
+The Rust API is unchanged: `sign_blob_keyless(payload, media_type, signer, cert_chain_der, rekor)` still accepts the full DER chain `&[Vec<u8>]` and the in-memory `Certificate { certificates: Vec<Vec<u8>> }` model is preserved for any verifier that walks the chain in-process. The leaf-only emit is purely a serialisation change.
+
+If you parse the bundle JSON directly:
+
+```sh
+# before (#31): chain wrapper, one entry per cert in chain
+jq -r '.verificationMaterial.x509CertificateChain.certificates[0].rawBytes' bundle.json
+
+# after (#38): singular leaf
+jq -r '.verificationMaterial.certificate.rawBytes' bundle.json
+```
+
+### Decode compatibility
+
+`Bundle::decode_json` accepts BOTH shapes — the new singular `certificate` AND the legacy `x509CertificateChain` wrapper — so existing bundles produced by cosign 2.x or older sigstore-rs continue to load. Bundles populating BOTH arms simultaneously are rejected with `BundleDecodeError::BothCertificateShapesSet`.
+
+### Downstream upgrade path
+
+- **cosign 2.x consumers**: upgrade to cosign 3.0+ to read justsign-produced bundles. cosign 2.x will reject the singular leaf shape.
+- **sigstore-rs consumers**: pin to a recent version that handles the protobuf-specs v0.3 final shape. Older versions that only decode `x509CertificateChain` will see no cert material in justsign-produced bundles.
+- **sigstore-go / sigstore-python**: any version that follows protobuf-specs v0.3 final will work; legacy versions that only handle the chain wrapper will not.
+- **Custom jq / shell pipelines**: substitute `verificationMaterial.certificate.rawBytes` for the old chain path.
+
 ## v0.1.0 — `verify_blob`'s `trusted_keys` parameter changed shape
 
 **Affects**: callers of `verify_blob`, `verify_blob_keyless`, `verify_attestation`, `verify_oci`, `verify_slsa_provenance`, `verify_cyclonedx`, `verify_spdx`.

@@ -87,8 +87,12 @@ a tracking issue; the README will be updated as they close.
   `trusted_keys` parameter changed from `&[p256::ecdsa::VerifyingKey]`
   to `&[VerifyingKey]` of the algorithm-tagged enum. The deprecation
   path / migration notes haven't been written. See [#29][i29].
-- **Bundle JSON shape pinning pending** — `certificate.certificates`
-  vs `verificationMaterial.x509CertificateChain`. See [#31][i31].
+- **Bundle JSON shape pinned** — `Bundle::encode_json` emits the
+  protobuf-specs v0.3 final singular leaf at
+  `verificationMaterial.certificate.rawBytes` (cosign 3.0+ wire
+  requirement); decode accepts both the singular shape and the
+  deprecated `x509CertificateChain` wrapper for cosign 2.x compat.
+  See [#38][i38] (inverts the earlier [#31][i31] pin).
 - **Granular `RekorError` variants pending** — transport vs HTTP
   status vs decode aren't separated yet. See [#32][i32].
 
@@ -210,5 +214,6 @@ the OCI specs, and every CNCF project.
 [i29]: https://github.com/sweengineeringlabs/justsign/issues/29
 [i31]: https://github.com/sweengineeringlabs/justsign/issues/31
 [i32]: https://github.com/sweengineeringlabs/justsign/issues/32
+[i38]: https://github.com/sweengineeringlabs/justsign/issues/38
 
 [`sigstore-rs`]: https://github.com/sigstore/sigstore-rs

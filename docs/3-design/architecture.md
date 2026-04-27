@@ -188,6 +188,6 @@ sequenceDiagram
 
 ## Wire format authority
 
-The Sigstore protobuf-specs v0.3 is the wire-format source of truth. The `verificationMaterial.x509CertificateChain.certificates[].rawBytes` shape (NOT `certificate.certificates`) is what `Bundle::encode_json` emits — see `spec/src/sigstore_bundle.rs` and the `test_encode_json_emits_canonical_certificate_shape` pin test from #31.
+The Sigstore protobuf-specs v0.3 final is the wire-format source of truth. `Bundle::encode_json` emits the singular leaf shape `verificationMaterial.certificate.rawBytes` (protobuf `X509Certificate` oneof arm) — required by cosign 3.0+ — and accepts both that shape and the deprecated `verificationMaterial.x509CertificateChain.certificates[].rawBytes` chain wrapper on decode for cosign 2.x compat. Pinned by `test_encode_json_emits_canonical_certificate_shape` in `spec/src/sigstore_bundle.rs` (inverted in #38 from #31's pin). Verifiers reconstruct intermediates and the root from their TUF-validated trust anchors, not from the bundle.
 
 For the threat model and what the verifier guarantees / does NOT guarantee, see [`docs/3-design/threat_model.md`](threat_model.md). For ADRs, see [`docs/3-design/adr/`](adr/).

@@ -131,7 +131,7 @@ Stubs return `SignerError::Stubbed("...; SDK integration tracked in justsign#NN"
 
 ## Wire compatibility
 
-justsign's `Bundle::encode_json` emits the protobuf-specs v0.3 canonical shape: `verificationMaterial.x509CertificateChain.certificates[].rawBytes` (NOT the legacy `certificate.certificates`). Decode accepts both shapes for backwards compat with older cosign / sigstore-rs producers. Pinned by `test_encode_json_emits_canonical_certificate_shape` in `spec/src/sigstore_bundle.rs`.
+justsign's `Bundle::encode_json` emits the protobuf-specs v0.3 final canonical shape: `verificationMaterial.certificate.rawBytes` (singular leaf, the `X509Certificate` arm of the `VerificationMaterial.content` oneof). cosign 3.0+ requires this shape; verifiers reconstruct intermediates and the root from their TUF-validated trust anchors. Decode accepts BOTH the singular shape and the deprecated `verificationMaterial.x509CertificateChain.certificates[].rawBytes` wrapper for backwards compat with cosign 2.x and older sigstore-rs producers. Pinned by `test_encode_json_emits_canonical_certificate_shape` in `spec/src/sigstore_bundle.rs` (inverted in #38 from #31's pin).
 
 Bundles produced by justsign verify against:
 

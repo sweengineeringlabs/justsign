@@ -537,10 +537,12 @@ pub fn cmd_sign_blob<W: Write>(args: &[String], out: &mut W) -> Result<(), CliEr
 
             // Step 6: build the signer over the ephemeral key and
             // delegate to `sign_blob_keyless`. The bundle returned
-            // carries the cert chain in
-            // `verification_material.x509CertificateChain.certificates`
-            // and (when rekor_arg is Some) the inclusion proof in
-            // `tlog_entries`.
+            // carries the leaf cert on the wire at
+            // `verification_material.certificate.rawBytes` (singular
+            // `X509Certificate`, the protobuf-specs v0.3 final shape
+            // cosign 3.0+ requires) and (when rekor_arg is Some) the
+            // inclusion proof in `tlog_entries`. The full chain is
+            // still held in-process by `Certificate.certificates`.
             let signer = EcdsaP256Signer::new(signing_key, None);
             sign_blob_keyless(
                 &payload,
