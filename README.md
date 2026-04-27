@@ -31,6 +31,11 @@ subsequent slices.
 - [`justcas`](../justcas)
 - [`justext4`](../justext4)
 
+## Documentation
+
+- [Threat model](docs/3-design/threat-model.md) — what the v0 verifier
+  guarantees, what it doesn't, and the caller-side checklist.
+
 ## Build
 
 ```
