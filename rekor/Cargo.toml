@@ -16,6 +16,17 @@ rust-version.workspace = true
 name = "rekor"
 path = "src/lib.rs"
 
+[features]
+# v0 default: blocking HTTP client only. Async is opt-in to keep
+# the default dep graph minimal — callers that don't need async
+# pay nothing for it.
+default = []
+# Adds the `async_client` module: `AsyncRekorClient` trait +
+# `HttpRekorClientAsync`. Pulls in `async-trait` (for an
+# object-safe async trait) and `tokio` (only for `#[tokio::test]`
+# in dev — runtime users bring their own executor).
+async = ["dep:async-trait", "dep:tokio"]
+
 [dependencies]
 thiserror  = { workspace = true }
 serde      = { workspace = true }
@@ -23,11 +34,18 @@ serde_json = { workspace = true }
 base64     = { workspace = true }
 sha2       = "0.10"
 
-# Blocking HTTP client used by `HttpRekorClient`. The dep line
-# matches the one in `swe_justsign_fulcio` exactly so cargo
-# resolves a single copy of `reqwest` (and its TLS/runtime stack)
-# across the workspace.
+# HTTP — `blocking` is the v0 default. The non-blocking `Client`
+# surface ships in `reqwest` regardless of the `blocking` feature
+# (the `blocking` feature *adds* `reqwest::blocking::Client` on
+# top of the always-on async one). Behind the `async` feature we
+# use the non-blocking client; the dep line itself doesn't change,
+# matching the one in `swe_justsign_fulcio` exactly so cargo
+# resolves a single copy of `reqwest` across the workspace.
 reqwest    = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+
+# Async surface — only compiled when `--features async` is set.
+async-trait = { version = "0.1", optional = true }
+tokio       = { version = "1", optional = true, default-features = false, features = ["macros", "rt"] }
 
 [lints]
 workspace = true

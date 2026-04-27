@@ -16,6 +16,17 @@ rust-version.workspace = true
 name = "fulcio"
 path = "src/lib.rs"
 
+[features]
+# v0 default: blocking HTTP client only. Async is opt-in to keep the
+# default dep graph minimal — callers that don't need async pay
+# nothing for it.
+default = []
+# Adds the `async_client` module: `AsyncFulcioClient` trait +
+# `HttpFulcioClientAsync`. Pulls in `async-trait` (for an
+# object-safe async trait) and `tokio` (only for `#[tokio::test]`
+# in dev — runtime users bring their own executor).
+async = ["dep:async-trait", "dep:tokio"]
+
 [dependencies]
 thiserror = { workspace = true }
 spec      = { workspace = true }
@@ -41,10 +52,23 @@ sha2      = { version = "0.10", default-features = false, features = ["oid"] }
 # PEM split for the cert chain Fulcio returns.
 pem       = { version = "3", default-features = false, features = ["std"] }
 
-# Blocking HTTP — keeps the v0 surface synchronous.
+# HTTP — `blocking` is the v0 default. The non-blocking `Client`
+# surface ships in `reqwest` regardless of the `blocking` feature
+# (the `blocking` feature *adds* `reqwest::blocking::Client` on top
+# of the always-on async one). Behind the `async` feature we use
+# the non-blocking client; the dep line itself doesn't change.
 reqwest    = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 serde      = { workspace = true }
 serde_json = { workspace = true }
+
+# Async surface — only compiled when `--features async` is set.
+# `async-trait` keeps the trait object-safe (no GAT yet stable for
+# trait objects with async fns).
+async-trait = { version = "0.1", optional = true }
+# `tokio` is *only* required for `#[tokio::test]` in this crate's
+# own tests; runtime callers bring their own executor. We still
+# gate it on the feature so default builds don't compile a runtime.
+tokio       = { version = "1", optional = true, default-features = false, features = ["macros", "rt"] }
 
 # Deterministic RNG used to materialise the canned mock cert chain
 # the first time `MockFulcioClient::new()` is called. ChaCha20 is

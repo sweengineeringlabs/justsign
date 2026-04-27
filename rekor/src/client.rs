@@ -252,21 +252,28 @@ impl RekorClient for HttpRekorClient {
 /// `LogEntry`. Shared between `submit` and `fetch` because the wire
 /// shape is identical.
 fn decode_log_entry_response(resp: reqwest::blocking::Response) -> Result<LogEntry, RekorError> {
-    let status = resp.status();
-    if !status.is_success() {
+    let status = resp.status().as_u16();
+    if !(200..300).contains(&status) {
         let body = resp.text().unwrap_or_else(|_| String::from("<unreadable>"));
-        return Err(RekorError::Status {
-            status: status.as_u16(),
-            body,
-        });
+        return Err(RekorError::Status { status, body });
     }
+    let raw = resp.bytes()?;
+    decode_log_entry_bytes(&raw)
+}
 
+/// Decode the *body bytes* of a successful Rekor entries response
+/// into a `LogEntry`. Pure (no I/O), so it can be reused by both
+/// the blocking and the (gated) async transport without dragging
+/// `reqwest::blocking::Response` into the async path.
+///
+/// Visible to the `async_client` sibling module via
+/// `pub(crate)`; not part of the public API.
+pub(crate) fn decode_log_entry_bytes(raw: &[u8]) -> Result<LogEntry, RekorError> {
     // Rekor returns `{ "<uuid>": { ... } }` — a one-element JSON
     // object keyed by the server-assigned UUID. We deserialise into
     // a `BTreeMap` so we don't depend on the field name and grab the
     // (one) entry.
-    let raw = resp.bytes()?;
-    let mut map: std::collections::BTreeMap<String, RekorEntryWire> = serde_json::from_slice(&raw)?;
+    let mut map: std::collections::BTreeMap<String, RekorEntryWire> = serde_json::from_slice(raw)?;
     let (uuid, wire) = map.pop_first().ok_or_else(|| RekorError::Status {
         status: 200,
         body: "rekor returned an empty entries map".to_string(),
@@ -332,7 +339,7 @@ fn decode_log_entry_response(resp: reqwest::blocking::Response) -> Result<LogEnt
 /// Decode a 64-char lowercase hex string into a 32-byte digest.
 /// Bare-bones because we only ever decode SHA-256-shaped hashes
 /// from Rekor — anything else is a malformed proof.
-fn decode_hex_32(s: &str) -> Result<[u8; 32], RekorError> {
+pub(crate) fn decode_hex_32(s: &str) -> Result<[u8; 32], RekorError> {
     use serde::de::Error as _;
     if s.len() != 64 {
         return Err(RekorError::Json(serde_json::Error::custom(format!(

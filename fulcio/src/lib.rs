@@ -24,7 +24,13 @@ mod client;
 mod csr;
 mod error;
 
+#[cfg(feature = "async")]
+pub mod async_client;
+
 pub use chain::{parse_chain, X509Cert};
 pub use client::{CertChain, FulcioClient, HttpFulcioClient, MockFulcioClient};
 pub use csr::{build_csr, Csr};
 pub use error::FulcioError;
+
+#[cfg(feature = "async")]
+pub use async_client::{AsyncFulcioClient, HttpFulcioClientAsync};

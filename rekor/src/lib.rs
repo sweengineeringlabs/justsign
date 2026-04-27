@@ -21,9 +21,15 @@ pub mod client;
 pub mod entry;
 pub mod merkle;
 
+#[cfg(feature = "async")]
+pub mod async_client;
+
 pub use client::{HttpRekorClient, LogEntry, MockRekorClient, RekorClient};
 pub use entry::{Data, HashedRekord, HashedRekordHash, PublicKey, Signature};
 pub use merkle::{verify_inclusion, EMPTY_TREE_ROOT, INTERNAL_NODE_PREFIX, LEAF_NODE_PREFIX};
+
+#[cfg(feature = "async")]
+pub use async_client::{AsyncRekorClient, HttpRekorClientAsync};
 
 /// Errors surfaced by the Rekor crate — verifier mismatches,
 /// shape mismatches, JSON failures, and (later) HTTP failures.
