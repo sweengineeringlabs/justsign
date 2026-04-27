@@ -44,6 +44,16 @@ ed25519     = ["dep:ed25519-dalek"]
 ecdsa-p384  = ["dep:p384"]
 secp256k1   = ["dep:k256"]
 
+# OIDC identity-token providers (issue #14). Umbrella feature for
+# Static / GitHubActions / GcpMetadata. Pulls reqwest + rand_core
+# (already transitively present, but re-stated here so the feature
+# advertises its full surface). The `InteractiveBrowser` provider
+# additionally needs `oidc-browser` because it pulls the `open` crate
+# to launch the operator's default browser — a dep we don't want to
+# carry on default builds.
+oidc         = ["dep:reqwest", "dep:rand_core"]
+oidc-browser = ["oidc", "dep:open"]
+
 [dependencies]
 thiserror  = { workspace = true }
 serde      = { workspace = true }
@@ -91,6 +101,19 @@ cryptoki  = { version = "0.10", optional = true }
 ed25519-dalek = { version = "2", optional = true, default-features = false, features = ["std", "pkcs8", "rand_core"] }
 p384          = { version = "0.13", optional = true, default-features = false, features = ["std", "ecdsa", "pkcs8"] }
 k256          = { version = "0.13", optional = true, default-features = false, features = ["std", "ecdsa", "pkcs8"] }
+
+# OIDC identity-token providers (issue #14) — gated behind the `oidc`
+# feature. reqwest pinned to the same version line as fulcio so cargo
+# resolves a single copy; rand_core for the OAuth `state` random.
+# Both `optional = true` so default builds don't pull them in.
+reqwest   = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"], optional = true }
+rand_core = { version = "0.6", default-features = false, features = ["std", "getrandom"], optional = true }
+
+# Browser launcher — gated behind the `oidc-browser` feature.
+# `open` is pure-Rust on every platform and shells out to the OS
+# default-handler (`xdg-open` / `start` / `open`). Same approach
+# cosign uses for its interactive flow.
+open      = { version = "5", optional = true }
 
 [dev-dependencies]
 # Deterministic RNG so the ECDSA round-trip test produces a stable

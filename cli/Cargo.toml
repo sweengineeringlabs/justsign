@@ -20,8 +20,23 @@ path = "src/main.rs"
 name = "cli"
 path = "src/lib.rs"
 
+[features]
+default = []
+# Forwards to `sign/oidc-browser`. Operators who want the
+# interactive-browser OIDC provider available via
+# `--oidc-provider interactive-browser` must build with this feature
+# (`cargo build -p swe_justsign_cli --features oidc-browser`).
+oidc-browser = ["sign/oidc-browser"]
+
 [dependencies]
-sign = { workspace = true }
+# Enable the `oidc` feature so the CLI can surface --oidc-provider
+# without callers having to flip features themselves. The
+# `oidc-browser` provider is left OFF by default — operators who want
+# the interactive flow must opt in via `cargo build --features
+# oidc-browser`. Keeping it off-by-default avoids pulling the `open`
+# crate (and its xdg-open / start / open shellouts) into a baseline
+# install on a server / CI box where there is no browser.
+sign = { workspace = true, features = ["oidc"] }
 
 # RustCrypto stack — versions match `swe_justsign_sign` and
 # `swe_justsign_fulcio` so cargo resolves a single copy of each

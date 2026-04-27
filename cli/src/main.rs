@@ -6,7 +6,8 @@ use std::io::{self, Write};
 use std::process::ExitCode;
 
 use cli::{
-    cmd_generate_key_pair, cmd_public_key, cmd_sign_blob, cmd_verify_blob, print_usage, CliError,
+    cmd_generate_key_pair, cmd_oidc_token, cmd_public_key, cmd_sign_blob, cmd_verify_blob,
+    print_usage, CliError,
 };
 
 fn main() -> ExitCode {
@@ -21,6 +22,7 @@ fn main() -> ExitCode {
         Some("public-key") => cmd_public_key(&argv[2..], &mut out),
         Some("sign-blob") => cmd_sign_blob(&argv[2..], &mut out),
         Some("verify-blob") => cmd_verify_blob(&argv[2..], &mut out),
+        Some("oidc-token") => cmd_oidc_token(&argv[2..], &mut out),
         Some("--help") | Some("-h") | Some("help") | None => {
             let _ = print_usage(&mut err);
             return ExitCode::SUCCESS;

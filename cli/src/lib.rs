@@ -53,6 +53,15 @@ use sign::{
     sign_blob, verify_blob, EcdsaP256Signer, VerifyingKey,
 };
 
+// OIDC providers are exposed via --oidc-provider on the
+// `oidc-token` subcommand. The CLI uses the `oidc` feature of `sign`
+// (always enabled by this crate's Cargo.toml). The `oidc-browser`
+// provider is gated behind the cli-side `oidc-browser` feature so a
+// default install on a server / CI box doesn't pull the `open` crate.
+#[cfg(feature = "oidc-browser")]
+use sign::InteractiveBrowserOidcProvider;
+use sign::{GcpMetadataOidcProvider, GitHubActionsOidcProvider, OidcProvider, StaticOidcProvider};
+
 /// Default Rekor base URL when `--rekor` is passed without a value.
 ///
 /// Sigstage staging — same hostname cosign uses for staging. We
@@ -120,6 +129,23 @@ pub fn print_usage<W: Write>(out: &mut W) -> std::io::Result<()> {
     writeln!(
         out,
         "      --rekor[=<url>] re-checks the bundle's tlog inclusion proof; same default URL."
+    )?;
+    writeln!(out, "  justsign oidc-token --oidc-provider <kind>")?;
+    writeln!(
+        out,
+        "      fetches an OIDC ID token (JWT) and prints the first 30 chars."
+    )?;
+    writeln!(
+        out,
+        "      kinds: static (default), github-actions, gcp-metadata, interactive-browser."
+    )?;
+    writeln!(
+        out,
+        "      v0 limitation: the CLI does NOT yet feed the token to a keyless-sign"
+    )?;
+    writeln!(
+        out,
+        "      command (sign_blob_keyless is library-only); the subcommand is the wiring proof."
     )?;
     Ok(())
 }
@@ -458,6 +484,121 @@ pub fn cmd_verify_blob<W: Write>(args: &[String], out: &mut W) -> Result<(), Cli
 
     writeln!(out, "OK").map_err(|e| CliError(format!("write: {e}")))?;
     Ok(())
+}
+
+/// Selects which OIDC provider `oidc-token` should use.
+///
+/// Concrete enum (rather than a `Box<dyn OidcProvider>`) so the
+/// `--oidc-provider <kind>` flag has a single, exhaustively-matched
+/// place where the kind string is decoded — adding a new provider
+/// means failing the `match` upfront, which is what we want.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OidcProviderKind {
+    Static,
+    GitHubActions,
+    GcpMetadata,
+    InteractiveBrowser,
+}
+
+impl OidcProviderKind {
+    /// Operator-friendly label printed in "fetching from <kind>..."
+    /// messages and in the unknown-provider error.
+    fn label(&self) -> &'static str {
+        match self {
+            OidcProviderKind::Static => "static",
+            OidcProviderKind::GitHubActions => "github-actions",
+            OidcProviderKind::GcpMetadata => "gcp-metadata",
+            OidcProviderKind::InteractiveBrowser => "interactive-browser",
+        }
+    }
+}
+
+/// Parse the `--oidc-provider <kind>` value. Returns a typed
+/// `OidcProviderKind` or a `CliError` whose message names every
+/// supported value — operators who mistype a kind get the answer in
+/// the error rather than having to read the help text.
+fn parse_oidc_provider_kind(s: &str) -> Result<OidcProviderKind, CliError> {
+    match s {
+        "static" => Ok(OidcProviderKind::Static),
+        "github-actions" => Ok(OidcProviderKind::GitHubActions),
+        "gcp-metadata" => Ok(OidcProviderKind::GcpMetadata),
+        "interactive-browser" => Ok(OidcProviderKind::InteractiveBrowser),
+        other => Err(CliError(format!(
+            "unknown --oidc-provider kind: '{other}' (expected: static, github-actions, gcp-metadata, interactive-browser)"
+        ))),
+    }
+}
+
+/// `oidc-token --oidc-provider <kind>` — fetch an OIDC ID token from
+/// the selected provider and print the first 30 chars.
+///
+/// v0 wiring proof: the CLI does not yet have a keyless-sign command,
+/// so the fetched token has nowhere to go end-to-end. Surfacing it
+/// here proves the provider trait + flag wiring works against every
+/// kind we ship; the keyless-sign command (which feeds the token to
+/// Fulcio) lands in a follow-up issue.
+pub fn cmd_oidc_token<W: Write>(args: &[String], out: &mut W) -> Result<(), CliError> {
+    // Default to `static` so this subcommand works in CI / scripted
+    // flows where the token is already in env (the most common case).
+    let mut kind = OidcProviderKind::Static;
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        match arg {
+            "--oidc-provider" => {
+                let v = args.get(i + 1).ok_or_else(|| {
+                    CliError("--oidc-provider requires a kind argument".to_string())
+                })?;
+                kind = parse_oidc_provider_kind(v)?;
+                i += 2;
+            }
+            other => return Err(CliError(format!("unknown flag: {other}"))),
+        }
+    }
+
+    writeln!(out, "fetching OIDC token from {}...", kind.label())
+        .map_err(|e| CliError(format!("write: {e}")))?;
+
+    let token = match kind {
+        OidcProviderKind::Static => StaticOidcProvider::default().fetch_token(),
+        OidcProviderKind::GitHubActions => GitHubActionsOidcProvider::default().fetch_token(),
+        OidcProviderKind::GcpMetadata => GcpMetadataOidcProvider::default().fetch_token(),
+        OidcProviderKind::InteractiveBrowser => fetch_interactive_browser_token(),
+    }
+    .map_err(|e| CliError(format!("oidc fetch: {e}")))?;
+
+    // Print only the first 30 chars + `...` — full JWTs are 1-2 KiB
+    // and pasting one into a terminal log line is a footgun
+    // (operators tend to copy them, the first 30 chars is enough to
+    // confirm the wiring + sniff which issuer it came from). Use
+    // `chars()` not byte slicing so we never split a UTF-8 codepoint.
+    let preview: String = token.chars().take(30).collect();
+    let elided = if token.chars().count() > 30 {
+        "..."
+    } else {
+        ""
+    };
+    writeln!(out, "token: {preview}{elided}").map_err(|e| CliError(format!("write: {e}")))?;
+    Ok(())
+}
+
+/// Helper that returns `Err` when the `oidc-browser` feature is OFF —
+/// keeps the `match` arm exhaustive without needing two compilation
+/// shapes for `cmd_oidc_token`.
+#[cfg(feature = "oidc-browser")]
+fn fetch_interactive_browser_token() -> Result<String, sign::OidcError> {
+    InteractiveBrowserOidcProvider::default().fetch_token()
+}
+
+#[cfg(not(feature = "oidc-browser"))]
+fn fetch_interactive_browser_token() -> Result<String, sign::OidcError> {
+    // `OidcError::Http` is the right shape: same enum the real
+    // provider would return, the only sensible variant for "this
+    // build has no browser provider".
+    Err(sign::OidcError::Http(
+        "interactive-browser provider not compiled in (rebuild with --features oidc-browser)"
+            .to_string(),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -942,5 +1083,95 @@ mod tests {
             derived, on_disk,
             "public-key output must equal the file generate-key-pair wrote"
         );
+    }
+
+    /// `--oidc-provider <kind>` parses every supported value into
+    /// the typed `OidcProviderKind` enum, and unknown kinds surface
+    /// a typed CliError that names the legal values.
+    ///
+    /// Bug it catches: a parser that silently fell back to `static`
+    /// on an unknown kind would mask operator typos (e.g. `--oidc-
+    /// provider github` instead of `github-actions`) and silently
+    /// pull a stale env-var token in CI.
+    #[test]
+    fn test_cli_parse_oidc_provider_kind_accepts_all_supported_values() {
+        assert_eq!(
+            parse_oidc_provider_kind("static").unwrap(),
+            OidcProviderKind::Static
+        );
+        assert_eq!(
+            parse_oidc_provider_kind("github-actions").unwrap(),
+            OidcProviderKind::GitHubActions
+        );
+        assert_eq!(
+            parse_oidc_provider_kind("gcp-metadata").unwrap(),
+            OidcProviderKind::GcpMetadata
+        );
+        assert_eq!(
+            parse_oidc_provider_kind("interactive-browser").unwrap(),
+            OidcProviderKind::InteractiveBrowser
+        );
+
+        let err = parse_oidc_provider_kind("github")
+            .expect_err("unknown kind must surface a typed error");
+        assert!(
+            err.0.contains("github-actions"),
+            "error must list legal values, got: {}",
+            err.0
+        );
+        assert!(
+            err.0.contains("static"),
+            "error must list legal values, got: {}",
+            err.0
+        );
+    }
+
+    /// `oidc-token` with `--oidc-provider static` and the env var set
+    /// fetches the token and prints the first 30 chars.
+    ///
+    /// Bug it catches: a wiring bug where the CLI built a provider
+    /// but never called `fetch_token()`, or one where the printed
+    /// preview used byte slicing and panicked on a multibyte JWT
+    /// boundary. The 30-char preview is the only operator-visible
+    /// output of the v0 wiring; if it doesn't appear, the wiring
+    /// is broken.
+    #[test]
+    fn test_cli_oidc_token_with_static_provider_prints_preview() {
+        // Mutating SIGSTORE_ID_TOKEN here races with the
+        // sign-crate's static_provider tests in the same workspace
+        // run, BUT cargo runs each crate's tests in a separate
+        // process, so cross-crate races are impossible. Within this
+        // crate, this is the only env-touching test.
+        let prev = std::env::var("SIGSTORE_ID_TOKEN").ok();
+        // 60 chars so the elision branch (`...`) fires too. JWTs in
+        // production are ~1-2 KiB; 60 chars is the smallest input
+        // that still exercises the truncation logic.
+        let canned_jwt = "eyJhbGciOiJSUzI1NiJ9.cli-preview-test.signature_part_x";
+        std::env::set_var("SIGSTORE_ID_TOKEN", canned_jwt);
+
+        let mut out = Vec::new();
+        cmd_oidc_token(&["--oidc-provider".into(), "static".into()], &mut out)
+            .expect("static provider with env set must succeed");
+
+        let stdout = String::from_utf8(out).unwrap();
+        assert!(
+            stdout.contains("fetching OIDC token from static"),
+            "must announce which provider, got: {stdout}"
+        );
+        // First 30 chars of the canned JWT exactly.
+        let expected_prefix: String = canned_jwt.chars().take(30).collect();
+        assert!(
+            stdout.contains(&expected_prefix),
+            "must print first 30 chars of token, got: {stdout}"
+        );
+        assert!(
+            stdout.contains("..."),
+            "must elide remainder with '...', got: {stdout}"
+        );
+
+        std::env::remove_var("SIGSTORE_ID_TOKEN");
+        if let Some(v) = prev {
+            std::env::set_var("SIGSTORE_ID_TOKEN", v);
+        }
     }
 }

@@ -53,6 +53,8 @@ mod error;
 ))]
 pub mod kms;
 pub mod oci;
+#[cfg(feature = "oidc")]
+pub mod oidc;
 pub mod sbom;
 mod signer;
 pub mod slsa;
@@ -88,6 +90,18 @@ pub use kms::gcp::GcpKmsSigner;
 pub use kms::vault::VaultTransitSigner;
 #[cfg(feature = "pkcs11")]
 pub use pkcs11::Pkcs11Signer;
+
+// OIDC identity-token providers — see `sign/src/oidc/mod.rs` for the
+// full taxonomy (Static / GitHubActions / GcpMetadata /
+// InteractiveBrowser). All four impl the same `OidcProvider` trait
+// and produce a JWT string the caller hands to Fulcio.
+#[cfg(feature = "oidc-browser")]
+pub use oidc::InteractiveBrowserOidcProvider;
+#[cfg(feature = "oidc")]
+pub use oidc::{
+    GcpMetadataOidcProvider, GitHubActionsOidcProvider, OidcError, OidcProvider, StaticOidcProvider,
+};
+
 pub use slsa::{
     sign_slsa_provenance, verify_slsa_provenance, VerifiedSlsaProvenance,
     SLSA_PROVENANCE_V1_PREDICATE_TYPE,
