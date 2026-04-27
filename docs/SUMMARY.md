@@ -17,6 +17,8 @@
 # Development
 
 - [Developer guide](4-development/developer_guide.md)
+- [MSRV policy](4-development/msrv_policy.md)
+- [Migration guide](4-development/migration_guide.md)
 
 # Testing
 
@@ -25,3 +27,4 @@
 # Deployment
 
 - [Deployment guide](6-deployment/deployment_guide.md)
+- [Production Sigstore round-trip runbook](6-deployment/production_round_trip_runbook.md)
