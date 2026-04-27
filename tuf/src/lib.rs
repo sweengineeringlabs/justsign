@@ -73,6 +73,7 @@ pub mod canonical;
 pub mod client;
 pub mod expiry;
 mod root;
+pub mod span;
 pub mod types;
 
 pub use canonical::{canonicalize, CanonicalizationError};
@@ -81,4 +82,5 @@ pub use expiry::{format_rfc3339_utc, is_expired, ExpiryParseError};
 pub use root::{
     verify_role, verify_self_signed, Key, KeyId, KeyVal, Role, RoleName, Root, Signature, TufError,
 };
+pub use span::{parse_with_signed_span, SpanParseError, SpannedSignedEnvelope};
 pub use types::{MetaInfo, Signed, Snapshot, Targets, Timestamp};
