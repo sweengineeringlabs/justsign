@@ -1,7 +1,7 @@
 [package]
 name        = "swe_justsign_tuf"
 version     = "0.1.0"
-description = "TUF metadata fetcher + verifier for justsign — establishes Sigstore root of trust. v0: parse + threshold-verify a self-signed TUF root.json."
+description = "TUF metadata fetcher + verifier for justsign — establishes Sigstore root of trust. Parse + threshold-verify TUF metadata, walk the chained root rotation chain, cross-check role hashes, enforce expiry."
 readme      = "../README.md"
 keywords    = ["sigstore", "tuf", "trust", "root", "metadata"]
 categories  = ["cryptography", "authentication"]
@@ -23,6 +23,19 @@ serde_json    = { workspace = true }
 spec          = { workspace = true }
 ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
 hex           = { version = "0.4", default-features = false, features = ["std"] }
+
+# SHA-256 for cross-checking role hashes (timestamp pins snapshot,
+# snapshot pins targets). Already a transitive dep via ed25519-dalek;
+# pinning it directly mirrors the workspace pattern (rekor/sign/cli
+# all depend on it directly with the same version).
+sha2          = { version = "0.10", default-features = false, features = ["std"] }
+
+# Blocking HTTP client for the Sigstore TUF mirror (`fetch_root`,
+# `fetch_timestamp`, `fetch_snapshot`, `fetch_targets`). Dep line is
+# byte-for-byte identical to swe_justsign_fulcio + swe_justsign_rekor
+# so cargo resolves a single copy of `reqwest` (and its TLS / runtime
+# stack) across the workspace.
+reqwest       = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 
 [dev-dependencies]
 ed25519-dalek = { version = "2", default-features = false, features = ["std", "rand_core"] }

@@ -1,38 +1,44 @@
-//! TUF metadata verifier for justsign — establishes Sigstore root of
-//! trust.
+//! TUF metadata verifier + fetcher for justsign — establishes
+//! Sigstore root of trust.
 //!
-//! # v0 scope
+//! # Surface
 //!
-//! Verification-only. Pure structs + a verifier; the caller supplies
-//! `root.json` bytes (and the raw `signed` slice — see below) however
-//! they like (filesystem read, embedded asset, network fetch).
+//! Two layers, both shipping today:
 //!
-//! What v0 does:
+//! 1. **Pure verifier** — [`Root`], [`verify_role`],
+//!    [`verify_self_signed`]. Caller supplies pre-fetched bytes; we
+//!    parse, threshold-verify, and surface typed errors. v0
+//!    behaviour, kept as the bottom of the stack.
+//! 2. **HTTP fetcher + chained-root walker** — [`TufClient`]. Hits a
+//!    Sigstore TUF mirror over HTTPS, walks the root chain
+//!    (old-signs-new + new-signs-self per spec §5.3.4), verifies
+//!    role signatures over canonical JSON, cross-checks role hashes
+//!    (timestamp pins snapshot, snapshot pins targets), enforces
+//!    expiry on every role, caches raw metadata bytes to disk so
+//!    re-runs don't refetch. See [`TufClient`] docs for the spec
+//!    walkthrough.
 //!
-//! - Parse a TUF root metadata document into a typed [`Root`].
+//! What this crate does:
+//!
+//! - Parse a TUF root metadata document into a typed [`Root`] (and
+//!   timestamp / snapshot / targets via [`types`]).
 //! - Verify a list of [`Signature`]s against a named role with at
 //!   least the role's threshold of distinct, valid keys.
-//! - In particular, check that a `root.json` is *self-signed* — i.e.
-//!   `root.signatures[]` validate against the keys named in
-//!   `root.signed.roles.root.keyids` to at least the root role's
-//!   threshold. This is the recursive trust establishment a TUF
-//!   client performs at boot.
+//! - Walk the chained-root rotation chain ([`TufClient::fetch_root`]).
+//! - Fetch + verify timestamp / snapshot / targets
+//!   ([`TufClient::fetch_timestamp`] et al.), with hash cross-checks.
+//! - Enforce expiry on every role at fetch time ([`expiry`]).
+//! - Cache raw wire bytes to disk for re-use across invocations.
 //!
-//! # Out of v0 scope
+//! # Out of scope
 //!
-//! - **Rotation / rollback.** Chained-root verification (N+1 root
-//!   signed by N's root keys) is not implemented.
-//! - **Targets / snapshot / timestamp roles.** Only the root role's
-//!   self-signature is checked.
-//! - **Delegations.** No delegated targets traversal.
-//! - **Expiry enforcement.** [`TufError::Expired`] is defined for
-//!   callers who want to enforce it; the verifier itself does *not*
-//!   reject expired metadata. Caller decides.
-//! - **Fetching.** No HTTP, no filesystem, no caching.
-//! - **Hashing.** v0 verifies signatures over caller-supplied raw
-//!   bytes; the caller is responsible for producing those bytes from
-//!   the `signed` field of `root.json` (see [`signature`] module
-//!   docs for what TUF expects here).
+//! - **Bootstrap.** The caller supplies the trusted initial root.
+//!   Baking a Sigstore root into the binary is a separate
+//!   attack-surface decision tracked elsewhere.
+//! - **Delegations.** No delegated targets traversal —
+//!   [`Targets::delegations`] is preserved as raw JSON.
+//! - **ECDSA / RSA keys.** Ed25519-only, mirroring Sigstore's
+//!   deployed shape.
 //!
 //! # Cryptography
 //!
@@ -64,9 +70,15 @@
 //! parse trade-off.
 
 pub mod canonical;
+pub mod client;
+pub mod expiry;
 mod root;
+pub mod types;
 
 pub use canonical::{canonicalize, CanonicalizationError};
+pub use client::TufClient;
+pub use expiry::{format_rfc3339_utc, is_expired, ExpiryParseError};
 pub use root::{
     verify_role, verify_self_signed, Key, KeyId, KeyVal, Role, RoleName, Root, Signature, TufError,
 };
+pub use types::{MetaInfo, Signed, Snapshot, Targets, Timestamp};

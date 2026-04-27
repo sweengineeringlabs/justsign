@@ -140,11 +140,104 @@ pub enum TufError {
     #[error("unsupported key type: keytype={keytype} scheme={scheme}")]
     UnsupportedKeyType { keytype: String, scheme: String },
 
-    /// Metadata `expires` is in the past. v0 never produces this
-    /// itself — provided so callers can construct it after a
-    /// caller-side expiry check.
-    #[error("metadata expired at {expires}")]
-    Expired { expires: String },
+    /// A role's `expires` field is in the past.
+    ///
+    /// Constructed by [`crate::client::TufClient`] after fetching a
+    /// role and rendering "now" against the role's RFC 3339 expiry.
+    /// `role` names which document is stale (`"root"`, `"timestamp"`,
+    /// `"snapshot"`, `"targets"`) so the caller can route on it.
+    #[error("metadata role {role} expired at {expires}")]
+    Expired {
+        /// The role whose `expires` field is in the past.
+        role: String,
+        /// The expiry timestamp the role declared.
+        expires: String,
+    },
+
+    /// Canonical-JSON re-encode failed before signature verification.
+    /// Surfaced when a fetched document has a structural shape the
+    /// canonicaliser refuses (e.g. a float in a numeric field).
+    #[error("canonicalisation: {0}")]
+    Canonicalization(#[from] crate::canonical::CanonicalizationError),
+
+    /// HTTP request failure when talking to the TUF mirror.
+    #[error("tuf http: {0}")]
+    Http(String),
+
+    /// HTTP response indicated a non-success, non-404 status. 404 is
+    /// surfaced separately via [`Self::NotFound`] because it is the
+    /// expected sentinel that ends the chained-root walk.
+    #[error("tuf http status {status}: {body}")]
+    HttpStatus {
+        /// HTTP status code returned by the mirror.
+        status: u16,
+        /// Truncated response body, for diagnostics.
+        body: String,
+    },
+
+    /// HTTP 404 from the mirror. Used by the chained-root walker as
+    /// the "no more versions" sentinel — not all 404s are errors
+    /// from the caller's perspective.
+    #[error("tuf http 404: {url}")]
+    NotFound {
+        /// URL that returned 404, surfaced for diagnostics.
+        url: String,
+    },
+
+    /// Filesystem error reading or writing the on-disk metadata
+    /// cache.
+    #[error("tuf cache io: {0}")]
+    Io(String),
+
+    /// A role's hash digest did not match the digest its parent
+    /// metadata declared. Examples:
+    ///
+    /// * `snapshot.json` SHA-256 != `timestamp.snapshot_meta.hashes.sha256`
+    /// * `targets.json`  SHA-256 != `snapshot.targets_meta.hashes.sha256`
+    ///
+    /// The two-level pinning (timestamp pins snapshot, snapshot pins
+    /// targets) is what TUF uses to defeat freshness attacks; a
+    /// mismatch here means an attacker tried to pair a fresh upper
+    /// role with a stale lower one.
+    #[error("role {role} hash mismatch: expected {expected}, got {actual}")]
+    HashMismatch {
+        /// Which role's hash failed to cross-check.
+        role: String,
+        /// The digest the parent metadata declared (lowercase hex).
+        expected: String,
+        /// The digest we computed over the fetched bytes (lowercase
+        /// hex).
+        actual: String,
+    },
+
+    /// A required hash algorithm was missing from the parent's
+    /// pointer. v0 only consumes SHA-256; an upstream metadata
+    /// document that omits SHA-256 from its `hashes` map is
+    /// considered malformed for our purposes.
+    #[error("role {role} missing required hash algorithm sha256")]
+    MissingHash {
+        /// The role we couldn't cross-check.
+        role: String,
+    },
+
+    /// A version monotonicity check failed during the chained-root
+    /// walk: root N+1 must have `version > N`. Defends against an
+    /// attacker downgrading the chain by serving an old root.json
+    /// from a path the new chain still resolves to.
+    #[error("root version regressed: previous {previous}, fetched {fetched}")]
+    VersionRegression {
+        /// Version of the previously-trusted root.
+        previous: u32,
+        /// Version of the freshly-fetched root that didn't advance.
+        fetched: u32,
+    },
+
+    /// Expiry-string parse failure (typed error from
+    /// [`crate::expiry::ExpiryParseError`]). Surfaced when a fetched
+    /// document carries an `expires` field we can't compare to "now"
+    /// — non-UTC offset, truncated, etc.
+    #[error("expiry parse: {0}")]
+    ExpiryParse(#[from] crate::expiry::ExpiryParseError),
 }
 
 /// Verify that `signatures` satisfies the named role's threshold

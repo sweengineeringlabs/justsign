@@ -128,3 +128,23 @@ jobs:
           cargo test -p swe_justsign_sign --features pkcs11 \
             test_pkcs11_signer_signs_against_softhsm_when_configured \
             -- --nocapture
+
+  tuf:
+    name: cargo test (live-tuf)
+    runs-on: ubuntu-latest
+    env:
+      # Opt-in flag: matches the JUSTSIGN_*_STAGING pattern used by
+      # the fulcio + rekor jobs above. The integration test no-ops
+      # with a SKIP line when this is unset.
+      JUSTSIGN_TUF_LIVE: "1"
+      # Path to a trusted Sigstore TUF bootstrap root.json. Stored
+      # as a repo secret (audited out-of-band). The test SKIPs
+      # without this so forks that lack the secret still see a
+      # green box.
+      JUSTSIGN_TUF_BOOTSTRAP: ${{ secrets.JUSTSIGN_TUF_BOOTSTRAP }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test (skip-pass)
+        run: cargo test -p swe_justsign_tuf --test live_sigstore test_tuf_client_walks_real_sigstore_chain_when_configured -- --nocapture
