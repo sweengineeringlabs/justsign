@@ -52,7 +52,27 @@ pub struct Signed<T> {
 ///
 /// Returning the typed body + the raw `Value` from one parse pass
 /// avoids a second walk over the bytes.
-pub(crate) fn parse_signed_envelope<T>(
+///
+/// # Deprecated for signature verification
+///
+/// `swe_justsign_tuf::client::TufClient` no longer calls this parser;
+/// it uses [`crate::span::parse_with_signed_span`] so the verifier
+/// sees the exact wire bytes of `signed` rather than a re-emitted
+/// canonical form. The (a) re-canonicalise approach this parser
+/// supports is kept available for downstream consumers that want the
+/// typed body plus a `serde_json::Value` view (e.g. compliance
+/// pipelines that re-canonicalise for content hashing) but MUST NOT
+/// be used to derive bytes for `verify_role` — drift between this
+/// crate's canonicaliser and the producer's would silently reject
+/// valid metadata. See [`crate::span`] for the wire-bytes parser
+/// and [`crate::canonical`] for the canonicaliser still exposed for
+/// non-verification callers.
+#[deprecated(
+    note = "use `swe_justsign_tuf::span::parse_with_signed_span` for signature verification; \
+            this parser does not preserve source spans, so verifying against its output trusts \
+            our canonicaliser instead of the wire bytes the producer signed"
+)]
+pub fn parse_signed_envelope<T>(
     bytes: &[u8],
 ) -> Result<(Signed<T>, serde_json::Value), serde_json::Error>
 where
@@ -218,6 +238,11 @@ mod tests {
             "signatures": []
         });
         let bytes = serde_json::to_vec(&doc).unwrap();
+        // Test code intentionally exercises the deprecated typed-only
+        // parser to keep its (Signed<T>, Value) shape covered. Real
+        // signature verification uses `parse_with_signed_span`; see
+        // `client.rs` migration tests.
+        #[allow(deprecated)]
         let (env, signed_value) =
             parse_signed_envelope::<crate::root::Root>(&bytes).expect("envelope");
         assert_eq!(env.signed.version, 1);

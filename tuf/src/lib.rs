@@ -83,4 +83,6 @@ pub use root::{
     verify_role, verify_self_signed, Key, KeyId, KeyVal, Role, RoleName, Root, Signature, TufError,
 };
 pub use span::{parse_with_signed_span, SpanParseError, SpannedSignedEnvelope};
+#[allow(deprecated)]
+pub use types::parse_signed_envelope;
 pub use types::{MetaInfo, Signed, Snapshot, Targets, Timestamp};

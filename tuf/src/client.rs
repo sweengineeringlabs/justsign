@@ -1,6 +1,8 @@
 //! `TufClient` — fetches Sigstore TUF metadata over HTTPS, walks the
-//! root chain, verifies role signatures over canonical JSON, and
-//! cross-checks role hashes between roles.
+//! root chain, verifies role signatures against the wire bytes of
+//! the `signed` field (extracted via
+//! [`crate::span::parse_with_signed_span`]), and cross-checks role
+//! hashes between roles.
 //!
 //! # Spec compliance
 //!
@@ -38,10 +40,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use crate::canonical::canonicalize;
 use crate::expiry::is_expired;
 use crate::root::{verify_role, Root, TufError};
-use crate::types::{parse_signed_envelope, Signed, Snapshot, Targets, Timestamp};
+use crate::span::parse_with_signed_span;
+use crate::types::{Signed, Snapshot, Targets, Timestamp};
 
 /// Default per-request HTTP timeout. Mirrors the value used in
 /// `swe_justsign_rekor` so a single tuned constant governs timeouts
@@ -190,16 +192,21 @@ impl TufClient {
                 Err(other) => return Err(other),
             };
 
-            let (envelope, signed_value) = parse_signed_envelope::<Root>(&bytes)?;
-            let signed_canonical = canonicalize(&signed_value)?;
+            let spanned = parse_with_signed_span::<Root>(&bytes)?;
+            // Verify against the EXACT wire bytes of the `signed`
+            // field — approach (b) from the canonical-vs-span
+            // trade-off. The verifier sees byte-for-byte what the
+            // signer hashed, with zero re-canonicalisation drift
+            // surface.
+            let signed_wire_bytes = &bytes[spanned.signed_bytes.clone()];
 
             // Old signs new: the previous root's root role must
             // approve this version's bytes.
             verify_role(
                 &current_root,
                 "root",
-                &signed_canonical,
-                &envelope.signatures,
+                signed_wire_bytes,
+                &spanned.signatures,
             )?;
 
             // New self-signs: the new root's own root role must
@@ -207,10 +214,10 @@ impl TufClient {
             // compromised the *previous* root role's keys could
             // hand us any keyset they like.
             verify_role(
-                &envelope.signed,
+                &spanned.signed,
                 "root",
-                &signed_canonical,
-                &envelope.signatures,
+                signed_wire_bytes,
+                &spanned.signatures,
             )?;
 
             // Monotonicity: spec §5.3.4 step 5 — version must
@@ -218,14 +225,14 @@ impl TufClient {
             // but we relax to "strictly greater" so a mirror that
             // skips a version (rare, but legal under the spec's
             // "can't roll back" framing) still succeeds.
-            if envelope.signed.version <= current_root.version {
+            if spanned.signed.version <= current_root.version {
                 return Err(TufError::VersionRegression {
                     previous: current_root.version,
-                    fetched: envelope.signed.version,
+                    fetched: spanned.signed.version,
                 });
             }
 
-            current_root = envelope.signed;
+            current_root = spanned.signed;
         }
 
         // Spec §5.3.4 step 6: "Check for a freeze attack" — the
@@ -247,16 +254,16 @@ impl TufClient {
     /// unverified root would invert the trust chain.
     pub fn fetch_timestamp(&self, root: &Root) -> Result<Timestamp, TufError> {
         let bytes = self.fetch_or_cached("timestamp.json")?;
-        let (envelope, signed_value) = parse_signed_envelope::<Timestamp>(&bytes)?;
-        let signed_canonical = canonicalize(&signed_value)?;
-        verify_role(root, "timestamp", &signed_canonical, &envelope.signatures)?;
-        if is_expired(&envelope.signed.expires, self.now())? {
+        let spanned = parse_with_signed_span::<Timestamp>(&bytes)?;
+        let signed_wire_bytes = &bytes[spanned.signed_bytes.clone()];
+        verify_role(root, "timestamp", signed_wire_bytes, &spanned.signatures)?;
+        if is_expired(&spanned.signed.expires, self.now())? {
             return Err(TufError::Expired {
                 role: "timestamp".to_string(),
-                expires: envelope.signed.expires.clone(),
+                expires: spanned.signed.expires.clone(),
             });
         }
-        Ok(envelope.signed)
+        Ok(spanned.signed)
     }
 
     /// Fetch and verify `snapshot.json` against `root` AND
@@ -284,16 +291,16 @@ impl TufClient {
             })?;
         cross_check_sha256(&bytes, "snapshot", meta)?;
 
-        let (envelope, signed_value) = parse_signed_envelope::<Snapshot>(&bytes)?;
-        let signed_canonical = canonicalize(&signed_value)?;
-        verify_role(root, "snapshot", &signed_canonical, &envelope.signatures)?;
-        if is_expired(&envelope.signed.expires, self.now())? {
+        let spanned = parse_with_signed_span::<Snapshot>(&bytes)?;
+        let signed_wire_bytes = &bytes[spanned.signed_bytes.clone()];
+        verify_role(root, "snapshot", signed_wire_bytes, &spanned.signatures)?;
+        if is_expired(&spanned.signed.expires, self.now())? {
             return Err(TufError::Expired {
                 role: "snapshot".to_string(),
-                expires: envelope.signed.expires.clone(),
+                expires: spanned.signed.expires.clone(),
             });
         }
-        Ok(envelope.signed)
+        Ok(spanned.signed)
     }
 
     /// Fetch and verify `targets.json` against `root` AND
@@ -309,16 +316,16 @@ impl TufClient {
             })?;
         cross_check_sha256(&bytes, "targets", meta)?;
 
-        let (envelope, signed_value) = parse_signed_envelope::<Targets>(&bytes)?;
-        let signed_canonical = canonicalize(&signed_value)?;
-        verify_role(root, "targets", &signed_canonical, &envelope.signatures)?;
-        if is_expired(&envelope.signed.expires, self.now())? {
+        let spanned = parse_with_signed_span::<Targets>(&bytes)?;
+        let signed_wire_bytes = &bytes[spanned.signed_bytes.clone()];
+        verify_role(root, "targets", signed_wire_bytes, &spanned.signatures)?;
+        if is_expired(&spanned.signed.expires, self.now())? {
             return Err(TufError::Expired {
                 role: "targets".to_string(),
-                expires: envelope.signed.expires.clone(),
+                expires: spanned.signed.expires.clone(),
             });
         }
-        Ok(envelope.signed)
+        Ok(spanned.signed)
     }
 
     // ------- internals -------
@@ -455,8 +462,11 @@ fn sha256_lower_hex(bytes: &[u8]) -> String {
 // Internal: a thin newtype around `Signed<Root>` is unused at the
 // moment but kept conceptually so tests can construct envelopes by
 // hand. Hidden behind `#[allow(dead_code)]` would mask real
-// dead-code warnings; we instead expose `parse_signed_envelope` for
-// any downstream that wants the envelope shape.
+// dead-code warnings; we instead expose this typed-only parser for
+// any downstream that wants the envelope shape without the span.
+// The signature-verification path in this crate uses
+// [`crate::span::parse_with_signed_span`] so the verifier sees the
+// exact wire bytes of `signed`.
 #[doc(hidden)]
 pub fn _parse_root_envelope(bytes: &[u8]) -> Result<Signed<Root>, TufError> {
     let typed: Signed<Root> = serde_json::from_slice(bytes)?;
@@ -468,6 +478,7 @@ pub fn _parse_root_envelope(bytes: &[u8]) -> Result<Signed<Root>, TufError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::canonical::canonicalize;
     use crate::root::{Key, KeyVal, Role, Signature};
     use ed25519_dalek::{Signer, SigningKey};
     use rand_core::OsRng;
@@ -1322,5 +1333,247 @@ mod tests {
             "got {err:?}"
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ─── span-vs-canonical migration tests ──────────────────────
+
+    /// The migration from approach (a) (re-canonicalise the parsed
+    /// `signed` value) to approach (b) (verify against the exact wire
+    /// bytes of the `signed` field) must produce a verifier that
+    /// accepts a metadata document signed over its on-the-wire form
+    /// even when that form is NOT byte-equal to what our
+    /// canonicaliser would have emitted.
+    ///
+    /// This test constructs exactly that scenario: a `timestamp.json`
+    /// envelope where the `signed` field carries non-canonical
+    /// whitespace (spaces after `:` and `,`). The signature is
+    /// computed over those EXACT wire bytes, not over the
+    /// canonicalised form. The post-#22 `TufClient` must accept it.
+    ///
+    /// To prove this is the migration's value (not an accident of
+    /// the test fixture matching the canonicaliser), we additionally
+    /// re-parse the same `signed` field and re-canonicalise it; the
+    /// resulting bytes must DIFFER from the wire bytes, AND a manual
+    /// `verify_role` call against those canonicalised bytes must
+    /// fail. That second assertion is the load-bearing one: it shows
+    /// the (a) approach this slice replaces would have rejected this
+    /// document, while the (b) approach now wired into `TufClient`
+    /// accepts it.
+    ///
+    /// Bug it catches: a `TufClient` that internally re-canonicalises
+    /// before verifying (the (a) approach pre-#22) — would silently
+    /// reject any producer whose canonicalisation differs from ours
+    /// even by one byte. Real-world hazard: a Sigstore root signed
+    /// with a slightly different escape policy than our encoder
+    /// emits. The (b) path eliminates this entire bug class because
+    /// the verifier sees the exact bytes the producer hashed.
+    #[test]
+    fn test_fetch_role_verifies_against_wire_bytes_not_recanonicalised() {
+        let dir = unique_temp_dir("wire_bytes_not_recanon");
+        let (root1, sks1) = build_test_root(1, 1, 1, "2099-01-01T00:00:00Z");
+
+        // Hand-roll the `signed` wire bytes: pretty-printed with
+        // leading whitespace inside the object. Canonical JSON would
+        // emit no whitespace and sort keys; this form deliberately
+        // does neither.
+        //
+        // Field order here also differs from canonical (which sorts
+        // alphabetically: `_type`, `expires`, `meta`, `spec_version`,
+        // `version`). We put `_type` first by convention, then
+        // `version`, then `spec_version`, then `expires`, then
+        // `meta`. The canonicaliser would re-order; this hand-rolled
+        // form does not.
+        let signed_wire = b"{ \"_type\": \"timestamp\", \"version\": 1, \"spec_version\": \"1.0.31\", \"expires\": \"2099-12-31T00:00:00Z\", \"meta\": { \"snapshot.json\": { \"version\": 1 } } }";
+
+        // Sign the EXACT wire bytes (approach (b)).
+        let sig = sks1[0].sign(signed_wire);
+        let sig_hex = hex::encode(sig.to_bytes());
+
+        // Build the envelope around those wire bytes verbatim. We
+        // must not let `serde_json::to_vec` re-emit the `signed`
+        // field; if it did, the bytes the verifier sees would be
+        // serde's canonical-ish output, not our hand-rolled form.
+        let mut envelope_bytes: Vec<u8> = Vec::new();
+        envelope_bytes.extend_from_slice(b"{\"signed\":");
+        envelope_bytes.extend_from_slice(signed_wire);
+        envelope_bytes.extend_from_slice(b",\"signatures\":[{\"keyid\":\"k0\",\"sig\":\"");
+        envelope_bytes.extend_from_slice(sig_hex.as_bytes());
+        envelope_bytes.extend_from_slice(b"\"}]}");
+
+        // Sanity: the (b) span parser recovers the EXACT wire bytes
+        // we built. Without this, the test could pass for the wrong
+        // reason (e.g. span parser recovering a different range that
+        // happens to also verify).
+        let spanned: crate::span::SpannedSignedEnvelope<Timestamp> =
+            crate::span::parse_with_signed_span(&envelope_bytes).expect("span parse");
+        assert_eq!(
+            &envelope_bytes[spanned.signed_bytes.clone()],
+            signed_wire,
+            "span parser must recover the wire bytes verbatim",
+        );
+
+        // Drive the migrated client. Approach (b) verifies signature
+        // against the wire bytes — this MUST succeed.
+        let server = LocalServer::start(vec![("timestamp.json".into(), envelope_bytes.clone())]);
+        let client = TufClient::new(&server.base_url, &dir).expect("client");
+        let ts = client
+            .fetch_timestamp(&root1)
+            .expect("(b) wire-bytes verifier must accept producer's exact bytes");
+        assert_eq!(ts.version, 1);
+
+        // Now prove that approach (a) — re-canonicalising — would
+        // have rejected the SAME document. Recover the typed `signed`
+        // value, canonicalise it, and try the verify_role we just
+        // succeeded with against those bytes instead.
+        let v: serde_json::Value =
+            serde_json::from_slice(&envelope_bytes).expect("envelope reparse");
+        let signed_value = v.get("signed").expect("envelope has signed").clone();
+        let canonical_bytes = canonicalize(&signed_value).expect("canonicalise");
+        assert_ne!(
+            canonical_bytes.as_slice(),
+            signed_wire,
+            "fixture is only meaningful if canonicaliser emits different bytes than the wire",
+        );
+
+        let signatures: Vec<Signature> = vec![Signature {
+            keyid: "k0".into(),
+            sig: sig_hex.clone(),
+        }];
+        let canonical_verify =
+            crate::root::verify_role(&root1, "timestamp", &canonical_bytes, &signatures);
+        match canonical_verify {
+            Err(TufError::BelowThreshold {
+                required: 1,
+                valid: 0,
+            }) => {
+                // The (a) path rejects, as expected. The (b) path
+                // accepted (above). Migration value proven.
+            }
+            other => panic!(
+                "(a) canonicalise path was expected to reject this fixture (BelowThreshold), \
+                 got {other:?}. If this assertion fails, the test fixture no longer demonstrates \
+                 a divergence between the wire form and the canonical form, so it does not \
+                 prove the (b) migration's value."
+            ),
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Tampering with a single byte INSIDE the `signed` block of the
+    /// served envelope (after the producer signed it) must cause the
+    /// fetcher to reject it. The wire-bytes verifier hashes the
+    /// tampered range, the signature was over the un-tampered range,
+    /// and Ed25519's avalanche means the verify fails.
+    ///
+    /// Bug it catches: a span extractor whose recorded range does
+    /// NOT cover the tampered byte. If the span ended one byte
+    /// short, or started one byte late, the verifier would hash a
+    /// slightly different slice and a tamper inside the dropped byte
+    /// would slip past. This test pins the span extractor's
+    /// boundaries by tampering at three positions inside the
+    /// `signed` block (start-ish, middle, end-ish) and asserting
+    /// rejection at each.
+    #[test]
+    fn test_fetch_role_rejects_tampering_inside_signed_field() {
+        let (root1, sks1) = build_test_root(1, 1, 1, "2099-01-01T00:00:00Z");
+
+        // Build a normal, canonical-ish `signed` body and a
+        // legitimate signature over it.
+        let mut meta = BTreeMap::new();
+        meta.insert(
+            "snapshot.json".to_string(),
+            crate::types::MetaInfo {
+                version: 1,
+                length: None,
+                hashes: None,
+            },
+        );
+        let ts = Timestamp {
+            type_field: "timestamp".into(),
+            spec_version: "1.0.31".into(),
+            version: 1,
+            expires: "2099-12-31T00:00:00Z".into(),
+            meta,
+        };
+        let signed_value = serde_json::to_value(&ts).unwrap();
+        let canonical = canonicalize(&signed_value).unwrap();
+        let sig = sks1[0].sign(&canonical);
+        let env = json!({
+            "signed": signed_value,
+            "signatures": [{"keyid": "k0", "sig": hex::encode(sig.to_bytes())}]
+        });
+        let original_bytes = serde_json::to_vec(&env).unwrap();
+
+        // Sanity: untampered fixture verifies.
+        {
+            let dir = unique_temp_dir("tamper_baseline");
+            let server =
+                LocalServer::start(vec![("timestamp.json".into(), original_bytes.clone())]);
+            let client = TufClient::new(&server.base_url, &dir).expect("client");
+            client
+                .fetch_timestamp(&root1)
+                .expect("untampered fixture must verify");
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        // Locate the `signed` value's byte range so we can tamper
+        // inside it. We use the span parser as the source of truth
+        // for those offsets; if the parser is wrong the assertion
+        // below would still pin a real boundary because tampering
+        // at a real `signed` byte must reject under either parser.
+        let spanned: crate::span::SpannedSignedEnvelope<Timestamp> =
+            crate::span::parse_with_signed_span(&original_bytes).expect("span parse baseline");
+        let span = spanned.signed_bytes.clone();
+        // Need at least a few bytes inside the value to pick three
+        // distinct offsets.
+        assert!(
+            span.end > span.start + 4,
+            "fixture must have a non-trivial `signed` body to tamper inside",
+        );
+
+        // Pick three offsets inside the `signed` value: just after
+        // start, middle, just before end. Each is a guaranteed
+        // member of the verifier's hashing input under approach (b).
+        let tamper_offsets = [span.start + 2, (span.start + span.end) / 2, span.end - 2];
+
+        for tamper_at in tamper_offsets {
+            let dir = unique_temp_dir(&format!("tamper_at_{tamper_at}"));
+            let mut tampered = original_bytes.clone();
+            // Flip every bit of the byte. XOR with 0xFF guarantees a
+            // visible change, including for 0x00 / 0xFF original
+            // bytes. We pick `tamper_at` knowing it's inside the
+            // `signed` span, but we don't know what the byte's role
+            // is (could be a quote, a colon, a digit) — that's fine
+            // because tampering ANY byte inside `signed` must
+            // produce a verify failure; if the chosen byte happens
+            // to be structurally critical (e.g. a quote) the parse
+            // step will fail with a different typed error that we
+            // also accept.
+            tampered[tamper_at] ^= 0xFF;
+
+            let server = LocalServer::start(vec![("timestamp.json".into(), tampered)]);
+            let client = TufClient::new(&server.base_url, &dir).expect("client");
+            let err = client
+                .fetch_timestamp(&root1)
+                .expect_err("tampered byte inside `signed` must be rejected");
+            // Acceptable rejections: signature mismatch (the common
+            // case), or a parse failure (when the tampered byte
+            // collides with structural JSON syntax). Anything else
+            // means the verifier was hashing a slice that excluded
+            // this byte — a span-extractor bug.
+            match err {
+                TufError::BelowThreshold { .. }
+                | TufError::SpanParse(_)
+                | TufError::Json(_)
+                | TufError::BadSignatureFormat { .. }
+                | TufError::ExpiryParse(_) => {}
+                other => panic!(
+                    "tampered byte at offset {tamper_at} inside `signed` produced \
+                     unexpected error variant {other:?}; expected a parse-or-verify rejection",
+                ),
+            }
+            let _ = fs::remove_dir_all(&dir);
+        }
     }
 }

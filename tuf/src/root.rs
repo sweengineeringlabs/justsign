@@ -238,6 +238,16 @@ pub enum TufError {
     /// — non-UTC offset, truncated, etc.
     #[error("expiry parse: {0}")]
     ExpiryParse(#[from] crate::expiry::ExpiryParseError),
+
+    /// Span-preserving envelope parse failure (typed error from
+    /// [`crate::span::SpanParseError`]). Surfaced when the fetched
+    /// document is not a well-formed `{signed, signatures}` envelope
+    /// or its typed body / signatures vector cannot be deserialised.
+    /// Distinct from [`Self::Json`] so callers can distinguish a
+    /// shape-level envelope problem from a generic JSON parse error
+    /// inside an otherwise-well-formed envelope.
+    #[error("envelope span parse: {0}")]
+    SpanParse(#[from] crate::span::SpanParseError),
 }
 
 /// Verify that `signatures` satisfies the named role's threshold
