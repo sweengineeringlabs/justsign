@@ -23,5 +23,20 @@ path = "src/lib.rs"
 [dependencies]
 sign = { workspace = true }
 
+# RustCrypto stack — versions match `swe_justsign_sign` and
+# `swe_justsign_fulcio` so cargo resolves a single copy of each
+# crate in the dependency tree (see commentary in those crates'
+# Cargo.toml files for the rationale).
+p256      = { version = "0.13", default-features = false, features = ["std", "ecdsa", "pkcs8", "pem"] }
+pkcs8     = { version = "0.10", default-features = false, features = ["std", "pem"] }
+signature = { version = "2",    default-features = false, features = ["std"] }
+sha2      = { version = "0.10", default-features = false, features = ["std"] }
+
+# `OsRng` for the keypair generator. `getrandom` is the underlying
+# OS-RNG shim — same dep graph the rest of the RustCrypto stack
+# already pulls in (fulcio brings it transitively for its mock
+# chain builder).
+rand_core = { version = "0.6", default-features = false, features = ["getrandom"] }
+
 [lints]
 workspace = true
