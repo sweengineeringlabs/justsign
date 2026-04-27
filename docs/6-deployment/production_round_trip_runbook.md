@@ -48,36 +48,30 @@ sha256sum "$ARTEFACT"
 ```sh
 SIGSTORE_ID_TOKEN="$TOKEN" \
   ./target/release/justsign sign-blob \
-    --keyless \
-    --rekor https://rekor.sigstore.dev \
-    --payload-type text/plain \
     "$ARTEFACT" \
-    > bundle.json
+    --keyless \
+    --fulcio https://fulcio.sigstore.dev \
+    --rekor  https://rekor.sigstore.dev \
+    --output-bundle bundle.json
 ```
 
-This:
+Important: production endpoints MUST be passed explicitly — the CLI defaults to staging (`https://fulcio.sigstage.dev` / `https://rekor.sigstage.dev`) so a typo'd command doesn't burn a permanent identity entry into the public production Rekor log.
 
-1. Generates a fresh ECDSA P-256 keypair in process.
-2. Builds a CSR.
-3. POSTs it to `https://fulcio.sigstore.dev/api/v2/signingCert` with the OIDC token; gets a short-lived cert chain.
-4. Signs the DSSE PAE of the artefact with the ephemeral private key.
-5. Submits a hashedrekord entry to `https://rekor.sigstore.dev/api/v1/log/entries`.
-6. Bundles cert chain + signature + Rekor inclusion proof into a Sigstore Bundle v0.3 JSON.
+What the CLI does per call:
+
+1. Resolves the OIDC token from `SIGSTORE_ID_TOKEN` (the default `--oidc-provider static` reads that env var, falling back to `OIDC_TOKEN`).
+2. Mints a fresh ECDSA P-256 keypair in process.
+3. Builds a CSR via `sign::fulcio::build_csr`.
+4. POSTs it to `https://fulcio.sigstore.dev/api/v2/signingCert` with the OIDC token; gets a short-lived cert chain.
+5. Signs the DSSE PAE of the artefact bytes with the ephemeral private key.
+6. Submits a hashedrekord entry to `https://rekor.sigstore.dev/api/v1/log/entries`.
+7. Wraps cert chain + signature + Rekor inclusion proof into a Sigstore Bundle v0.3 JSON, written to `bundle.json`.
 
 Expected size: bundle is ~3-5 KB.
 
-### 4. Verify with justsign
+### 4. Inspect the cert chain
 
-```sh
-./target/release/justsign verify-blob \
-  --keyless \
-  --rekor https://rekor.sigstore.dev \
-  --bundle bundle.json \
-  --expected-san "$YOUR_EMAIL_OR_OIDC_SUBJECT" \
-  "$ARTEFACT"
-```
-
-`$YOUR_EMAIL_OR_OIDC_SUBJECT` is the value Fulcio embedded in the leaf cert's SAN — for Google ID tokens, your email. Inspect the cert chain with:
+The leaf cert's Subject Alternative Name is the Fulcio-embedded OIDC subject (your email, for Google ID tokens). Inspect with:
 
 ```sh
 jq -r '.verificationMaterial.x509CertificateChain.certificates[0].rawBytes' bundle.json \
@@ -88,7 +82,7 @@ jq -r '.verificationMaterial.x509CertificateChain.certificates[0].rawBytes' bund
 
 ### 5. Cross-verify with upstream cosign
 
-This is the load-bearing check. If our bundle round-trips through justsign but NOT cosign, that's a wire-shape gap.
+This is the load-bearing check. justsign verifying its own output proves only self-consistency. cosign accepting the bundle is the test that actually proves Sigstore-ecosystem compatibility — if cosign rejects, the "drop-in replacement for sigstore-rs" claim is false. (justsign's own `verify-blob` does NOT yet support a `--keyless` flag — that's a tracked v0 follow-up. For #23 we rely on cosign as the verifier.)
 
 ```sh
 cosign verify-blob \
