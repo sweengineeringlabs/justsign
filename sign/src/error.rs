@@ -149,18 +149,31 @@ pub enum VerifyError {
         actual: Vec<String>,
     },
 
-    /// Placeholder for clock-aware expiry enforcement. Defined in v0
-    /// so callers can construct it after a caller-side `notAfter`
-    /// check; `verify_blob_keyless` itself does NOT enforce expiry
-    /// (parity with [`tuf::TufError::Expired`]). v1 wires a clock SPI
-    /// and emits this variant directly.
+    /// Some cert in the chain has `notAfter` in the past per the
+    /// active [`spec::Clock`]. Surfaces a stolen-leaf replay attempt:
+    /// a signed bundle whose embedded Fulcio leaf was rotated long
+    /// ago is rejected at verify time even when the cryptographic
+    /// signature still nominally checks out.
     #[error("certificate expired (notAfter = {not_after})")]
     CertExpired {
         /// Unix epoch seconds parsed from the cert's `notAfter`.
-        /// Held as `i64` to match the spec crate's wire shape for
-        /// timestamps; negative values are legal in DER but would
-        /// only arise from clock-pre-1970 weirdness.
+        /// Held as `i64` so pre-1970 values (legal in DER, vanishing
+        /// in practice) round-trip without truncation.
         not_after: i64,
+    },
+
+    /// Some cert in the chain has `notBefore` strictly after the
+    /// active [`spec::Clock`]. Catches the OTHER direction of
+    /// clock-skew: a producer running on a host with a fast clock
+    /// can mint certs that no verifier on a normal clock will accept
+    /// until time catches up. Surfaced distinctly from `CertExpired`
+    /// so operators can tell "your producer's clock is fast" from
+    /// "your producer's cert is stale".
+    #[error("certificate not yet valid (notBefore = {not_before})")]
+    CertNotYetValid {
+        /// Unix epoch seconds parsed from the cert's `notBefore`.
+        /// Held as `i64` to match `CertExpired`.
+        not_before: i64,
     },
 
     /// Internal: re-encoding the bundle to compute its layer

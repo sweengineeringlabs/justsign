@@ -100,3 +100,11 @@ pub use span::{parse_with_signed_span, SpanParseError, SpannedSignedEnvelope};
 #[allow(deprecated)]
 pub use types::parse_signed_envelope;
 pub use types::{MetaInfo, Signed, Snapshot, Targets, Timestamp};
+
+// ─── Issue #26: Clock SPI re-exports ────────────────────────────────
+//
+// `spec::Clock` is the canonical home of the trait so `tuf` and `sign`
+// can both consume it without `tuf` taking a `sign` dep. Re-exported
+// from `tuf` here so callers building `TufClient::with_clock(...)`
+// don't have to add `swe_justsign_spec` directly to their dep graph.
+pub use spec::{Clock, FixedClock, SystemClock};

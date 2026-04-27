@@ -986,7 +986,33 @@ pub fn verify_oci(
 // ───────────────────────────────────────────────────────────────────
 
 /// Verify a Sigstore-keyless [`spec::Bundle`] against caller-supplied
-/// trust anchors.
+/// trust anchors, using the system clock for cert validity checks.
+///
+/// Convenience wrapper around [`verify_blob_keyless_with_clock`] with
+/// `clock = &SystemClock`. Production callers want this; tests and
+/// air-gapped deploys that need a deterministic time source go
+/// through the explicit-clock variant.
+///
+/// See [`verify_blob_keyless_with_clock`] for the full pipeline,
+/// error surface, and rationale for each gate.
+pub fn verify_blob_keyless(
+    bundle: &Bundle,
+    trust_anchors_der: &[Vec<u8>],
+    expected_san: Option<&str>,
+    rekor: Option<&dyn RekorClient>,
+) -> Result<(), VerifyError> {
+    verify_blob_keyless_with_clock(
+        bundle,
+        trust_anchors_der,
+        expected_san,
+        rekor,
+        &spec::SystemClock,
+    )
+}
+
+/// Verify a Sigstore-keyless [`spec::Bundle`] against caller-supplied
+/// trust anchors, using a caller-supplied [`spec::Clock`] for cert
+/// validity-window checks.
 ///
 /// Pipeline:
 ///
@@ -998,10 +1024,19 @@ pub fn verify_oci(
 ///    intra-chain signature verifies AND the topmost cert terminates
 ///    at a trust anchor (either the same DER, or signed by one).
 ///    On success this returns the leaf's `VerifyingKey`.
-/// 3. If `expected_san` is `Some`, extract SAN entries from the leaf
+/// 3. **Validity window enforcement (issue #26).** Read each cert's
+///    `notBefore` and `notAfter` and compare them against
+///    `clock.now_unix_secs()`. Any cert with `now >= notAfter`
+///    surfaces as [`VerifyError::CertExpired`]; any cert with
+///    `now < notBefore` surfaces as [`VerifyError::CertNotYetValid`].
+///    The check applies to EVERY cert in the chain — a chain whose
+///    leaf is fresh but whose intermediate has expired must reject,
+///    otherwise an attacker who held the chain's intermediate could
+///    issue replays after the intermediate's stated lifetime.
+/// 4. If `expected_san` is `Some`, extract SAN entries from the leaf
 ///    via [`cert_chain::extract_san`] and require an EXACT-string
 ///    match against one of them. v0 does not pattern-match.
-/// 4. Dispatch the rest of verification to the existing [`verify_blob`]
+/// 5. Dispatch the rest of verification to the existing [`verify_blob`]
 ///    logic, using the leaf's verifying key as the (single) trusted
 ///    key. This re-uses the DSSE-only / Rekor-optional posture from
 ///    the v0 verifier so we don't duplicate signature-shape logic.
@@ -1010,26 +1045,26 @@ pub fn verify_oci(
 ///
 /// * [`VerifyError::EmptyCertChain`] — bundle has no cert chain.
 /// * [`VerifyError::ChainBroken`] — chain walk rejected the chain.
+/// * [`VerifyError::CertExpired`] — a cert's `notAfter` is at or
+///   before `clock.now_unix_secs()`.
+/// * [`VerifyError::CertNotYetValid`] — a cert's `notBefore` is
+///   strictly after `clock.now_unix_secs()`.
 /// * [`VerifyError::SanMismatch`] — `expected_san` not found in leaf.
-///   [`cert_chain::ChainError::Decode`] surfacing as `ChainBroken`
-///   here means the leaf cert was malformed when SAN extraction tried
-///   to re-decode it; that's a chain problem, not a SAN problem.
 /// * [`VerifyError::SignatureInvalid`] / [`VerifyError::EnvelopeMissing`] /
 ///   [`VerifyError::NoTlogEntry`] / [`VerifyError::RekorVerify`] —
 ///   inherited from [`verify_blob`].
 ///
 /// # Open issues for v1
 ///
-/// * Expiry — [`VerifyError::CertExpired`] is defined but not
-///   produced. Wiring a clock SPI is its own slice.
 /// * SAN pattern matching (issuer-prefix matching, regex on URIs,
 ///   etc.) — v0 is exact-string only.
 /// * SCT / Rekor inclusion-time-vs-cert-validity binding.
-pub fn verify_blob_keyless(
+pub fn verify_blob_keyless_with_clock(
     bundle: &Bundle,
     trust_anchors_der: &[Vec<u8>],
     expected_san: Option<&str>,
     rekor: Option<&dyn RekorClient>,
+    clock: &dyn spec::Clock,
 ) -> Result<(), VerifyError> {
     // 1. Pull the cert chain out of the bundle. The wire shape uses
     //    `Option<Certificate>` where `Certificate.certificates` is a
@@ -1045,7 +1080,28 @@ pub fn verify_blob_keyless(
     //    `From` impl on VerifyError::ChainBroken.
     let leaf_vk = cert_chain::verify_chain(chain_der, trust_anchors_der)?;
 
-    // 3. SAN policy check. The leaf is at index 0 by Sigstore wire
+    // 3. Enforce notBefore/notAfter on EVERY cert in the chain. We
+    //    compare ALL certs, not just the leaf, because Fulcio's
+    //    intermediate has its own validity window (typically ~10
+    //    years). An expired intermediate is a real failure mode that
+    //    the cryptographic chain check would otherwise accept.
+    //
+    //    Order: we check the validity window AFTER the chain walk
+    //    succeeds. A chain that doesn't cryptographically link is
+    //    rejected for the stronger reason first; expiry is the
+    //    second-line gate.
+    let now = clock.now_unix_secs();
+    for cert_der in chain_der {
+        let (not_before, not_after) = cert_chain::cert_validity_window(cert_der)?;
+        if now < not_before {
+            return Err(VerifyError::CertNotYetValid { not_before });
+        }
+        if now >= not_after {
+            return Err(VerifyError::CertExpired { not_after });
+        }
+    }
+
+    // 4. SAN policy check. The leaf is at index 0 by Sigstore wire
     //    convention; `verify_chain` already validated that index
     //    decodes, so `extract_san` should only fail if the SAN
     //    extension itself is malformed (vanishingly rare for a cert
@@ -1060,7 +1116,7 @@ pub fn verify_blob_keyless(
         }
     }
 
-    // 4. Hand off to the existing v0 verifier, using the leaf's key
+    // 5. Hand off to the existing v0 verifier, using the leaf's key
     //    as the single trusted key. `verify_blob` enforces:
     //      - DSSE envelope variant (not message-signature),
     //      - at least one envelope signature validates against the
@@ -1084,11 +1140,11 @@ mod keyless_tests {
     use p256::ecdsa::{Signature, SigningKey};
     use p256::pkcs8::DecodePrivateKey;
     use rcgen::{
-        BasicConstraints, CertificateParams, DnType, IsCa, KeyPair, KeyUsagePurpose, SanType,
-        PKCS_ECDSA_P256_SHA256,
+        date_time_ymd, BasicConstraints, CertificateParams, DnType, IsCa, KeyPair, KeyUsagePurpose,
+        SanType, PKCS_ECDSA_P256_SHA256,
     };
     use signature::Signer as _;
-    use spec::Certificate as SpecCertificate;
+    use spec::{Certificate as SpecCertificate, FixedClock};
 
     /// Three-level synthetic chain bundled with the leaf's signing
     /// key, so the caller can sign a real bundle whose DSSE
@@ -1106,12 +1162,107 @@ mod keyless_tests {
         leaf_email: String,
     }
 
-    /// Build a real chain whose leaf carries a P-256 key that we
-    /// also retain (so we can sign with it). Mirrors the structure
-    /// `cert_chain::tests::build_three_level_chain` produces, but
-    /// extracts the leaf signing key as a `p256::ecdsa::SigningKey`
-    /// so the caller can produce a real DSSE signature.
-    fn build_keyless_fixture() -> KeylessFixture {
+    /// Validity-window override for [`build_keyless_fixture_with_validity`],
+    /// expressed as `(year, month, day)` triplets so the test module
+    /// doesn't have to name `time::OffsetDateTime` directly. `None` =
+    /// use rcgen's permissive default (1975-01-01 to 4096-01-01),
+    /// which keeps pre-#26 tests passing under `SystemClock` without
+    /// wall-clock-dependent fixtures.
+    #[derive(Clone, Copy)]
+    struct ValidityOverride {
+        leaf_not_before: Option<(i32, u8, u8)>,
+        leaf_not_after: Option<(i32, u8, u8)>,
+        intermediate_not_before: Option<(i32, u8, u8)>,
+        intermediate_not_after: Option<(i32, u8, u8)>,
+    }
+
+    impl ValidityOverride {
+        const fn none() -> Self {
+            Self {
+                leaf_not_before: None,
+                leaf_not_after: None,
+                intermediate_not_before: None,
+                intermediate_not_after: None,
+            }
+        }
+    }
+
+    impl KeylessFixture {
+        /// Default fixture: every cert uses rcgen's 1975 → 4096 default
+        /// window, which is wide enough that `SystemClock` always lands
+        /// inside the validity range. Existing tests that don't care
+        /// about expiry call this and get the pre-#26 behaviour.
+        fn build() -> Self {
+            build_keyless_fixture_with_validity(ValidityOverride::none())
+        }
+
+        /// Variant whose leaf has `notAfter` strictly before
+        /// [`KEYLESS_FIXED_NOW`] (the timestamp the cert-expiry tests
+        /// pin via `FixedClock`). Intermediate validity is left at the
+        /// permissive default so the failure attributes to the leaf.
+        ///
+        /// Bug class this fixture exists for: a verifier that ignores
+        /// `notAfter` lets a stolen Fulcio leaf cert replay forever.
+        fn build_with_expired_leaf() -> Self {
+            // Leaf: 2020-01-01 → 2020-12-31. KEYLESS_FIXED_NOW is in
+            // 2024 — well after notAfter.
+            build_keyless_fixture_with_validity(ValidityOverride {
+                leaf_not_before: Some((2020, 1, 1)),
+                leaf_not_after: Some((2020, 12, 31)),
+                intermediate_not_before: None,
+                intermediate_not_after: None,
+            })
+        }
+
+        /// Variant whose intermediate has `notAfter` strictly before
+        /// [`KEYLESS_FIXED_NOW`], but whose leaf is still inside its
+        /// (permissive) default window.
+        ///
+        /// Bug class: a verifier that only checks the leaf misses
+        /// expiry on the intermediate. An attacker who held an
+        /// expired intermediate could use it to fingerprint chains
+        /// that should have been rotated.
+        fn build_with_expired_intermediate() -> Self {
+            build_keyless_fixture_with_validity(ValidityOverride {
+                leaf_not_before: None,
+                leaf_not_after: None,
+                intermediate_not_before: Some((2020, 1, 1)),
+                intermediate_not_after: Some((2020, 12, 31)),
+            })
+        }
+
+        /// Variant whose leaf has `notBefore` strictly after
+        /// [`KEYLESS_FIXED_NOW`] — simulating a producer with a
+        /// fast-skewed clock.
+        ///
+        /// Bug class: a verifier that ignores `notBefore` would
+        /// accept a cert minted in some host's future, which from
+        /// every other host's POV is unverifiable. The clock-skew
+        /// must surface as a typed rejection.
+        fn build_with_not_yet_valid_leaf() -> Self {
+            // Leaf: 2099-01-01 → 2099-12-31. KEYLESS_FIXED_NOW is in
+            // 2024 — well before notBefore.
+            build_keyless_fixture_with_validity(ValidityOverride {
+                leaf_not_before: Some((2099, 1, 1)),
+                leaf_not_after: Some((2099, 12, 31)),
+                intermediate_not_before: None,
+                intermediate_not_after: None,
+            })
+        }
+    }
+
+    /// Pinned "now" for cert-expiry tests: 2024-06-15T00:00:00Z =
+    /// 1 718 409 600 Unix seconds. Falls between every test fixture's
+    /// expired window (2020) and not-yet-valid window (2099) so the
+    /// same FixedClock value works for both directions.
+    const KEYLESS_FIXED_NOW: i64 = 1_718_409_600;
+
+    /// Parameterised builder. `validity` lets callers pin a leaf or
+    /// intermediate window; `None` falls back to rcgen's wide default.
+    /// The root cert is always left at the default — a chain whose
+    /// root has expired is a much rarer (and noisier) failure mode
+    /// that we don't need a test fixture for in this slice.
+    fn build_keyless_fixture_with_validity(validity: ValidityOverride) -> KeylessFixture {
         let root_kp = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("root kp");
         let mut root_params = CertificateParams::new(Vec::<String>::new()).expect("root params");
         root_params
@@ -1132,6 +1283,12 @@ mod keyless_tests {
         intermediate_params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
         intermediate_params.key_usages =
             vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+        if let Some((y, m, d)) = validity.intermediate_not_before {
+            intermediate_params.not_before = date_time_ymd(y, m, d);
+        }
+        if let Some((y, m, d)) = validity.intermediate_not_after {
+            intermediate_params.not_after = date_time_ymd(y, m, d);
+        }
         let intermediate_cert = intermediate_params
             .signed_by(&intermediate_kp, &root_cert, &root_kp)
             .expect("intermediate sign");
@@ -1154,6 +1311,12 @@ mod keyless_tests {
         leaf_params.subject_alt_names = vec![SanType::Rfc822Name(
             leaf_email.clone().try_into().expect("email IA5"),
         )];
+        if let Some((y, m, d)) = validity.leaf_not_before {
+            leaf_params.not_before = date_time_ymd(y, m, d);
+        }
+        if let Some((y, m, d)) = validity.leaf_not_after {
+            leaf_params.not_after = date_time_ymd(y, m, d);
+        }
         let leaf_cert = leaf_params
             .signed_by(&leaf_kp, &intermediate_cert, &intermediate_kp)
             .expect("leaf sign");
@@ -1165,6 +1328,13 @@ mod keyless_tests {
             leaf_signing_key,
             leaf_email,
         }
+    }
+
+    /// Backward-compat shim for tests written against the original
+    /// no-arg builder. New tests SHOULD call `KeylessFixture::build()`
+    /// or one of the validity-pinned variants directly.
+    fn build_keyless_fixture() -> KeylessFixture {
+        KeylessFixture::build()
     }
 
     /// Build a bundle whose `verification_material.certificate`
@@ -1320,6 +1490,197 @@ mod keyless_tests {
         leaf_vk
             .verify(msg, &sig)
             .expect("signature from leaf signing key must verify under leaf VK");
+    }
+
+    // ─── issue #26: cert validity-window enforcement ────────────────
+
+    /// Bug it catches: a verifier that ignores `notAfter` lets a
+    /// stolen Fulcio leaf cert replay forever — even after the
+    /// stated lifetime expired and the cert was rotated. We mint a
+    /// leaf whose `notAfter` is in 2020, pin "now" to 2024, and
+    /// require [`VerifyError::CertExpired`].
+    #[test]
+    fn test_verify_blob_keyless_with_expired_leaf_returns_cert_expired() {
+        let fx = KeylessFixture::build_with_expired_leaf();
+        let bundle = sign_with_chain(b"replay payload", &fx);
+
+        let err = verify_blob_keyless_with_clock(
+            &bundle,
+            std::slice::from_ref(&fx.root_der),
+            None,
+            None,
+            &FixedClock(KEYLESS_FIXED_NOW),
+        )
+        .expect_err("expired leaf must reject");
+
+        match err {
+            VerifyError::CertExpired { not_after } => {
+                // Leaf was minted with notAfter = 2020-12-31. The
+                // exact Unix-seconds value is implementation-detail
+                // of rcgen + x509-cert; we assert it's strictly
+                // before our pinned now.
+                assert!(
+                    not_after < KEYLESS_FIXED_NOW,
+                    "CertExpired.not_after = {not_after} must be < now = {KEYLESS_FIXED_NOW}"
+                );
+                // And specifically inside calendar year 2020 to pin
+                // we got the LEAF's notAfter (not, say, the root's
+                // default 4096-01-01 which would be huge).
+                // 2020-01-01 = 1577836800; 2021-01-01 = 1609459200.
+                assert!(
+                    (1_577_836_800..1_609_459_200).contains(&not_after),
+                    "CertExpired.not_after = {not_after} expected inside 2020"
+                );
+            }
+            other => panic!("expected CertExpired, got {other:?}"),
+        }
+    }
+
+    /// Bug it catches: a verifier that only checks the leaf's
+    /// validity window misses chain-wide expiry. An expired
+    /// intermediate is just as security-relevant as an expired leaf
+    /// — both indicate "this material should have been rotated".
+    #[test]
+    fn test_verify_blob_keyless_with_expired_intermediate_returns_cert_expired() {
+        let fx = KeylessFixture::build_with_expired_intermediate();
+        let bundle = sign_with_chain(b"intermediate-expiry payload", &fx);
+
+        let err = verify_blob_keyless_with_clock(
+            &bundle,
+            std::slice::from_ref(&fx.root_der),
+            None,
+            None,
+            &FixedClock(KEYLESS_FIXED_NOW),
+        )
+        .expect_err("expired intermediate must reject");
+
+        match err {
+            VerifyError::CertExpired { not_after } => {
+                // Intermediate was minted with notAfter = 2020-12-31.
+                assert!(
+                    (1_577_836_800..1_609_459_200).contains(&not_after),
+                    "CertExpired.not_after = {not_after} expected inside 2020 \
+                     (intermediate's notAfter); a value outside that range \
+                     suggests the verifier checked a different cert in the chain"
+                );
+            }
+            other => panic!("expected CertExpired, got {other:?}"),
+        }
+    }
+
+    /// Bug it catches: a verifier that ignores `notBefore`. A
+    /// producer running on a fast-skewed host can mint certs that
+    /// are valid only in the future; without a `notBefore` gate,
+    /// every other host in the world would accept them as fresh.
+    /// The clock-skew failure mode must surface as a typed rejection.
+    #[test]
+    fn test_verify_blob_keyless_with_not_yet_valid_leaf_returns_cert_not_yet_valid() {
+        let fx = KeylessFixture::build_with_not_yet_valid_leaf();
+        let bundle = sign_with_chain(b"future-skew payload", &fx);
+
+        let err = verify_blob_keyless_with_clock(
+            &bundle,
+            std::slice::from_ref(&fx.root_der),
+            None,
+            None,
+            &FixedClock(KEYLESS_FIXED_NOW),
+        )
+        .expect_err("not-yet-valid leaf must reject");
+
+        match err {
+            VerifyError::CertNotYetValid { not_before } => {
+                // Leaf was minted with notBefore = 2099-01-01.
+                // 2099-01-01 = 4 070 908 800 Unix seconds.
+                // 2100-01-01 = 4 102 444 800.
+                assert!(
+                    (4_070_908_800..4_102_444_800).contains(&not_before),
+                    "CertNotYetValid.not_before = {not_before} expected inside 2099"
+                );
+                assert!(
+                    not_before > KEYLESS_FIXED_NOW,
+                    "CertNotYetValid.not_before = {not_before} must be > now = {KEYLESS_FIXED_NOW}"
+                );
+            }
+            other => panic!("expected CertNotYetValid, got {other:?}"),
+        }
+    }
+
+    /// Smoke-test that the gate doesn't reject valid certs. Use the
+    /// default fixture (rcgen 1975 → 4096 default window) which
+    /// always covers `KEYLESS_FIXED_NOW` (2024). If this fails the
+    /// clock check is overzealous — e.g. swapping `<` and `<=` or
+    /// comparing the wrong field.
+    #[test]
+    fn test_verify_blob_keyless_with_clock_inside_window_succeeds() {
+        let fx = build_keyless_fixture();
+        let bundle = sign_with_chain(b"in-window payload", &fx);
+
+        verify_blob_keyless_with_clock(
+            &bundle,
+            std::slice::from_ref(&fx.root_der),
+            None,
+            None,
+            &FixedClock(KEYLESS_FIXED_NOW),
+        )
+        .expect("default-validity chain must verify under FixedClock(2024)");
+    }
+
+    /// Bug it catches: a `verify_blob_keyless_with_clock` impl that
+    /// silently falls back to `SystemTime::now()` instead of
+    /// consulting the supplied `&dyn Clock`. We pin the clock to
+    /// year-2150 (well beyond rcgen's default `notAfter` of
+    /// 4096-01-01... wait — 4096 IS post-2150). So instead we pin to
+    /// FAR-future after rcgen's 4096 default expiry: 4096-06-01 =
+    /// 67 116 614 400 Unix seconds. With this clock the default
+    /// fixture's leaf (notAfter = 4096-01-01) is expired, and the
+    /// only way the verifier learns that is by consulting our clock
+    /// — proving the parameter is wired.
+    #[test]
+    fn test_verify_blob_keyless_with_clock_consults_injected_clock_not_system_time() {
+        let fx = build_keyless_fixture();
+        let bundle = sign_with_chain(b"clock-injection payload", &fx);
+
+        // 4096-06-01 — past every rcgen default `notAfter`.
+        // Computed inline: from 1970-01-01 to 4096-06-01 is 4096-1970
+        // = 2126 years; rough seconds ≈ 67 100 000 000. We use
+        // 67_116_614_400, but the EXACT value is not load-bearing —
+        // any value strictly past 4096-01-01 (which is approximately
+        // 67 100 803 200) suffices.
+        let post_default_expiry: i64 = 67_116_614_400;
+
+        let err = verify_blob_keyless_with_clock(
+            &bundle,
+            std::slice::from_ref(&fx.root_der),
+            None,
+            None,
+            &FixedClock(post_default_expiry),
+        )
+        .expect_err(
+            "FixedClock pinned past rcgen default notAfter must reject; \
+             if this passes the verifier ignored our clock and used SystemTime::now()",
+        );
+
+        assert!(
+            matches!(err, VerifyError::CertExpired { .. }),
+            "expected CertExpired (proving the injected clock was consulted), got {err:?}"
+        );
+    }
+
+    /// Bug it catches: a `verify_blob_keyless` (no-clock variant)
+    /// that DOESN'T enforce expiry at all — would reduce to the
+    /// pre-#26 behaviour. We rely on `SystemClock` here; the
+    /// fixture's leaf has notAfter = 4096-01-01, well after any
+    /// realistic CI clock, so this MUST succeed. A regression where
+    /// `verify_blob_keyless` swaps to a hardcoded "now = 0" or
+    /// similar would cause every cert with notBefore > 0 to surface
+    /// `CertNotYetValid`.
+    #[test]
+    fn test_verify_blob_keyless_default_clock_under_system_clock_succeeds() {
+        let fx = build_keyless_fixture();
+        let bundle = sign_with_chain(b"system-clock payload", &fx);
+
+        verify_blob_keyless(&bundle, std::slice::from_ref(&fx.root_der), None, None)
+            .expect("default fixture must verify under SystemClock");
     }
 }
 

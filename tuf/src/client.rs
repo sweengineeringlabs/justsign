@@ -52,7 +52,9 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use spec::{Clock, FixedClock, SystemClock};
 
 use crate::expiry::{format_rfc3339_utc, is_expired};
 use crate::root::{verify_role, Root, TufError};
@@ -91,20 +93,38 @@ const SIGSTAGE_URL: &str = "https://tuf-repo-cdn.sigstage.dev";
 /// [`Self::new`] / [`Self::sigstage`] constructors leave it `None`
 /// and require callers to supply a root explicitly to
 /// [`Self::fetch_root`].
-#[derive(Debug)]
+///
+/// Time source: the client owns a `Box<dyn spec::Clock>` (issue #26).
+/// Production callers get [`spec::SystemClock`] by default; tests and
+/// air-gapped deploys can swap it via [`Self::with_clock`].
 pub struct TufClient {
     base_url: String,
     cache_dir: PathBuf,
     http: reqwest::blocking::Client,
-    /// Override for "now" — used by tests to avoid wall-clock
-    /// dependence on expiry checks. Default `None` → use
-    /// `SystemTime::now()`.
-    now_override: Option<SystemTime>,
+    /// Time source for every expiry comparison this client makes.
+    /// Default is [`SystemClock`]; [`Self::with_clock`] /
+    /// [`Self::with_now_override`] swap it for tests or
+    /// time-pinned deploys.
+    clock: Box<dyn Clock>,
     /// Trusted bootstrap root document the chained-root walk starts
     /// from. Populated by [`Self::sigstore`] and
     /// [`Self::with_initial_root_bytes`]. `None` for clients built
     /// via [`Self::new`] / [`Self::sigstage`].
     initial_root: Option<Root>,
+}
+
+// Manual `Debug` impl: `Box<dyn Clock>` does not require `Debug` on
+// the trait (per spec), so we surface the clock's presence as an
+// opaque marker rather than widening the trait bound.
+impl std::fmt::Debug for TufClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TufClient")
+            .field("base_url", &self.base_url)
+            .field("cache_dir", &self.cache_dir)
+            .field("clock", &"<dyn Clock>")
+            .field("initial_root_present", &self.initial_root.is_some())
+            .finish()
+    }
 }
 
 impl TufClient {
@@ -135,7 +155,7 @@ impl TufClient {
             base_url,
             cache_dir,
             http,
-            now_override: None,
+            clock: Box::new(SystemClock),
             initial_root: None,
         })
     }
@@ -242,9 +262,48 @@ impl TufClient {
     /// Test-only: pin the `now` reference [`is_expired`] uses. Lets
     /// expiry tests use deterministic timestamps without poking
     /// system clocks.
+    ///
+    /// Implemented as a thin shim over [`Self::with_clock`]: converts
+    /// the [`SystemTime`] into a [`FixedClock`] holding the equivalent
+    /// Unix-seconds value. Times before the Unix epoch are clamped to
+    /// 0 (the implementation never produces such a value, but the
+    /// type permits it).
     #[doc(hidden)]
-    pub fn with_now_override(mut self, now: SystemTime) -> Self {
-        self.now_override = Some(now);
+    pub fn with_now_override(self, now: SystemTime) -> Self {
+        let secs = match now.duration_since(UNIX_EPOCH) {
+            Ok(d) => {
+                let s = d.as_secs();
+                if s > i64::MAX as u64 {
+                    i64::MAX
+                } else {
+                    s as i64
+                }
+            }
+            Err(_) => 0,
+        };
+        self.with_clock(Box::new(FixedClock(secs)))
+    }
+
+    /// Swap the [`Clock`] this client consults for expiry comparisons.
+    ///
+    /// Production code should NEVER need this — [`SystemClock`] is the
+    /// default for every public constructor. The injection point exists
+    /// for two callers:
+    ///
+    /// 1. **Tests** that need a deterministic "now" so expiry assertions
+    ///    don't depend on the host's wall clock.
+    /// 2. **Air-gapped / replay deploys** that pin the verifier's clock
+    ///    to a release timestamp (e.g. reproducing a build).
+    ///
+    /// The supplied clock is consulted at every point the client checks
+    /// expiry: the bootstrap-root expiry guard inside
+    /// [`Self::with_initial_root_bytes`] (when wrapped via this
+    /// constructor instead), the chained-root walk's freeze-attack
+    /// check, and every per-role expiry check in
+    /// [`Self::fetch_timestamp`] / [`Self::fetch_snapshot`] /
+    /// [`Self::fetch_targets`].
+    pub fn with_clock(mut self, clock: Box<dyn Clock>) -> Self {
+        self.clock = clock;
         self
     }
 
@@ -257,8 +316,24 @@ impl TufClient {
         self
     }
 
+    /// Resolve the client's clock to a [`SystemTime`] suitable for
+    /// the existing [`is_expired`] / [`format_rfc3339_utc`] surface.
+    ///
+    /// Negative `now_unix_secs()` (system clock set before 1970) is
+    /// clamped to [`UNIX_EPOCH`] — matches the existing
+    /// [`format_rfc3339_utc`] error path which would otherwise return
+    /// [`crate::ExpiryParseError::ClockBeforeEpoch`]. We prefer a
+    /// silent clamp here because every downstream comparison treats
+    /// "now = 1970-01-01" as "everything is expired" anyway, which is
+    /// the safer default than crashing the verifier on an operator
+    /// misconfiguration.
     fn now(&self) -> SystemTime {
-        self.now_override.unwrap_or_else(SystemTime::now)
+        let secs = self.clock.now_unix_secs();
+        if secs <= 0 {
+            UNIX_EPOCH
+        } else {
+            UNIX_EPOCH + Duration::from_secs(secs as u64)
+        }
     }
 
     /// Walk the root chain from `initial_root` upward.

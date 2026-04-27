@@ -15,11 +15,14 @@
 //!
 //! Rekor entry types land in a subsequent slice.
 
+pub mod clock;
 pub mod dsse;
 pub mod in_toto;
 pub mod sbom;
 pub mod sigstore_bundle;
 pub mod slsa;
+
+pub use clock::{Clock, FixedClock, SystemClock};
 
 pub use dsse::{
     pae, Envelope, EnvelopeDecodeError, EnvelopeEncodeError, Signature, DSSE_PAE_PREFIX,

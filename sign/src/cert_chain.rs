@@ -25,12 +25,12 @@
 //!   would invite drift between what we accept on a leaf vs an
 //!   intermediate. The signature_algorithm OID on every cert is
 //!   checked against `ECDSA_WITH_SHA_256`.
-//! * **Expiry is NOT enforced.** Same posture as
-//!   [`tuf::TufError::Expired`]: the typed variant
-//!   [`crate::VerifyError::CertExpired`] is defined for callers that
-//!   want to enforce it, but the cert-chain walker does not parse
-//!   `notAfter` against a clock. Wiring a clock SPI in the verifier
-//!   is a follow-up so this slice stays IO-free.
+//! * **Expiry IS enforced** (issue #26). The walker itself stays
+//!   IO-free; callers route a [`spec::Clock`] in via
+//!   [`crate::verify_blob_keyless_with_clock`]. Each cert's
+//!   `notBefore` and `notAfter` are compared against the clock's
+//!   `now_unix_secs()` and rejected with [`crate::VerifyError::CertExpired`]
+//!   / [`crate::VerifyError::CertNotYetValid`] respectively.
 //! * **No revocation, no SCT check.** Out of scope for v0.
 //!
 //! ## Sigstore wire shape (what the caller hands us)
@@ -116,6 +116,39 @@ pub enum ChainError {
         /// The OID we refused, as a dotted-decimal string.
         oid: String,
     },
+}
+
+/// Extract the validity window (`notBefore`, `notAfter`) of a single
+/// DER-encoded cert as Unix epoch seconds.
+///
+/// Returns `(not_before_secs, not_after_secs)`. Both values are
+/// signed because a DER `Time` can encode pre-1970 dates via
+/// `GeneralizedTime`; in practice every Fulcio cert is strictly
+/// post-1970, but the typed surface mirrors the wire shape
+/// faithfully so a misissued cert with a pre-epoch `notBefore`
+/// surfaces as "not yet valid" in 1970, not as a panic.
+///
+/// # Errors
+///
+/// * [`ChainError::Decode`] — `cert_der` isn't a valid X.509 cert.
+pub fn cert_validity_window(cert_der: &[u8]) -> Result<(i64, i64), ChainError> {
+    let cert = Certificate::from_der(cert_der)
+        .map_err(|e| ChainError::Decode(format!("certificate decode: {e}")))?;
+    let validity = &cert.tbs_certificate.validity;
+    // `Time::to_unix_duration` returns a `Duration` (unsigned). The
+    // x509-cert lower bound is the Unix epoch (so non-negative). Cap
+    // at i64::MAX during the cast to avoid silently wrapping a
+    // pathological GeneralizedTime far in the future.
+    let to_signed_secs = |secs: u64| -> i64 {
+        if secs > i64::MAX as u64 {
+            i64::MAX
+        } else {
+            secs as i64
+        }
+    };
+    let not_before_secs = to_signed_secs(validity.not_before.to_unix_duration().as_secs());
+    let not_after_secs = to_signed_secs(validity.not_after.to_unix_duration().as_secs());
+    Ok((not_before_secs, not_after_secs))
 }
 
 /// Pull the SubjectAltName entries (RFC 822 emails + URIs) from a
