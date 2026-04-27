@@ -45,6 +45,13 @@ pub use tuf;
 
 pub mod cert_chain;
 mod error;
+#[cfg(any(
+    feature = "aws-kms",
+    feature = "gcp-kms",
+    feature = "azure-kv",
+    feature = "vault-transit"
+))]
+pub mod kms;
 pub mod oci;
 pub mod sbom;
 mod signer;
@@ -53,6 +60,19 @@ pub mod slsa;
 pub use error::{OciError, SignError, VerifyError};
 pub use sbom::{sign_cyclonedx, sign_spdx, verify_cyclonedx, verify_spdx};
 pub use signer::{EcdsaP256Signer, MockSigner, Signer, SignerError};
+
+// Per-provider KMS signer re-exports. Each is feature-gated so the
+// default build surfaces no KMS types and pulls no KMS deps (there
+// are no KMS deps in v0; the gating keeps the surface honest as
+// real SDKs land per follow-up issue).
+#[cfg(feature = "aws-kms")]
+pub use kms::aws::AwsKmsSigner;
+#[cfg(feature = "azure-kv")]
+pub use kms::azure::AzureKeyVaultSigner;
+#[cfg(feature = "gcp-kms")]
+pub use kms::gcp::GcpKmsSigner;
+#[cfg(feature = "vault-transit")]
+pub use kms::vault::VaultTransitSigner;
 pub use slsa::{
     sign_slsa_provenance, verify_slsa_provenance, VerifiedSlsaProvenance,
     SLSA_PROVENANCE_V1_PREDICATE_TYPE,

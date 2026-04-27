@@ -33,6 +33,20 @@ pub enum SignerError {
     /// it shows up in operator logs verbatim.
     #[error("signer: {0}")]
     Other(String),
+
+    /// Returned by a v0 typed-stub signer whose real SDK
+    /// integration is tracked in a follow-up issue (the cloud
+    /// KMS signers in [`crate::kms`]). Holds an operator-facing
+    /// message that names the provider, the configured key
+    /// identifier, the payload byte-length the caller passed in,
+    /// and the follow-up issue number.
+    ///
+    /// Held as a distinct variant — not folded into [`Self::Other`]
+    /// — so callers can match on it and route differently (e.g.
+    /// emit a "stub signer wired in production" alert instead of
+    /// treating it as a generic signing failure).
+    #[error("signer stub: {0}")]
+    Stubbed(String),
 }
 
 /// Contract a key-bearing signer must satisfy.

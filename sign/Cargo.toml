@@ -16,6 +16,20 @@ rust-version.workspace = true
 name = "sign"
 path = "src/lib.rs"
 
+[features]
+default = []
+# Cloud KMS signer surfaces. v0 ships TYPED STUBS — the config types
+# and trait impls are real, but the network call returns a typed
+# `SignerError::Stubbed` pointing at per-provider follow-up issues
+# (#17 AWS, #18 GCP, #19 Azure KV, #20 Vault Transit). This lets
+# downstream callers declare KMS signers in their code now; the
+# real SDK integration lands per-provider as separate slices to
+# keep the dep-tree balloon scoped.
+aws-kms       = []
+gcp-kms       = []
+azure-kv      = []
+vault-transit = []
+
 [dependencies]
 thiserror  = { workspace = true }
 serde      = { workspace = true }
