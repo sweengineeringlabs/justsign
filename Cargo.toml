@@ -8,7 +8,12 @@ license      = "Apache-2.0"
 repository   = "https://github.com/sweengineeringlabs/justsign"
 homepage     = "https://github.com/sweengineeringlabs/justsign"
 authors      = ["SWE Engineering Labs"]
-rust-version = "1.75"
+# 1.85 because the RustCrypto stack pulled by fulcio + sign + tuf
+# (base64ct 1.7+, etc.) requires edition2024 support, stabilised
+# in Cargo 1.85. Lower than that means a transitive dep refuses
+# to parse its Cargo.toml. Pinning back is whack-a-mole; better
+# to track the ecosystem.
+rust-version = "1.85"
 
 [workspace.dependencies]
 # `version` is required next to `path` so `cargo publish` can resolve
