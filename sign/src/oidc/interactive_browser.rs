@@ -285,7 +285,7 @@ fn code_challenge_s256(verifier: &str) -> String {
 /// fixed-length input. RFC 4648 §5 alphabet: A-Z a-z 0-9 - _.
 fn base64url_no_pad(input: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    let mut out = String::with_capacity((input.len() * 4 + 2) / 3);
+    let mut out = String::with_capacity((input.len() * 4).div_ceil(3));
     let chunks = input.chunks(3);
     for chunk in chunks {
         let n = chunk.len();
