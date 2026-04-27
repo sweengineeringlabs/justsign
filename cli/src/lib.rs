@@ -47,10 +47,12 @@ use p256::ecdsa::{SigningKey, VerifyingKey as P256VerifyingKey};
 use p256::pkcs8::{
     DecodePrivateKey, DecodePublicKey, EncodePrivateKey, EncodePublicKey, LineEnding,
 };
+use rand_core::OsRng;
 use sign::spec::Bundle;
 use sign::{
+    fulcio::{build_csr, FulcioClient, HttpFulcioClient},
     rekor::{HttpRekorClient, MockRekorClient, RekorClient},
-    sign_blob, verify_blob, EcdsaP256Signer, VerifyingKey,
+    sign_blob, sign_blob_keyless, verify_blob, EcdsaP256Signer, VerifyingKey,
 };
 
 // OIDC providers are exposed via --oidc-provider on the
@@ -104,7 +106,7 @@ pub fn print_usage<W: Write>(out: &mut W) -> std::io::Result<()> {
     )?;
     writeln!(
         out,
-        "  justsign sign-blob <file> --key <priv-pem-path> \\\n      [--output-bundle <path>] [--rekor[=<url>]] [--mock-rekor]"
+        "  justsign sign-blob <file> {{--key <priv-pem> | --keyless [--fulcio <url>] [--oidc-provider <kind>]}} \\\n      [--output-bundle <path>] [--rekor[=<url>]] [--mock-rekor]"
     )?;
     writeln!(
         out,
@@ -112,7 +114,39 @@ pub fn print_usage<W: Write>(out: &mut W) -> std::io::Result<()> {
     )?;
     writeln!(
         out,
+        "      --key <priv-pem-path>: static-key signing with a PKCS#8 PEM ECDSA P-256 key."
+    )?;
+    writeln!(
+        out,
+        "      --keyless: Sigstore-keyless. Mints an ephemeral keypair, fetches OIDC token,"
+    )?;
+    writeln!(
+        out,
+        "                 exchanges with Fulcio for a short-lived cert chain, embeds chain in bundle."
+    )?;
+    writeln!(
+        out,
+        "      --fulcio <url>: keyless-only Fulcio base URL; default {DEFAULT_FULCIO_URL}."
+    )?;
+    writeln!(
+        out,
+        "                      For production: --fulcio https://fulcio.sigstore.dev"
+    )?;
+    writeln!(
+        out,
+        "      --oidc-provider <kind>: keyless-only; one of static (default), github-actions,"
+    )?;
+    writeln!(
+        out,
+        "                              gcp-metadata, interactive-browser."
+    )?;
+    writeln!(
+        out,
         "      --rekor[=<url>] submits to a real Rekor; bare flag defaults to {DEFAULT_REKOR_URL}."
+    )?;
+    writeln!(
+        out,
+        "                      For production: --rekor https://rekor.sigstore.dev"
     )?;
     writeln!(
         out,
@@ -141,11 +175,11 @@ pub fn print_usage<W: Write>(out: &mut W) -> std::io::Result<()> {
     )?;
     writeln!(
         out,
-        "      v0 limitation: the CLI does NOT yet feed the token to a keyless-sign"
+        "      The same OIDC providers also feed `sign-blob --keyless`; this subcommand"
     )?;
     writeln!(
         out,
-        "      command (sign_blob_keyless is library-only); the subcommand is the wiring proof."
+        "      lets operators preview the token resolution without driving a sign call."
     )?;
     Ok(())
 }
@@ -238,10 +272,37 @@ enum RekorChoice {
     Mock,
 }
 
+/// Default Fulcio base URL when `--keyless` is passed without an
+/// explicit `--fulcio` override.
+///
+/// Sigstage staging — same hostname cosign uses for staging. We
+/// intentionally do NOT default to `fulcio.sigstore.dev` (production)
+/// for the same reason `DEFAULT_REKOR_URL` doesn't: a typo of the
+/// command line could otherwise burn a permanent identity entry into
+/// the public production Rekor log. Operators sign against production
+/// by passing `--fulcio https://fulcio.sigstore.dev` and
+/// `--rekor https://rekor.sigstore.dev` explicitly.
+const DEFAULT_FULCIO_URL: &str = "https://fulcio.sigstage.dev";
+
+/// Whether the sign path is static-key or Fulcio-keyless.
+#[derive(Debug, PartialEq)]
+enum SignMode {
+    /// Caller supplied `--key <priv-pem>`.
+    StaticKey { key_path: String },
+    /// Caller supplied `--keyless`. Pulls an OIDC token via the
+    /// configured provider, exchanges it with Fulcio for a
+    /// short-lived cert chain, signs with the freshly-generated
+    /// ephemeral keypair, and embeds the chain in the bundle.
+    Keyless {
+        fulcio_url: String,
+        oidc_provider: OidcProviderKind,
+    },
+}
+
 /// Parsed `sign-blob` arg state.
 struct SignBlobArgs {
     file: String,
-    key: String,
+    mode: SignMode,
     output_bundle: Option<String>,
     rekor: RekorChoice,
 }
@@ -259,12 +320,15 @@ fn parse_sign_blob_args(args: &[String]) -> Result<SignBlobArgs, CliError> {
         .first()
         .ok_or_else(|| {
             CliError(
-                "sign-blob requires <file> [--key <priv-pem>] [--output-bundle <path>] [--rekor[=<url>]] [--mock-rekor]"
+                "sign-blob requires <file> [--key <priv-pem> | --keyless [--fulcio <url>] [--oidc-provider <kind>]] [--output-bundle <path>] [--rekor[=<url>]] [--mock-rekor]"
                     .to_string(),
             )
         })?
         .clone();
     let mut key: Option<String> = None;
+    let mut keyless = false;
+    let mut fulcio_url: Option<String> = None;
+    let mut oidc_provider: Option<OidcProviderKind> = None;
     let mut output_bundle: Option<String> = None;
     let mut rekor = RekorChoice::None;
     let mut i = 1;
@@ -276,6 +340,24 @@ fn parse_sign_blob_args(args: &[String]) -> Result<SignBlobArgs, CliError> {
                     .get(i + 1)
                     .ok_or_else(|| CliError("--key requires a path argument".to_string()))?;
                 key = Some(v.clone());
+                i += 2;
+            }
+            "--keyless" => {
+                keyless = true;
+                i += 1;
+            }
+            "--fulcio" => {
+                let v = args
+                    .get(i + 1)
+                    .ok_or_else(|| CliError("--fulcio requires a URL argument".to_string()))?;
+                fulcio_url = Some(v.clone());
+                i += 2;
+            }
+            "--oidc-provider" => {
+                let v = args.get(i + 1).ok_or_else(|| {
+                    CliError("--oidc-provider requires a kind argument".to_string())
+                })?;
+                oidc_provider = Some(parse_oidc_provider_kind(v)?);
                 i += 2;
             }
             "--output-bundle" => {
@@ -308,29 +390,72 @@ fn parse_sign_blob_args(args: &[String]) -> Result<SignBlobArgs, CliError> {
             other => return Err(CliError(format!("unknown flag: {other}"))),
         }
     }
-    let key =
-        key.ok_or_else(|| CliError("sign-blob requires --key <priv-pem-path>".to_string()))?;
+    // `--key` and `--keyless` are mutually exclusive AND one is required.
+    let mode = match (key, keyless) {
+        (Some(_), true) => {
+            return Err(CliError(
+                "--key and --keyless are mutually exclusive".to_string(),
+            ));
+        }
+        (None, false) => {
+            return Err(CliError(
+                "sign-blob requires either --key <priv-pem-path> or --keyless".to_string(),
+            ));
+        }
+        (Some(key_path), false) => {
+            // `--fulcio` and `--oidc-provider` only apply to keyless.
+            if fulcio_url.is_some() {
+                return Err(CliError(
+                    "--fulcio is only valid with --keyless".to_string(),
+                ));
+            }
+            if oidc_provider.is_some() {
+                return Err(CliError(
+                    "--oidc-provider is only valid with --keyless".to_string(),
+                ));
+            }
+            SignMode::StaticKey { key_path }
+        }
+        (None, true) => SignMode::Keyless {
+            fulcio_url: fulcio_url.unwrap_or_else(|| DEFAULT_FULCIO_URL.to_string()),
+            oidc_provider: oidc_provider.unwrap_or(OidcProviderKind::Static),
+        },
+    };
     Ok(SignBlobArgs {
         file,
-        key,
+        mode,
         output_bundle,
         rekor,
     })
 }
 
-/// `sign-blob <file> --key <priv-pem-path> [--output-bundle <path>] [--rekor]`
+/// `sign-blob <file> [--key <priv-pem-path> | --keyless [--fulcio <url>] [--oidc-provider <kind>]] [--output-bundle <path>] [--rekor]`
 /// — sign the bytes of `<file>` and emit a Sigstore bundle v0.3
 /// JSON to `<path>` or stdout.
+///
+/// Two sign modes:
+///
+/// * **`--key <priv-pem>`** — static-key signing. Caller supplies a
+///   PKCS#8 PEM ECDSA P-256 private key (e.g. from `generate-key-pair`).
+///   The bundle's `verification_material.certificate` is left
+///   empty; verifiers need the matching public key out-of-band.
+/// * **`--keyless`** — Sigstore-keyless signing. Mints an ephemeral
+///   ECDSA P-256 keypair, fetches an OIDC ID token via the chosen
+///   provider, exchanges it with Fulcio for a short-lived cert
+///   chain, signs the payload with the ephemeral key, and embeds
+///   the chain in the bundle. Verifiers establish trust by walking
+///   the chain back to Sigstore's trust roots.
+///
+/// Default Fulcio target is `fulcio.sigstage.dev` (staging) — operators
+/// signing against production must pass `--fulcio https://fulcio.sigstore.dev`
+/// AND `--rekor https://rekor.sigstore.dev` explicitly. The mismatch
+/// between defaults is intentional: a typo'd command line should not
+/// burn a permanent identity entry into the public production Rekor log.
 pub fn cmd_sign_blob<W: Write>(args: &[String], out: &mut W) -> Result<(), CliError> {
     let parsed = parse_sign_blob_args(args)?;
 
     let payload = std::fs::read(Path::new(&parsed.file))
         .map_err(|e| CliError(format!("read {}: {e}", parsed.file)))?;
-    let priv_pem = std::fs::read_to_string(Path::new(&parsed.key))
-        .map_err(|e| CliError(format!("read {}: {e}", parsed.key)))?;
-    let signing_key = SigningKey::from_pkcs8_pem(&priv_pem)
-        .map_err(|e| CliError(format!("parse PKCS#8 PEM private key: {e}")))?;
-    let signer = EcdsaP256Signer::new(signing_key, None);
 
     // Hold storage for whichever Rekor client variant is in play.
     // Both branches are bound out-of-line so `rekor_arg` can borrow
@@ -350,17 +475,83 @@ pub fn cmd_sign_blob<W: Write>(args: &[String], out: &mut W) -> Result<(), CliEr
         }
     };
 
-    let bundle = sign_blob(
-        &payload,
-        // Bundle media type — pinning the v0.3 string here keeps
-        // operator-facing CLI output identical regardless of which
-        // sign path the binary takes (cosign-compat tools key off
-        // this string).
-        "application/vnd.dev.sigstore.bundle+json;version=0.3",
-        &signer,
-        rekor_arg,
-    )
-    .map_err(|e| CliError(format!("sign_blob: {e}")))?;
+    let bundle = match &parsed.mode {
+        SignMode::StaticKey { key_path } => {
+            let priv_pem = std::fs::read_to_string(Path::new(key_path))
+                .map_err(|e| CliError(format!("read {key_path}: {e}")))?;
+            let signing_key = SigningKey::from_pkcs8_pem(&priv_pem)
+                .map_err(|e| CliError(format!("parse PKCS#8 PEM private key: {e}")))?;
+            let signer = EcdsaP256Signer::new(signing_key, None);
+
+            sign_blob(
+                &payload,
+                // Bundle media type — pinning the v0.3 string here keeps
+                // operator-facing CLI output identical regardless of which
+                // sign path the binary takes (cosign-compat tools key off
+                // this string).
+                "application/vnd.dev.sigstore.bundle+json;version=0.3",
+                &signer,
+                rekor_arg,
+            )
+            .map_err(|e| CliError(format!("sign_blob: {e}")))?
+        }
+        SignMode::Keyless {
+            fulcio_url,
+            oidc_provider,
+        } => {
+            // Step 1: resolve OIDC ID token. Operator surfaces the
+            // chosen provider via `--oidc-provider`; the helper here
+            // dispatches to the matching `OidcProvider` impl.
+            writeln!(out, "fetching OIDC token from {}...", oidc_provider.label())
+                .map_err(|e| CliError(format!("write: {e}")))?;
+            let token = fetch_oidc_token(*oidc_provider)?;
+
+            // Step 2: ephemeral ECDSA P-256 keypair. Fresh per sign
+            // call; never written to disk; freed when this function
+            // returns.
+            let signing_key = SigningKey::random(&mut OsRng);
+
+            // Step 3: build the CSR. The `subject_email` placeholder
+            // is overwritten server-side by Fulcio with the OIDC
+            // token's `sub` / `email` claim (the OIDC subject is what
+            // ends up in the leaf cert's SAN, not what we put here).
+            let csr = build_csr(&signing_key, "justsign-cli@local")
+                .map_err(|e| CliError(format!("build CSR: {e}")))?;
+
+            // Step 4: exchange CSR + token for a cert chain. The
+            // cert chain's leaf is a P-256 signing cert bound to the
+            // OIDC subject; intermediates and root come from Fulcio.
+            writeln!(out, "exchanging CSR with Fulcio at {fulcio_url}...")
+                .map_err(|e| CliError(format!("write: {e}")))?;
+            let fulcio_client = HttpFulcioClient::new(fulcio_url.as_str())
+                .map_err(|e| CliError(format!("build Fulcio client for {fulcio_url}: {e}")))?;
+            let cert_chain = fulcio_client
+                .sign_csr(&csr, &token)
+                .map_err(|e| CliError(format!("Fulcio sign_csr: {e}")))?;
+
+            // Step 5: convert chain to the leaf-first DER vec shape
+            // `sign_blob_keyless` expects. The fulcio crate's
+            // `X509Cert` already holds verbatim DER bytes per cert.
+            let cert_chain_der: Vec<Vec<u8>> =
+                cert_chain.certs.iter().map(|c| c.der.clone()).collect();
+
+            // Step 6: build the signer over the ephemeral key and
+            // delegate to `sign_blob_keyless`. The bundle returned
+            // carries the cert chain in
+            // `verification_material.x509CertificateChain.certificates`
+            // and (when rekor_arg is Some) the inclusion proof in
+            // `tlog_entries`.
+            let signer = EcdsaP256Signer::new(signing_key, None);
+            sign_blob_keyless(
+                &payload,
+                "application/vnd.dev.sigstore.bundle+json;version=0.3",
+                &signer,
+                &cert_chain_der,
+                rekor_arg,
+            )
+            .map_err(|e| CliError(format!("sign_blob_keyless: {e}")))?
+        }
+    };
 
     let json = bundle
         .encode_json()
@@ -492,7 +683,7 @@ pub fn cmd_verify_blob<W: Write>(args: &[String], out: &mut W) -> Result<(), Cli
 /// `--oidc-provider <kind>` flag has a single, exhaustively-matched
 /// place where the kind string is decoded — adding a new provider
 /// means failing the `match` upfront, which is what we want.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OidcProviderKind {
     Static,
     GitHubActions,
@@ -559,13 +750,7 @@ pub fn cmd_oidc_token<W: Write>(args: &[String], out: &mut W) -> Result<(), CliE
     writeln!(out, "fetching OIDC token from {}...", kind.label())
         .map_err(|e| CliError(format!("write: {e}")))?;
 
-    let token = match kind {
-        OidcProviderKind::Static => StaticOidcProvider::default().fetch_token(),
-        OidcProviderKind::GitHubActions => GitHubActionsOidcProvider::default().fetch_token(),
-        OidcProviderKind::GcpMetadata => GcpMetadataOidcProvider::default().fetch_token(),
-        OidcProviderKind::InteractiveBrowser => fetch_interactive_browser_token(),
-    }
-    .map_err(|e| CliError(format!("oidc fetch: {e}")))?;
+    let token = fetch_oidc_token(kind)?;
 
     // Print only the first 30 chars + `...` — full JWTs are 1-2 KiB
     // and pasting one into a terminal log line is a footgun
@@ -580,6 +765,23 @@ pub fn cmd_oidc_token<W: Write>(args: &[String], out: &mut W) -> Result<(), CliE
     };
     writeln!(out, "token: {preview}{elided}").map_err(|e| CliError(format!("write: {e}")))?;
     Ok(())
+}
+
+/// Resolve an OIDC ID token via the configured provider.
+///
+/// Shared helper between `cmd_oidc_token` (which prints a preview)
+/// and `cmd_sign_blob`'s `--keyless` path (which feeds the token to
+/// Fulcio). Centralised so the OIDC-error -> CliError mapping happens
+/// in one place.
+fn fetch_oidc_token(kind: OidcProviderKind) -> Result<String, CliError> {
+    let token = match kind {
+        OidcProviderKind::Static => StaticOidcProvider::default().fetch_token(),
+        OidcProviderKind::GitHubActions => GitHubActionsOidcProvider::default().fetch_token(),
+        OidcProviderKind::GcpMetadata => GcpMetadataOidcProvider::default().fetch_token(),
+        OidcProviderKind::InteractiveBrowser => fetch_interactive_browser_token(),
+    }
+    .map_err(|e| CliError(format!("oidc fetch: {e}")))?;
+    Ok(token)
 }
 
 /// Helper that returns `Err` when the `oidc-browser` feature is OFF —
@@ -990,6 +1192,102 @@ mod tests {
             "error must explain the conflict, got: {}",
             err.0
         );
+    }
+
+    /// `--key` and `--keyless` are mutually exclusive — passing both
+    /// surfaces a typed error rather than silently dropping one.
+    ///
+    /// Bug it catches: a parser that ignored the duplicate-mode case
+    /// would let a caller think they're signing keyless while
+    /// actually using a static key (or vice versa), masking the
+    /// identity surface that ends up in the bundle.
+    #[test]
+    fn test_cli_sign_blob_with_key_and_keyless_returns_error() {
+        let dir = Tempdir::new("key-and-keyless");
+        let prefix = dir.join_str("k");
+        let mut sink = Vec::new();
+        cmd_generate_key_pair(std::slice::from_ref(&prefix), &mut sink).unwrap();
+        let priv_path = format!("{prefix}.key");
+
+        let payload_path = dir.join_str("payload.bin");
+        std::fs::write(&payload_path, b"data").unwrap();
+
+        let err = cmd_sign_blob(
+            &[payload_path, "--key".into(), priv_path, "--keyless".into()],
+            &mut sink,
+        )
+        .expect_err("--key + --keyless MUST surface an error");
+        assert!(
+            err.0.contains("mutually exclusive"),
+            "error must explain the conflict, got: {}",
+            err.0
+        );
+    }
+
+    /// `--fulcio` is keyless-only; passing it with `--key` surfaces
+    /// a typed error so callers don't think their override applied.
+    ///
+    /// Bug it catches: a parser that silently accepted `--fulcio`
+    /// in the static-key branch would have it appear to work, with
+    /// the operator not realising the URL was ignored.
+    #[test]
+    fn test_cli_sign_blob_with_fulcio_and_static_key_returns_error() {
+        let dir = Tempdir::new("fulcio-static");
+        let prefix = dir.join_str("k");
+        let mut sink = Vec::new();
+        cmd_generate_key_pair(std::slice::from_ref(&prefix), &mut sink).unwrap();
+        let priv_path = format!("{prefix}.key");
+
+        let payload_path = dir.join_str("payload.bin");
+        std::fs::write(&payload_path, b"data").unwrap();
+
+        let err = cmd_sign_blob(
+            &[
+                payload_path,
+                "--key".into(),
+                priv_path,
+                "--fulcio".into(),
+                "https://fulcio.example.invalid".into(),
+            ],
+            &mut sink,
+        )
+        .expect_err("--fulcio without --keyless MUST surface an error");
+        assert!(
+            err.0.contains("--fulcio"),
+            "error must explain --fulcio is keyless-only, got: {}",
+            err.0
+        );
+    }
+
+    /// `--keyless` parses defaults: Fulcio defaults to staging,
+    /// OIDC provider defaults to Static. Pins the default values
+    /// so a regression that flips Fulcio default to production
+    /// would be caught at the parser layer.
+    ///
+    /// Bug it catches: a default change to `https://fulcio.sigstore.dev`
+    /// (production) would let a typo'd command burn a permanent
+    /// identity entry into the public production Rekor log. The
+    /// CLI default is staging on purpose; this test pins that.
+    #[test]
+    fn test_cli_sign_blob_keyless_defaults_to_staging_fulcio() {
+        let dir = Tempdir::new("keyless-defaults");
+        let payload_path = dir.join_str("payload.bin");
+        std::fs::write(&payload_path, b"data").unwrap();
+
+        let parsed = super::parse_sign_blob_args(&[payload_path, "--keyless".into()]).unwrap();
+        match parsed.mode {
+            SignMode::Keyless {
+                fulcio_url,
+                oidc_provider,
+            } => {
+                assert_eq!(
+                    fulcio_url, DEFAULT_FULCIO_URL,
+                    "Fulcio default must be staging"
+                );
+                assert_eq!(oidc_provider, OidcProviderKind::Static);
+            }
+            other => panic!("expected SignMode::Keyless, got {other:?}"),
+        }
     }
 
     /// Unknown subcommand surfaces a typed CliError with a useful
