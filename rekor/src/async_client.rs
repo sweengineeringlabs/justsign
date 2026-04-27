@@ -32,7 +32,7 @@
 
 use async_trait::async_trait;
 
-use crate::client::{decode_log_entry_bytes, LogEntry};
+use crate::client::{classify_non_success, decode_log_entry_bytes, LogEntry};
 use crate::entry::HashedRekord;
 use crate::RekorError;
 
@@ -152,18 +152,22 @@ impl AsyncRekorClient for HttpRekorClientAsync {
 /// Async counterpart to `client::decode_log_entry_response`. The
 /// status check and the `text()` fallback live here — the body
 /// decode path is shared with the blocking client via
-/// [`decode_log_entry_bytes`].
+/// [`decode_log_entry_bytes`], and the non-2xx classification is
+/// shared via [`classify_non_success`] so the blocking and async
+/// transports produce identical error variants for identical
+/// responses.
 async fn decode_async(resp: reqwest::Response) -> Result<LogEntry, RekorError> {
-    let status = resp.status().as_u16();
-    if !(200..300).contains(&status) {
-        let body = resp
-            .text()
-            .await
-            .unwrap_or_else(|_| String::from("<unreadable>"));
-        return Err(RekorError::Status { status, body });
+    let status = resp.status();
+    let code = status.as_u16();
+    if status.is_success() {
+        let raw = resp.bytes().await?;
+        return decode_log_entry_bytes(&raw);
     }
-    let raw = resp.bytes().await?;
-    decode_log_entry_bytes(&raw)
+    let body = resp
+        .text()
+        .await
+        .unwrap_or_else(|_| String::from("<unreadable>"));
+    Err(classify_non_success(code, body))
 }
 
 // ── Tests ────────────────────────────────────────────────────────
@@ -394,16 +398,18 @@ mod tests {
             .expect("envelope must be self-consistent");
     }
 
-    /// Server-side 4xx must map to `RekorError::Status` carrying
-    /// the upstream code + body verbatim — mirrors the blocking
-    /// client and pins the contract for any retry / alerting layer
-    /// built on top.
+    /// Server-side 4xx (rate-limit, validation error) must map to
+    /// [`RekorError::ClientError`] carrying the upstream code +
+    /// body verbatim — mirrors the blocking client and pins the
+    /// contract for any retry / alerting layer built on top.
     ///
     /// Bug it catches: an async impl that swallows the body via a
-    /// generic `Http(_)` variant, hiding the actual server response
-    /// from the operator.
+    /// generic `Transport(_)` variant, hiding the actual server
+    /// response from the operator and routing rate-limited 429s
+    /// to "your network is down" instead of "you're calling too
+    /// fast".
     #[tokio::test]
-    async fn test_async_submit_4xx_response_maps_to_status_error() {
+    async fn test_async_submit_with_429_response_returns_client_error_variant() {
         let server = LocalServer::start(
             429,
             "application/json",
@@ -415,11 +421,120 @@ mod tests {
             .await
             .expect_err("server said 429");
         match err {
-            RekorError::Status { status, body } => {
+            RekorError::ClientError { status, body } => {
                 assert_eq!(status, 429);
                 assert!(body.contains("slow down"), "body was {body:?}");
             }
-            other => panic!("expected Status, got {other:?}"),
+            other => panic!("expected ClientError, got {other:?}"),
+        }
+    }
+
+    /// 5xx response on the async path → [`RekorError::ServerError`].
+    ///
+    /// Bug it catches: divergence between sync and async classifier
+    /// — both transports must route 5xx the same way, otherwise
+    /// alerting policy depends on which transport the caller picked.
+    #[tokio::test]
+    async fn test_async_submit_with_5xx_response_returns_server_error_variant() {
+        let server = LocalServer::start(
+            500,
+            "application/json",
+            b"{\"message\":\"internal error\"}".to_vec(),
+        );
+        let client = HttpRekorClientAsync::new(&server.base_url).expect("client");
+        let err = client
+            .submit(&sample_record())
+            .await
+            .expect_err("server said 500");
+        match err {
+            RekorError::ServerError { status, body } => {
+                assert_eq!(status, 500);
+                assert!(body.contains("internal error"), "body was {body:?}");
+            }
+            other => panic!("expected ServerError, got {other:?}"),
+        }
+    }
+
+    /// 4xx with the canonical Rekor idempotency body →
+    /// [`RekorError::AlreadyExists`]. Async path mirrors the
+    /// blocking path's idempotency contract.
+    ///
+    /// Bug it catches: an async classifier that doesn't share
+    /// `classify_non_success` with the blocking client would let
+    /// idempotent re-submits surface as `ClientError` and break
+    /// retry logic for tokio-flavoured callers (servers, long-
+    /// lived signing services).
+    #[tokio::test]
+    async fn test_async_submit_with_canonical_already_exists_body_returns_already_exists_variant() {
+        let server = LocalServer::start(
+            409,
+            "application/json",
+            b"{\"code\":\"AlreadyExists\",\"message\":\"entry already exists\"}".to_vec(),
+        );
+        let client = HttpRekorClientAsync::new(&server.base_url).expect("client");
+        let err = client
+            .submit(&sample_record())
+            .await
+            .expect_err("server said 409");
+        match err {
+            RekorError::AlreadyExists { body } => {
+                assert!(body.contains("AlreadyExists"), "body was {body:?}");
+            }
+            other => panic!("expected AlreadyExists, got {other:?}"),
+        }
+    }
+
+    /// 200 OK with an unparseable body → [`RekorError::Decode`]
+    /// on the async path.
+    ///
+    /// Bug it catches: a classifier that surfaces a 200-but-bad
+    /// body as `Transport(_)` (the reqwest body-read error chain)
+    /// or as the generic `Json` (entry-encode) variant would
+    /// conflate "the server returned garbage" with either "your
+    /// network is broken" or "your input was bad".
+    #[tokio::test]
+    async fn test_async_submit_with_200_unparseable_body_returns_decode_variant() {
+        let server = LocalServer::start(
+            200,
+            "text/html",
+            b"<!DOCTYPE html><html><body>oops</body></html>".to_vec(),
+        );
+        let client = HttpRekorClientAsync::new(&server.base_url).expect("client");
+        let err = client
+            .submit(&sample_record())
+            .await
+            .expect_err("body wasn't Rekor JSON");
+        match err {
+            RekorError::Decode(_) => {}
+            other => panic!("expected Decode, got {other:?}"),
+        }
+    }
+
+    /// Async path against an unreachable address →
+    /// [`RekorError::Transport`].
+    ///
+    /// Bug it catches: a regression that maps
+    /// connection-refused on the tokio path to a 4xx-shaped error
+    /// would produce wrong retry policy for service callers (who
+    /// retry transport errors with backoff, but do NOT retry
+    /// 4xx because the request itself is what's wrong).
+    #[tokio::test]
+    async fn test_async_submit_against_unreachable_address_returns_transport_variant() {
+        // Bind, capture port, drop — guarantees nothing is
+        // listening for the duration of the test.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let url = format!("http://127.0.0.1:{port}");
+
+        let client = HttpRekorClientAsync::new(&url).expect("client");
+        let err = client
+            .submit(&sample_record())
+            .await
+            .expect_err("must fail");
+        match err {
+            RekorError::Transport(_) => {}
+            other => panic!("expected Transport, got {other:?}"),
         }
     }
 

@@ -149,8 +149,8 @@ fn hex_lower_64(bytes: &[u8; 32]) -> String {
 ///
 /// 30 seconds is generous for a single proof submission; matches the
 /// upper end of cosign / fulcio defaults. Surfaces a concrete
-/// `RekorError::Http` (timeout) instead of hanging a CLI invocation
-/// indefinitely on a stalled network.
+/// `RekorError::Transport` (timeout) instead of hanging a CLI
+/// invocation indefinitely on a stalled network.
 const HTTP_TIMEOUT_SECS: u64 = 30;
 
 /// Blocking Rekor HTTP client.
@@ -251,14 +251,89 @@ impl RekorClient for HttpRekorClient {
 /// Decode a Rekor entries response (single-key UUID map) into a
 /// `LogEntry`. Shared between `submit` and `fetch` because the wire
 /// shape is identical.
+///
+/// Status-code routing:
+/// * 2xx → parse the body via [`decode_log_entry_bytes`]; any parse
+///   failure surfaces as [`RekorError::Decode`] (server bug).
+/// * 5xx → [`RekorError::ServerError`] (retry-worthy, alert).
+/// * 4xx → [`RekorError::AlreadyExists`] if the body matches the
+///   Rekor idempotency shape (see [`is_already_exists_body`]),
+///   otherwise [`RekorError::ClientError`] (operator-fixable; not
+///   retry-worthy with the same payload).
+/// * 1xx / 3xx → routed to [`RekorError::ClientError`] because we
+///   never expect them on this API and they indicate a misconfigured
+///   proxy / redirector in front of Rekor.
 fn decode_log_entry_response(resp: reqwest::blocking::Response) -> Result<LogEntry, RekorError> {
-    let status = resp.status().as_u16();
-    if !(200..300).contains(&status) {
-        let body = resp.text().unwrap_or_else(|_| String::from("<unreadable>"));
-        return Err(RekorError::Status { status, body });
+    let status = resp.status();
+    let code = status.as_u16();
+    if status.is_success() {
+        let raw = resp.bytes()?;
+        return decode_log_entry_bytes(&raw);
     }
-    let raw = resp.bytes()?;
-    decode_log_entry_bytes(&raw)
+    let body = resp.text().unwrap_or_else(|_| String::from("<unreadable>"));
+    Err(classify_non_success(code, body))
+}
+
+/// Map a non-2xx HTTP status + body to the appropriate error
+/// variant. Pure (no I/O) so it's shared verbatim between the
+/// blocking and async transports.
+pub(crate) fn classify_non_success(status: u16, body: String) -> RekorError {
+    if (500..=599).contains(&status) {
+        return RekorError::ServerError { status, body };
+    }
+    if (400..=499).contains(&status) && is_already_exists_body(&body) {
+        return RekorError::AlreadyExists { body };
+    }
+    RekorError::ClientError { status, body }
+}
+
+/// Detect Rekor's "entry already exists" idempotency response.
+///
+/// Rekor signals that a content-identical entry is already in the
+/// log via a 4xx with one of two body shapes:
+///
+/// * Canonical JSON object containing a `code` field whose value
+///   is either the string `"AlreadyExists"` or the integer `409`.
+///   The string form is what Rekor v1 emits; the integer form is
+///   what older deployments and some proxies surface.
+/// * A free-form error body that contains the substring
+///   `"already exists"` (case-insensitive). This is the fallback
+///   for Rekor versions whose error body shape doesn't surface a
+///   structured `code` field — and for proxies that rewrite the
+///   body but preserve the human-readable message.
+///
+/// The substring fallback is deliberately permissive: a false
+/// positive (a 4xx body that happens to contain "already exists"
+/// but is NOT an idempotency signal) routes the caller to
+/// `AlreadyExists` instead of `ClientError`. The cost of that
+/// false positive is small — the caller treats a re-submittable
+/// failure as success and never alerts — but Rekor's own bodies
+/// reliably contain this phrase only on the idempotency path, so
+/// in practice the heuristic matches Rekor's contract.
+pub(crate) fn is_already_exists_body(body: &str) -> bool {
+    // Try the structured JSON shape first. We deserialize into a
+    // free-form Value because Rekor's error body has multiple
+    // historical shapes — `{ "code": "AlreadyExists", ... }`,
+    // `{ "code": 409, ... }`, `{ "code": "ALREADY_EXISTS", ... }`.
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(body) {
+        if let Some(code) = value.get("code") {
+            if let Some(s) = code.as_str() {
+                if s.eq_ignore_ascii_case("alreadyexists")
+                    || s.eq_ignore_ascii_case("already_exists")
+                {
+                    return true;
+                }
+            }
+            if code.as_i64() == Some(409) {
+                return true;
+            }
+        }
+    }
+    // Substring fallback. Lower-case once; bounded scan over the
+    // whole body. Bodies are response-sized (a few KB at worst —
+    // Rekor doesn't return MB-sized errors), so the allocation
+    // cost is negligible compared to the HTTP round-trip.
+    body.to_ascii_lowercase().contains("already exists")
 }
 
 /// Decode the *body bytes* of a successful Rekor entries response
@@ -272,52 +347,61 @@ fn decode_log_entry_response(resp: reqwest::blocking::Response) -> Result<LogEnt
 /// only an opaque byte slice, and surfaces typed errors — exactly
 /// the contract the fuzzer asserts (no panics).
 pub fn decode_log_entry_bytes(raw: &[u8]) -> Result<LogEntry, RekorError> {
+    use serde::de::Error as _;
+
     // Rekor returns `{ "<uuid>": { ... } }` — a one-element JSON
     // object keyed by the server-assigned UUID. We deserialise into
     // a `BTreeMap` so we don't depend on the field name and grab the
-    // (one) entry.
-    let mut map: std::collections::BTreeMap<String, RekorEntryWire> = serde_json::from_slice(raw)?;
-    let (uuid, wire) = map.pop_first().ok_or_else(|| RekorError::Status {
-        status: 200,
-        body: "rekor returned an empty entries map".to_string(),
+    // (one) entry. Any JSON-shape failure here is server-bug
+    // territory (200 OK with an unparseable body) — surface as
+    // `Decode`, NOT `Json`, so callers can distinguish a sign-time
+    // entry-encode failure from a server response-decode failure.
+    let mut map: std::collections::BTreeMap<String, RekorEntryWire> =
+        serde_json::from_slice(raw).map_err(RekorError::Decode)?;
+    let (uuid, wire) = map.pop_first().ok_or_else(|| {
+        RekorError::Decode(serde_json::Error::custom(
+            "rekor returned an empty entries map",
+        ))
     })?;
 
     // Body is base64-encoded canonical JSON of the entry the server
     // stored. The mock returns the raw JSON bytes; we decode here so
-    // the shape matches.
+    // the shape matches. A base64 failure on a 200 is also a server
+    // bug — route it to `Decode`.
     let body = STANDARD.decode(wire.body.as_bytes()).map_err(|e| {
-        use serde::de::Error as _;
-        RekorError::Json(serde_json::Error::custom(format!(
+        RekorError::Decode(serde_json::Error::custom(format!(
             "rekor body base64 decode: {e}"
         )))
     })?;
 
-    let proof = wire.verification.and_then(|v| v.inclusion_proof).ok_or({
-        // Rekor returns inclusionProof for every fresh submission;
-        // its absence means the server is in an unsupported config.
-        RekorError::Status {
-            status: 200,
-            body: "rekor response had no verification.inclusionProof".to_string(),
-        }
-    })?;
+    let proof = wire
+        .verification
+        .and_then(|v| v.inclusion_proof)
+        .ok_or_else(|| {
+            // Rekor returns inclusionProof for every fresh submission;
+            // its absence means the server is in an unsupported config.
+            RekorError::Decode(serde_json::Error::custom(
+                "rekor response had no verification.inclusionProof",
+            ))
+        })?;
 
-    let log_index: u64 = u64::try_from(wire.log_index).map_err(|_| RekorError::Status {
-        status: 200,
-        body: format!("rekor logIndex was negative: {}", wire.log_index),
+    let log_index: u64 = u64::try_from(wire.log_index).map_err(|_| {
+        RekorError::Decode(serde_json::Error::custom(format!(
+            "rekor logIndex was negative: {}",
+            wire.log_index
+        )))
     })?;
-    let proof_log_index: u64 = u64::try_from(proof.log_index).map_err(|_| RekorError::Status {
-        status: 200,
-        body: format!(
+    let proof_log_index: u64 = u64::try_from(proof.log_index).map_err(|_| {
+        RekorError::Decode(serde_json::Error::custom(format!(
             "rekor inclusionProof.logIndex was negative: {}",
             proof.log_index
-        ),
+        )))
     })?;
-    let tree_size: u64 = u64::try_from(proof.tree_size).map_err(|_| RekorError::Status {
-        status: 200,
-        body: format!(
+    let tree_size: u64 = u64::try_from(proof.tree_size).map_err(|_| {
+        RekorError::Decode(serde_json::Error::custom(format!(
             "rekor inclusionProof.treeSize was negative: {}",
             proof.tree_size
-        ),
+        )))
     })?;
 
     let leaf_hash = hash_leaf(&body);
@@ -658,9 +742,11 @@ mod tests {
         // Staging may reject our entry on signature-verify (the bytes
         // above are not a real signature). What we're pinning here is
         // the *transport contract*: either a 2xx with a parseable
-        // proof, or a structured `RekorError::Status` that names the
-        // server's complaint. Anything else (panic, hang, untyped
-        // error) is a real bug.
+        // proof, or a structured 4xx (`ClientError` for a bad
+        // signature) / 4xx-idempotent (`AlreadyExists` if the same
+        // synthetic content was submitted previously). Anything else
+        // (panic, hang, untyped error, transport failure on a healthy
+        // staging server) is a real bug.
         match client.submit(&entry) {
             Ok(log_entry) => {
                 assert!(
@@ -677,15 +763,485 @@ mod tests {
                 assert_eq!(fetched.uuid, log_entry.uuid);
                 assert_eq!(fetched.body, log_entry.body);
             }
-            Err(RekorError::Status { status, body }) => {
+            Err(RekorError::ClientError { status, body }) => {
                 eprintln!(
-                    "staging submit returned typed Status {status}: {body} \
+                    "staging submit returned typed ClientError {status}: {body} \
                      (acceptable for a synthetic signature; transport contract held)"
+                );
+            }
+            Err(RekorError::AlreadyExists { body }) => {
+                eprintln!(
+                    "staging submit returned AlreadyExists: {body} \
+                     (acceptable on a content collision; idempotency contract held)"
                 );
             }
             Err(other) => {
                 panic!("staging submit returned untyped error: {other:?}");
             }
         }
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // Issue #32: granular `RekorError` variants — heuristic + wire
+    // tests for the new `Transport` / `ServerError` / `ClientError`
+    // / `AlreadyExists` / `Decode` split.
+    //
+    // The `is_already_exists_body` heuristic is the subtle part:
+    // these tests are written FIRST (before the heuristic was
+    // wired into the response classifier) so they pin the
+    // canonical body shapes Rekor actually returns and the
+    // permissive substring fallback for older deployments.
+    // ──────────────────────────────────────────────────────────────
+
+    /// Canonical Rekor 4xx idempotency body — top-level `code` is
+    /// the string `"AlreadyExists"` (Rekor v1 shape).
+    ///
+    /// Bug it catches: a heuristic that only checks the substring
+    /// fallback would also match this body, but a heuristic that
+    /// only checks the JSON shape and uses a stricter equality
+    /// (e.g. `code == "ALREADY_EXISTS"` only) would miss the
+    /// canonical Rekor wire string.
+    #[test]
+    fn test_is_already_exists_body_with_canonical_alreadyexists_string_returns_true() {
+        let body = r#"{"code":"AlreadyExists","message":"entry already exists"}"#;
+        assert!(is_already_exists_body(body));
+    }
+
+    /// Older / proxy-rewritten bodies surface `code` as the
+    /// integer 409 (HTTP "Conflict").
+    ///
+    /// Bug it catches: a heuristic that only matches the string
+    /// shape would route 409-coded bodies to `ClientError` and the
+    /// caller would alert on what is actually idempotent re-submit
+    /// success.
+    #[test]
+    fn test_is_already_exists_body_with_integer_409_code_returns_true() {
+        let body = r#"{"code":409,"message":"already exists"}"#;
+        assert!(is_already_exists_body(body));
+    }
+
+    /// SCREAMING_SNAKE variant — some Rekor deployments and proxies
+    /// emit `"ALREADY_EXISTS"` instead of `"AlreadyExists"`.
+    ///
+    /// Bug it catches: a case-sensitive equality check on the
+    /// canonical string would miss this and route to
+    /// `ClientError`.
+    #[test]
+    fn test_is_already_exists_body_with_screaming_snake_code_returns_true() {
+        let body = r#"{"code":"ALREADY_EXISTS","message":"dup"}"#;
+        assert!(is_already_exists_body(body));
+    }
+
+    /// Substring fallback — a 4xx body that isn't structured JSON
+    /// but contains the human-readable phrase still routes to
+    /// `AlreadyExists`. Covers Rekor versions / proxies whose
+    /// error body shape doesn't surface a structured `code`.
+    ///
+    /// Bug it catches: a heuristic that ONLY parses JSON would
+    /// misroute proxy-rewritten plain-text bodies.
+    #[test]
+    fn test_is_already_exists_body_with_plaintext_substring_case_insensitive_returns_true() {
+        // Mixed case + extra context — the substring scan must be
+        // case-insensitive over the lower-cased body.
+        assert!(is_already_exists_body(
+            "this entry Already Exists in the log"
+        ));
+        assert!(is_already_exists_body("ALREADY EXISTS"));
+    }
+
+    /// A genuine 4xx that ISN'T idempotent must NOT match —
+    /// otherwise every malformed-request response would silently
+    /// be treated as success.
+    ///
+    /// Bug it catches: an over-eager substring fallback (e.g.
+    /// matching just "exists") would false-positive on bodies
+    /// like "schema does not exist" and treat real client errors
+    /// as idempotent.
+    #[test]
+    fn test_is_already_exists_body_with_unrelated_4xx_body_returns_false() {
+        let body = r#"{"code":"ValidationError","message":"signature shape malformed"}"#;
+        assert!(!is_already_exists_body(body));
+    }
+
+    /// `RekorError` is `From<reqwest::Error>` via the `Transport`
+    /// variant — the type-level check ensures `?` propagation in
+    /// the construction sites still compiles after the rename.
+    ///
+    /// Bug it catches: a regression that drops `#[from]` on
+    /// `Transport` would force every construction site to wrap
+    /// manually, and the compiler would silently let an `Http`-
+    /// using site keep building until its branch was reached at
+    /// runtime.
+    #[test]
+    fn test_rekor_error_from_reqwest_error_uses_transport_variant() {
+        // We can't easily fabricate a real `reqwest::Error` here,
+        // but we can prove the From impl exists by referencing it
+        // in a function signature — if the impl is missing, this
+        // does not compile.
+        fn _typecheck(_e: reqwest::Error) -> RekorError {
+            RekorError::from(_e)
+        }
+    }
+
+    // ── Local HTTP server fixture ─────────────────────────────────
+
+    /// Minimal local HTTP server. One canned response per
+    /// connection. Mirrors the pattern in `async_client::tests`
+    /// and `tuf::client` — kept in-tree so the blocking client's
+    /// test surface doesn't need the `async` feature on.
+    struct LocalServer {
+        base_url: String,
+        port: u16,
+        shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        handle: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl LocalServer {
+        fn start(status: u16, content_type: &'static str, body: Vec<u8>) -> Self {
+            use std::io::{BufRead, BufReader, Write};
+            use std::net::TcpListener;
+            use std::sync::atomic::{AtomicBool, Ordering};
+            use std::sync::Arc;
+            use std::thread;
+            use std::time::Duration;
+
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+            let port = listener.local_addr().unwrap().port();
+            let base_url = format!("http://127.0.0.1:{port}");
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let shutdown_t = Arc::clone(&shutdown);
+
+            let handle = thread::spawn(move || loop {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(s) => s,
+                    Err(_) => return,
+                };
+                if shutdown_t.load(Ordering::SeqCst) {
+                    let _ = stream.shutdown(std::net::Shutdown::Both);
+                    return;
+                }
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .expect("read timeout");
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(5)))
+                    .expect("write timeout");
+
+                let mut reader = BufReader::new(stream.try_clone().expect("clone"));
+                let mut request_line = String::new();
+                if reader.read_line(&mut request_line).is_err() {
+                    continue;
+                }
+
+                let mut content_length: usize = 0;
+                loop {
+                    let mut hdr = String::new();
+                    match reader.read_line(&mut hdr) {
+                        Ok(0) => break,
+                        Ok(_) => {
+                            if hdr == "\r\n" || hdr == "\n" {
+                                break;
+                            }
+                            if let Some(rest) =
+                                hdr.to_ascii_lowercase().strip_prefix("content-length:")
+                            {
+                                content_length = rest.trim().parse().unwrap_or(0);
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                if content_length > 0 {
+                    let mut body_buf = vec![0u8; content_length];
+                    use std::io::Read as _;
+                    let _ = reader.read_exact(&mut body_buf);
+                }
+
+                let header = format!(
+                    "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    status,
+                    status_reason(status),
+                    content_type,
+                    body.len()
+                );
+                let _ = stream.write_all(header.as_bytes());
+                let _ = stream.write_all(&body);
+                let _ = stream.flush();
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+            });
+
+            Self {
+                base_url,
+                port,
+                shutdown,
+                handle: Some(handle),
+            }
+        }
+    }
+
+    fn status_reason(code: u16) -> &'static str {
+        match code {
+            200 => "OK",
+            400 => "Bad Request",
+            409 => "Conflict",
+            429 => "Too Many Requests",
+            500 => "Internal Server Error",
+            502 => "Bad Gateway",
+            _ => "Status",
+        }
+    }
+
+    impl Drop for LocalServer {
+        fn drop(&mut self) {
+            use std::sync::atomic::Ordering;
+            use std::time::Duration;
+            self.shutdown.store(true, Ordering::SeqCst);
+            let _ = std::net::TcpStream::connect_timeout(
+                &format!("127.0.0.1:{}", self.port).parse().unwrap(),
+                Duration::from_secs(2),
+            );
+            if let Some(h) = self.handle.take() {
+                let _ = h.join();
+            }
+        }
+    }
+
+    /// Find a free port for a "dead address" (LocalServer started
+    /// then dropped) — guarantees nothing is listening so the
+    /// client gets a connection-refused at the transport layer.
+    fn dead_base_url() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        format!("http://127.0.0.1:{port}")
+    }
+
+    /// Build a Rekor-shaped success envelope. Mirrors the helper
+    /// in `async_client::tests::rekor_success_envelope` so the
+    /// blocking and async wire fixtures stay in lock-step.
+    fn rekor_success_envelope(uuid: &str, body_bytes: &[u8]) -> Vec<u8> {
+        use crate::merkle::hash_leaf;
+        let leaf_hex = {
+            let h = hash_leaf(body_bytes);
+            let mut s = String::with_capacity(64);
+            const HEX: &[u8; 16] = b"0123456789abcdef";
+            for b in &h {
+                s.push(HEX[(b >> 4) as usize] as char);
+                s.push(HEX[(b & 0x0f) as usize] as char);
+            }
+            s
+        };
+        let body_b64 = STANDARD.encode(body_bytes);
+        let json = serde_json::json!({
+            uuid: {
+                "body": body_b64,
+                "logIndex": 0,
+                "verification": {
+                    "inclusionProof": {
+                        "hashes": Vec::<String>::new(),
+                        "logIndex": 0,
+                        "rootHash": leaf_hex,
+                        "treeSize": 1,
+                    }
+                }
+            }
+        });
+        serde_json::to_vec(&json).expect("envelope")
+    }
+
+    /// `submit` against an unreachable address surfaces
+    /// [`RekorError::Transport`], NOT `ClientError`.
+    ///
+    /// Bug it catches: a regression that maps "connection refused"
+    /// to a 4xx-shaped error would mislead operators into "fix
+    /// your request" when the failure is "your network is down" —
+    /// the retry policy and the alerting path differ.
+    #[test]
+    fn test_submit_against_unreachable_address_returns_transport_variant() {
+        let url = dead_base_url();
+        let client = HttpRekorClient::new(&url).expect("client");
+        let err = client.submit(&sample_record()).expect_err("must fail");
+        match err {
+            RekorError::Transport(_) => {}
+            other => panic!("expected Transport, got {other:?}"),
+        }
+    }
+
+    /// 5xx response → [`RekorError::ServerError`], carrying the
+    /// status code and body verbatim.
+    ///
+    /// Bug it catches: a classifier that bucketed all non-2xx as
+    /// `ClientError` would surface a Rekor outage as if the
+    /// caller's request were malformed.
+    #[test]
+    fn test_submit_with_5xx_response_returns_server_error_variant() {
+        let server = LocalServer::start(
+            500,
+            "application/json",
+            br#"{"message":"internal error"}"#.to_vec(),
+        );
+        let client = HttpRekorClient::new(&server.base_url).expect("client");
+        let err = client
+            .submit(&sample_record())
+            .expect_err("server said 500");
+        match err {
+            RekorError::ServerError { status, body } => {
+                assert_eq!(status, 500);
+                assert!(body.contains("internal error"), "body was {body:?}");
+            }
+            other => panic!("expected ServerError, got {other:?}"),
+        }
+    }
+
+    /// 4xx with a non-AlreadyExists body → [`RekorError::ClientError`].
+    ///
+    /// Bug it catches: a permissive substring heuristic that
+    /// matched any "exists" substring (or that always defaulted
+    /// 4xx to `AlreadyExists`) would silently mark malformed-
+    /// request failures as idempotent success.
+    #[test]
+    fn test_submit_with_400_malformed_body_returns_client_error_variant() {
+        let server = LocalServer::start(
+            400,
+            "application/json",
+            br#"{"code":"ValidationError","message":"signature shape malformed"}"#.to_vec(),
+        );
+        let client = HttpRekorClient::new(&server.base_url).expect("client");
+        let err = client
+            .submit(&sample_record())
+            .expect_err("server said 400");
+        match err {
+            RekorError::ClientError { status, body } => {
+                assert_eq!(status, 400);
+                assert!(body.contains("ValidationError"), "body was {body:?}");
+            }
+            other => panic!("expected ClientError, got {other:?}"),
+        }
+    }
+
+    /// 409 with the canonical Rekor idempotency body →
+    /// [`RekorError::AlreadyExists`].
+    ///
+    /// Bug it catches: a verifier that doesn't detect the
+    /// idempotency shape surfaces re-submits of identical content
+    /// as failures, breaking retry logic in callers that re-run
+    /// signing pipelines (e.g. CI re-invocations on the same
+    /// blob).
+    #[test]
+    fn test_submit_with_409_canonical_body_returns_already_exists_variant() {
+        let server = LocalServer::start(
+            409,
+            "application/json",
+            br#"{"code":"AlreadyExists","message":"entry already exists"}"#.to_vec(),
+        );
+        let client = HttpRekorClient::new(&server.base_url).expect("client");
+        let err = client
+            .submit(&sample_record())
+            .expect_err("server said 409");
+        match err {
+            RekorError::AlreadyExists { body } => {
+                assert!(body.contains("AlreadyExists"), "body was {body:?}");
+            }
+            other => panic!("expected AlreadyExists, got {other:?}"),
+        }
+    }
+
+    /// 4xx with a free-form body containing the human-readable
+    /// phrase (case-insensitive) still routes to
+    /// [`RekorError::AlreadyExists`].
+    ///
+    /// Bug it catches: a JSON-only heuristic would misroute
+    /// proxy-rewritten plain-text bodies that preserve the
+    /// idempotency phrase but drop the structured `code`.
+    #[test]
+    fn test_submit_with_4xx_substring_body_returns_already_exists_variant() {
+        let server = LocalServer::start(
+            400,
+            "text/plain",
+            b"this entry Already Exists in the log".to_vec(),
+        );
+        let client = HttpRekorClient::new(&server.base_url).expect("client");
+        let err = client
+            .submit(&sample_record())
+            .expect_err("server said 400");
+        match err {
+            RekorError::AlreadyExists { body } => {
+                assert!(
+                    body.to_ascii_lowercase().contains("already exists"),
+                    "body was {body:?}",
+                );
+            }
+            other => panic!("expected AlreadyExists, got {other:?}"),
+        }
+    }
+
+    /// 200 OK with an unparseable body (a load balancer error
+    /// page, a future-version response shape) →
+    /// [`RekorError::Decode`].
+    ///
+    /// Bug it catches: a classifier that surfaced the parse
+    /// failure as `RekorError::Json` (the entry-encode variant)
+    /// would conflate "the content I tried to sign was bad" with
+    /// "the server returned garbage" — operators can't route on
+    /// the difference.
+    #[test]
+    fn test_submit_with_200_unparseable_body_returns_decode_variant() {
+        let server = LocalServer::start(
+            200,
+            "text/html",
+            b"<!DOCTYPE html><html><body>oops</body></html>".to_vec(),
+        );
+        let client = HttpRekorClient::new(&server.base_url).expect("client");
+        let err = client
+            .submit(&sample_record())
+            .expect_err("body wasn't Rekor JSON");
+        match err {
+            RekorError::Decode(_) => {}
+            other => panic!("expected Decode, got {other:?}"),
+        }
+    }
+
+    /// `fetch` shares the response-handling path with `submit` —
+    /// asserting the new variants on the fetch path catches a
+    /// regression where one path is updated but the other still
+    /// emits the old `Status` / `Http` variants.
+    ///
+    /// Bug it catches: divergence between submit and fetch error
+    /// classification. The two paths intentionally route through
+    /// `decode_log_entry_response`; this test pins that they BOTH
+    /// produce the granular variants.
+    #[test]
+    fn test_fetch_with_5xx_response_returns_server_error_variant() {
+        let server = LocalServer::start(502, "text/plain", b"upstream timeout".to_vec());
+        let client = HttpRekorClient::new(&server.base_url).expect("client");
+        let err = client.fetch("any-uuid").expect_err("server said 502");
+        match err {
+            RekorError::ServerError { status, body } => {
+                assert_eq!(status, 502);
+                assert!(body.contains("upstream timeout"), "body was {body:?}");
+            }
+            other => panic!("expected ServerError, got {other:?}"),
+        }
+    }
+
+    /// `fetch` happy-path round trip — confirms the success path
+    /// of the rewritten `decode_log_entry_response` still works.
+    ///
+    /// Bug it catches: a mistake in the rewrite that broke the
+    /// 2xx branch (e.g. routing a successful response through
+    /// `classify_non_success`) would silently take down every
+    /// real submission.
+    #[test]
+    fn test_fetch_with_200_envelope_decodes_log_entry() {
+        let entry = sample_record();
+        let body = entry.encode_json().expect("encode");
+        let envelope = rekor_success_envelope("cafe-d00d", &body);
+        let server = LocalServer::start(200, "application/json", envelope);
+
+        let client = HttpRekorClient::new(&server.base_url).expect("client");
+        let log_entry = client.fetch("cafe-d00d").expect("fetch");
+
+        assert_eq!(log_entry.uuid, "cafe-d00d");
+        assert_eq!(log_entry.body, body);
     }
 }
