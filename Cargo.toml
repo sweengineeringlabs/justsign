@@ -8,12 +8,12 @@ license      = "Apache-2.0"
 repository   = "https://github.com/sweengineeringlabs/justsign"
 homepage     = "https://github.com/sweengineeringlabs/justsign"
 authors      = ["SWE Engineering Labs"]
-# 1.85 because the RustCrypto stack pulled by fulcio + sign + tuf
-# (base64ct 1.7+, etc.) requires edition2024 support, stabilised
-# in Cargo 1.85. Lower than that means a transitive dep refuses
-# to parse its Cargo.toml. Pinning back is whack-a-mole; better
-# to track the ecosystem.
-rust-version = "1.85"
+# 1.86 because the active dep graph requires it: base64ct 1.7+
+# wants edition2024 (Cargo 1.85), and reqwest → idna →
+# icu_collections 2.x declares rust-version "1.86". Pinning back
+# is whack-a-mole; track the ecosystem instead. Same MSRV justoci
+# landed on.
+rust-version = "1.86"
 
 [workspace.dependencies]
 # `version` is required next to `path` so `cargo publish` can resolve

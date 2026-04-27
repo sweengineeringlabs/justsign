@@ -26,16 +26,18 @@ jobs:
       - name: cargo test
         run: cargo test --workspace
 
-  # MSRV gate — the workspace-pinned rust-version (1.75) must
+  # MSRV gate — the workspace-pinned rust-version (1.86) must
   # actually build. Catches accidental use of newer-stdlib APIs.
+  # 1.86 because base64ct 1.7+ wants edition2024 (1.85) and
+  # icu_collections 2.x declares 1.86. Same MSRV as justoci.
   msrv:
-    name: cargo check (MSRV 1.75)
+    name: cargo check (MSRV 1.86)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.75"
+          toolchain: "1.86"
       - uses: Swatinem/rust-cache@v2
         with:
           key: msrv
