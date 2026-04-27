@@ -47,23 +47,26 @@
 //! Ed25519, so this matches the deployed shape; ECDSA support would
 //! land alongside chained-root verification in v1.
 //!
-//! # Canonical-JSON disclaimer
+//! # Canonical-JSON
 //!
 //! TUF specifies that signatures cover the **OLPC canonical JSON**
 //! form of the `signed` object, not arbitrary serde-emitted JSON.
 //! Real TUF clients re-canonicalise `signed` before hashing.
 //!
-//! v0 sidesteps this by **letting the caller supply the exact bytes
-//! that were signed**: [`verify_role`] takes a `signed_bytes`
-//! parameter and treats it as opaque. For unit tests we synthesise
-//! roots where we control both signing and verification, so the
-//! canonical-JSON ambiguity does not bite. A v1 that ingests live
-//! Sigstore metadata will need to either (a) implement OLPC
-//! canonical JSON or (b) re-extract the `signed` byte slice from the
-//! original document via a streaming JSON parser.
+//! [`verify_role`] still takes a `signed_bytes: &[u8]` and treats
+//! it as opaque — synthesised tests pass pre-canonicalised bytes
+//! and control both sides. The [`canonical`] module provides the
+//! canonicaliser callers will use to compute those bytes from a
+//! parsed `signed` value when verifying live Sigstore metadata
+//! (the metadata fetcher in #3 wires it up). See
+//! [`canonical::canonicalize`] for the encoding rules and the
+//! reasoning behind the (a) re-canonicalise / (b) span-preserving
+//! parse trade-off.
 
+pub mod canonical;
 mod root;
 
+pub use canonical::{canonicalize, CanonicalizationError};
 pub use root::{
     verify_role, verify_self_signed, Key, KeyId, KeyVal, Role, RoleName, Root, Signature, TufError,
 };
