@@ -28,7 +28,7 @@
 //!
 //! # Bootstrap
 //!
-//! Per ADR `docs/3-design/adr/001-sigstore-tuf-bootstrap.md`,
+//! Per ADR `docs/3-design/adr/001_sigstore_tuf_bootstrap.md`,
 //! [`TufClient::sigstore`] uses the Sigstore production root that is
 //! baked into the binary at build time (see [`crate::embedded`]). For
 //! air-gapped deployments, custom mirrors, or operators who refuse

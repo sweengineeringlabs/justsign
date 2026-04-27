@@ -54,7 +54,7 @@ fn main() {
             "missing or unreadable embedded TUF asset {ASSET_PATH}: {e}. \
              Fetch the current Sigstore production root from \
              https://tuf-repo-cdn.sigstore.dev/<N>.root.json and commit it \
-             to {ASSET_PATH}; see docs/3-design/adr/001-sigstore-tuf-bootstrap.md."
+             to {ASSET_PATH}; see docs/3-design/adr/001_sigstore_tuf_bootstrap.md."
         )
     });
 
@@ -117,7 +117,7 @@ fn main() {
         println!(
             "cargo:warning=embedded Sigstore TUF root expires in {days_to_expiry} days \
              (at {expires}). Refresh tuf/{ASSET_PATH} before the deadline; see \
-             docs/3-design/adr/001-sigstore-tuf-bootstrap.md."
+             docs/3-design/adr/001_sigstore_tuf_bootstrap.md."
         );
     }
 
