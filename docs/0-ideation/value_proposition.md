@@ -1,5 +1,7 @@
 # justsign value proposition
 
+**Audience**: Project sponsors, prospective users, contributors evaluating whether to adopt or contribute to justsign.
+
 ## Why this exists
 
 Sigstore is the industry standard for keyless software signing, but

@@ -1,5 +1,7 @@
 # ADR-001: Sigstore TUF root bootstrap policy
 
+**Audience**: Architects, security reviewers, and operators evaluating the trust path from a justsign install to the Sigstore public-good production root.
+
 - Status: accepted
 - Date: 2026-04-27
 - Deciders: justsign maintainers

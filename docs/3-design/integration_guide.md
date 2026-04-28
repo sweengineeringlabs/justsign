@@ -1,5 +1,7 @@
 # Integration guide
 
+**Audience**: Application developers and library authors integrating justsign into a downstream project; sigstore-rs migrants.
+
 How to integrate justsign into other systems. Three integration shapes are supported: as a Rust library, as a CLI binary, and as a `sigstore-rs` replacement behind a feature flag.
 
 ## As a library

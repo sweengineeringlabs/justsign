@@ -1,5 +1,7 @@
 # justsign threat model (v0 verifier surface)
 
+**Audience**: Security reviewers, downstream library consumers, anyone integrating justsign verification into a trust-decision-bearing system.
+
 This document is for security reviewers and downstream library consumers
 evaluating what `verify_blob`, `verify_blob_keyless`, `verify_attestation`,
 and `verify_oci` actually guarantee in `swe_justsign_sign` v0. It does

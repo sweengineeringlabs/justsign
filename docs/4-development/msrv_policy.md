@@ -1,5 +1,7 @@
 # MSRV stability policy
 
+**Audience**: Library consumers, distro packagers, and CI maintainers who need to know which Rust toolchains justsign commits to supporting.
+
 This document describes when justsign bumps its Minimum Supported Rust Version (MSRV), how that decision propagates downstream, and how operators / distros can reason about which Rust toolchains we commit to building on.
 
 ## Current MSRV

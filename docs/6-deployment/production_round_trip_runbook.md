@@ -1,5 +1,9 @@
 # Production Sigstore round-trip runbook
 
+**Audience**: Release engineers and maintainers executing (or re-executing) the cosign-against-production-Sigstore regression check before any wire-shape change ships.
+
+> **TLDR**: Build justsign with `--features oidc-browser`, sign a one-line artefact against `https://fulcio.sigstore.dev` + `https://rekor.sigstore.dev` via the interactive-browser OIDC flow, then verify the resulting bundle with `cosign verify-blob --new-bundle-format`. Expected output: `Verified OK`. Last passed 2026-04-28 at logIndex [1396196448](https://search.sigstore.dev/?logIndex=1396196448). Re-run on every wire-shape change to `spec`, `rekor`, or `sign`.
+
 Operator-actionable runbook for executing the production Sigstore round-trip described in justsign issue #23. Estimated time: ~5 minutes once cosign + a browser are available.
 
 > **Status (2026-04-28):** the round-trip was executed by phdsystems and verified `OK` by cosign 3.0.6 against production Fulcio + Rekor. Permanent evidence at <https://search.sigstore.dev/?logIndex=1396196448>. Issue #23 is closed. Re-run this runbook on every wire-shape change touching `spec`, `rekor`, or `sign`.

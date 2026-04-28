@@ -1,5 +1,7 @@
 # Architecture
 
+**Audience**: Architects, contributors, security reviewers; anyone needing the system-level picture before reading individual crate sources.
+
 ## Diagrams
 
 Four diagrams covering the four shapes of the system: which crates depend on which (inclusion), how the pieces wire up at runtime (block), how a sign call flows data end-to-end (data flow), and how a keyless sign-then-verify call sequences (sequence).

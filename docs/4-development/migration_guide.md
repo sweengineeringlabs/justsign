@@ -1,5 +1,7 @@
 # Migration guide
 
+**Audience**: Library consumers upgrading justsign across versions; downstream maintainers planning a version bump.
+
 This document tracks API changes between justsign releases that require caller-side adjustment. Entries are in reverse chronological order (newest at the top).
 
 ## post-v0.1.0 (#38) — bundle wire shape: singular `certificate` leaf, not `x509CertificateChain`

@@ -1,5 +1,7 @@
 # Developer guide
 
+**Audience**: Contributors and maintainers — anyone planning to clone the repo and build / test / land changes.
+
 ## Local setup
 
 ```sh

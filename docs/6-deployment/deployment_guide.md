@@ -1,5 +1,7 @@
 # Deployment guide
 
+**Audience**: Release engineers, CI maintainers, and operators wiring justsign into a release pipeline.
+
 How to integrate justsign into a release pipeline. Two patterns are covered: keyless CI signing (the common case for OSS releases) and static-key release signing using PKCS#11 hardware (the common case for org-internal compliance regimes).
 
 ## Pattern 1 — Keyless CI signing (GitHub Actions)

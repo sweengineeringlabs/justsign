@@ -1,5 +1,7 @@
 # Testing strategy
 
+**Audience**: Contributors writing or reviewing tests; QA engineers validating the test pyramid before a release cut.
+
 justsign is a security library — every test exists to prevent a specific regression that would change a verification outcome or compromise a signing guarantee. This document describes the four test layers, the bug-class doc-comment convention, and what's NOT yet tested.
 
 ## Layer 1 — Unit tests (`#[cfg(test)] mod tests`)
