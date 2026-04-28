@@ -7,6 +7,7 @@
 # Ideation
 
 - [Value proposition](0-ideation/value_proposition.md)
+- [Use cases](0-ideation/use_case.md)
 - [Market research](0-ideation/market_research.md)
 
 # Design

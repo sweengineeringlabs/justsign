@@ -20,6 +20,8 @@ The docs are organised around a five-phase OSS-slim SDLC (`0-ideation` / `3-desi
 
 → [`0-ideation/value_proposition.md`](0-ideation/value_proposition.md) — what problem justsign solves, who it's for, where it sits in the Sigstore ecosystem, and the alternatives.
 
+→ [`0-ideation/use_case.md`](0-ideation/use_case.md) — concrete actor + action + outcome descriptions: hermetic CI signing, PKCS#11 HSM, air-gapped self-hosted Sigstore, multi-algorithm verification, staging round-trip.
+
 → [`0-ideation/market_research.md`](0-ideation/market_research.md) — ecosystem survey: existing Rust Sigstore clients, cosign subprocess problems, producer categories who need an embeddable pure-Rust library.
 
 ### "I'm an architect or security reviewer — show me the system"
