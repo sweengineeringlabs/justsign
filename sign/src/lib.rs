@@ -115,8 +115,9 @@ use rekor::{DsseRekord, HashedRekord, HashedRekordHash, LogEntry, PublicKey, Rek
 use sha2::{Digest, Sha256};
 use spec::{
     Bundle, BundleContent, BundleContentKind, Certificate as SpecCertificate, Checkpoint, Envelope,
-    HashOutput, InclusionProof, KindVersion, MessageSignature as SpecMessageSignature,
-    Signature as DsseSignature, Statement, Subject, TlogEntry, VerificationMaterial,
+    HashOutput, InclusionPromise, InclusionProof, KindVersion, LogId,
+    MessageSignature as SpecMessageSignature, Signature as DsseSignature, Statement, Subject,
+    TlogEntry, VerificationMaterial,
     IN_TOTO_STATEMENT_V1_TYPE, SIGSTORE_BUNDLE_V0_3_MEDIA_TYPE,
 };
 use std::collections::BTreeMap;
@@ -398,14 +399,20 @@ pub fn sign_blob_message(
     //    SPI (out of scope for issue #40).
     let digest = Sha256::digest(payload);
 
-    // 2. Sign the digest bytes directly. Critically, this is NOT a
-    //    DSSE PAE wrap — MessageSignature schema verifies the
-    //    signature against `signer_sign(SHA-256(payload))`, NOT against
-    //    `signer_sign(PAE(payload_type, payload))`. Mis-wiring this
-    //    is the core failure mode the issue-40 schema dispatch fixes.
+    // 2. Sign the payload bytes. RustCrypto's `Signer::sign` for
+    //    ECDSA hashes the input internally with SHA-256, so this
+    //    produces `sig = ECDSA-Sign(SHA-256(payload), key)`.
+    //
+    //    Rekor's hashedrekord verifier (`pkg/types/hashedrekord/v0.0.1`)
+    //    decodes `data.hash.value` to the digest bytes and calls
+    //    `ecdsa.VerifyASN1(pub, digest, sig)` directly — i.e. verifies
+    //    the signature against `SHA-256(payload)`, NOT a re-hash. Our
+    //    single-hash output therefore matches Rekor's verification
+    //    model. Confirmed empirically against `rekor.sigstore.dev`
+    //    (issue #23 round-trip).
     let digest_bytes: Vec<u8> = digest.to_vec();
     let sig_bytes = signer
-        .sign(&digest_bytes)
+        .sign(payload)
         .map_err(|e| SignError::Signer(e.to_string()))?;
 
     let message_signature = SpecMessageSignature {
@@ -503,7 +510,7 @@ pub fn sign_blob_message_keyless(
     let digest = Sha256::digest(payload);
     let digest_bytes: Vec<u8> = digest.to_vec();
     let sig_bytes = signer
-        .sign(&digest_bytes)
+        .sign(payload)
         .map_err(|e| SignError::Signer(e.to_string()))?;
 
     let message_signature = SpecMessageSignature {
@@ -642,13 +649,20 @@ pub fn verify_blob_message(
         });
     }
 
-    // 4. Signature gate. The signed bytes are the digest itself —
-    //    NOT a DSSE PAE. Run the same algorithm-tagged dispatch
-    //    `verify_blob` uses so multi-algorithm trusted-key sets work
-    //    transparently here too.
+    // 4. Signature gate. The signer produced
+    //    `sig = ECDSA(SHA-256(payload))` (RustCrypto auto-hashes the
+    //    message). RustCrypto's verify also auto-hashes its message
+    //    argument, so we hand it the raw `payload` — NOT the digest —
+    //    so the verifier internally computes `SHA-256(payload)` and
+    //    matches what was signed.
+    //
+    //    Passing `pinned_digest` here would produce
+    //    `SHA-256(SHA-256(payload))`, an off-by-one hash that does
+    //    NOT match the signer's output and would silently reject
+    //    every signature.
     let mut any_valid = false;
     for key in trusted_keys {
-        if try_verify(key, pinned_digest, &message_signature.signature) {
+        if try_verify(key, payload, &message_signature.signature) {
             any_valid = true;
             break;
         }
@@ -1086,37 +1100,47 @@ fn build_dsse_rekord(envelope: &Envelope, leaf_der: &[u8]) -> Result<DsseRekord,
 /// returned by the v0 mock (single-leaf log, log_index = 0,
 /// tree_size = 1).
 fn log_entry_to_tlog_entry(entry: &LogEntry, kind: &str) -> TlogEntry {
+    // Rekor's `logID` (when present) identifies the signing log;
+    // when the mock returns all-zeros, fall back to the leaf hash so
+    // the field round-trips with stable bytes.
+    let log_id_key_id = if entry.log_id == [0u8; 32] {
+        entry.leaf_hash.to_vec()
+    } else {
+        entry.log_id.to_vec()
+    };
+    let inclusion_promise = if entry.signed_entry_timestamp.is_empty() {
+        None
+    } else {
+        Some(InclusionPromise {
+            signed_entry_timestamp: entry.signed_entry_timestamp.clone(),
+        })
+    };
     TlogEntry {
         log_index: entry.log_index as i64,
-        log_id: HashOutput {
-            algorithm: "SHA2_256".to_string(),
-            // Mock has no log_id of its own; use the leaf hash
-            // as a stable identifier so the field round-trips.
-            digest: entry.leaf_hash.to_vec(),
+        log_id: LogId {
+            key_id: log_id_key_id,
         },
         kind_version: KindVersion {
             kind: kind.to_string(),
             version: "0.0.1".to_string(),
         },
-        // The mock has no integration timestamp; v0.5 will populate
-        // this from the real Rekor response. Zero is a valid
-        // sentinel — verifiers don't gate on it in v0.
-        integrated_time: 0,
-        // No SET in v0 — the mock doesn't sign, and the real
-        // server's promise is wired in v0.5.
-        inclusion_promise: None,
+        integrated_time: entry.integrated_time,
+        inclusion_promise,
         inclusion_proof: Some(InclusionProof {
-            log_index: entry.log_index as i64,
+            // Shard-local index for merkle reconstruction — strictly
+            // less than `tree_size`. NOT the global `entry.log_index`,
+            // which on sharded Rekor instances exceeds the per-shard
+            // tree size and would fail cosign's "index is beyond size"
+            // pre-check.
+            log_index: entry.proof_log_index as i64,
             root_hash: entry.root_hash.to_vec(),
             tree_size: entry.tree_size as i64,
             hashes: entry.inclusion_proof.iter().map(|h| h.to_vec()).collect(),
-            // Empty checkpoint envelope — the real signed
-            // checkpoint comes from the v0.5 HTTP client. Holding
-            // an empty placeholder keeps the wire shape valid.
             checkpoint: Checkpoint {
-                envelope: String::new(),
+                envelope: entry.checkpoint_envelope.clone(),
             },
         }),
+        canonicalized_body: entry.body.clone(),
     }
 }
 
@@ -3247,11 +3271,16 @@ mod tests {
                 Ok(rekor::LogEntry {
                     uuid: "submit-canary".into(),
                     log_index: 0,
+                    proof_log_index: 0,
                     tree_size: 1,
                     leaf_hash: [0u8; 32],
                     inclusion_proof: Vec::new(),
                     root_hash: [0u8; 32],
                     body: Vec::new(),
+                    integrated_time: 1,
+                    log_id: [0u8; 32],
+                    signed_entry_timestamp: Vec::new(),
+                    checkpoint_envelope: String::new(),
                 })
             }
             fn submit_dsse(
@@ -3262,11 +3291,16 @@ mod tests {
                 Ok(rekor::LogEntry {
                     uuid: "submit-dsse-canary".into(),
                     log_index: 0,
+                    proof_log_index: 0,
                     tree_size: 1,
                     leaf_hash: [0u8; 32],
                     inclusion_proof: Vec::new(),
                     root_hash: [0u8; 32],
                     body: Vec::new(),
+                    integrated_time: 1,
+                    log_id: [0u8; 32],
+                    signed_entry_timestamp: Vec::new(),
+                    checkpoint_envelope: String::new(),
                 })
             }
         }

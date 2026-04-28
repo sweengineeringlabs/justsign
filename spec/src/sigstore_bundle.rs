@@ -181,19 +181,18 @@ pub struct HashOutput {
 }
 
 /// One Rekor transparency-log entry.
-///
-/// We deliberately omit `canonicalized_body` (which Rekor returns
-/// alongside the entry): for v0 it's redundant with the bundle's own
-/// envelope/signature, and storing it doubles the bundle size for no
-/// new information.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TlogEntry {
     /// Sequential index in the Rekor log.
     pub log_index: i64,
 
-    /// Hash of the Rekor instance's public key — identifies which
-    /// log this entry came from.
-    pub log_id: HashOutput,
+    /// Identifier for the Rekor instance that signed this entry —
+    /// SHA-256 of the log's public key. Wire shape is the
+    /// protobuf-specs `LogId { key_id: bytes }` message, NOT a
+    /// `HashOutput` (no `algorithm` field): sigstore-go's protojson
+    /// decoder rejects bundles that include `logId.algorithm` with
+    /// `proto: unknown field "algorithm"`.
+    pub log_id: LogId,
 
     /// Rekor entry kind + version (e.g.
     /// `kind = "intoto"`, `version = "0.0.2"`).
@@ -212,6 +211,23 @@ pub struct TlogEntry {
     /// Merkle inclusion proof against a published checkpoint. Built
     /// once the entry is canonicalized into the log.
     pub inclusion_proof: Option<InclusionProof>,
+
+    /// Canonical body bytes that Rekor stored. Required by
+    /// sigstore-go's bundle validation for v0.3 — verifiers re-derive
+    /// the leaf hash from these bytes and check it against the
+    /// inclusion proof's root. Without this field cosign silently
+    /// falls back to the legacy bundle parser and reports the
+    /// misleading "bundle does not contain cert for verification"
+    /// error.
+    pub canonicalized_body: Vec<u8>,
+}
+
+/// Identifier for a transparency log instance. Mirrors the
+/// protobuf-specs `LogId { bytes key_id = 1 }` message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogId {
+    /// SHA-256 of the log's public key (32 bytes when populated).
+    pub key_id: Vec<u8>,
 }
 
 /// Rekor entry kind + version.
@@ -478,8 +494,8 @@ impl Bundle {
 }
 
 fn decode_tlog_entry(wire: TlogEntryWire) -> Result<TlogEntry, BundleDecodeError> {
-    let log_id_digest = STANDARD
-        .decode(wire.log_id.digest.as_bytes())
+    let log_id_key_id = STANDARD
+        .decode(wire.log_id.key_id.as_bytes())
         .map_err(|e| BundleDecodeError::LogIdBase64 {
             detail: e.to_string(),
         })?;
@@ -536,14 +552,23 @@ fn decode_tlog_entry(wire: TlogEntryWire) -> Result<TlogEntry, BundleDecodeError
             }
         };
 
+    let canonicalized_body = if wire.canonicalized_body.is_empty() {
+        Vec::new()
+    } else {
+        STANDARD
+            .decode(wire.canonicalized_body.as_bytes())
+            .map_err(|e| BundleDecodeError::CanonicalizedBodyBase64 {
+                detail: e.to_string(),
+            })?
+    };
+
     Ok(TlogEntry {
         log_index: wire
             .log_index
             .parse()
             .map_err(|_| BundleDecodeError::IntegerField { field: "logIndex" })?,
-        log_id: HashOutput {
-            algorithm: wire.log_id.algorithm,
-            digest: log_id_digest,
+        log_id: LogId {
+            key_id: log_id_key_id,
         },
         kind_version: KindVersion {
             kind: wire.kind_version.kind,
@@ -556,15 +581,15 @@ fn decode_tlog_entry(wire: TlogEntryWire) -> Result<TlogEntry, BundleDecodeError
         })?,
         inclusion_promise,
         inclusion_proof,
+        canonicalized_body,
     })
 }
 
 fn encode_tlog_entry(te: &TlogEntry) -> TlogEntryWire {
     TlogEntryWire {
         log_index: te.log_index.to_string(),
-        log_id: HashOutputWire {
-            algorithm: te.log_id.algorithm.clone(),
-            digest: STANDARD.encode(&te.log_id.digest),
+        log_id: LogIdWire {
+            key_id: STANDARD.encode(&te.log_id.key_id),
         },
         kind_version: KindVersionWire {
             kind: te.kind_version.kind.clone(),
@@ -583,6 +608,7 @@ fn encode_tlog_entry(te: &TlogEntry) -> TlogEntryWire {
                 envelope: p.checkpoint.envelope.clone(),
             },
         }),
+        canonicalized_body: STANDARD.encode(&te.canonicalized_body),
     }
 }
 
@@ -695,7 +721,7 @@ struct TlogEntryWire {
     #[serde(rename = "logIndex")]
     log_index: String,
     #[serde(rename = "logId")]
-    log_id: HashOutputWire,
+    log_id: LogIdWire,
     #[serde(rename = "kindVersion")]
     kind_version: KindVersionWire,
     #[serde(rename = "integratedTime")]
@@ -704,6 +730,17 @@ struct TlogEntryWire {
     inclusion_promise: Option<InclusionPromiseWire>,
     #[serde(rename = "inclusionProof", skip_serializing_if = "Option::is_none")]
     inclusion_proof: Option<InclusionProofWire>,
+    /// Base64 of the canonical body bytes Rekor stored. Default
+    /// empty for backward compat with older bundles, but v0.3
+    /// validation rejects entries without it.
+    #[serde(rename = "canonicalizedBody", default)]
+    canonicalized_body: String,
+}
+
+#[derive(Deserialize, Serialize)]
+struct LogIdWire {
+    #[serde(rename = "keyId")]
+    key_id: String,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -782,6 +819,9 @@ pub enum BundleDecodeError {
     #[error("inclusionProof.hashes[*] base64 decode: {detail}")]
     ProofHashBase64 { detail: String },
 
+    #[error("tlogEntry.canonicalizedBody base64 decode: {detail}")]
+    CanonicalizedBodyBase64 { detail: String },
+
     #[error("integer field {field} did not parse as i64")]
     IntegerField { field: &'static str },
 }
@@ -825,9 +865,8 @@ mod tests {
                 }),
                 tlog_entries: vec![TlogEntry {
                     log_index: 12345678,
-                    log_id: HashOutput {
-                        algorithm: "SHA2_256".to_string(),
-                        digest: vec![0xAA; 32],
+                    log_id: LogId {
+                        key_id: vec![0xAA; 32],
                     },
                     kind_version: KindVersion {
                         kind: "intoto".to_string(),
@@ -847,6 +886,7 @@ mod tests {
                                 .to_string(),
                         },
                     }),
+                    canonicalized_body: b"{\"kind\":\"intoto\",\"spec\":{}}".to_vec(),
                 }],
                 timestamp_verification_data: None,
             },

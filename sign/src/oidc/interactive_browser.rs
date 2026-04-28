@@ -62,10 +62,11 @@ pub const DEFAULT_ISSUER_URL: &str = "https://oauth2.sigstore.dev/auth";
 pub const DEFAULT_CLIENT_ID: &str = "sigstore";
 
 /// How long we wait for the operator to complete the browser flow
-/// before giving up. 60 seconds matches cosign's default; long
-/// enough for a fresh TOTP, short enough that an operator who
-/// closes the tab doesn't leak a hung process.
-const REDIRECT_TIMEOUT: Duration = Duration::from_secs(300);
+/// before giving up. 15 minutes is comfortable for a manual flow
+/// with provider chooser + 2FA — long enough that an inattentive
+/// operator doesn't lose the run, short enough that a hung listener
+/// doesn't pin a port forever.
+const REDIRECT_TIMEOUT: Duration = Duration::from_secs(900);
 
 /// Cap response-body capture at 4 KiB on token-endpoint errors.
 const MAX_ERROR_BODY_BYTES: usize = 4096;

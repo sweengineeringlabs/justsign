@@ -35,8 +35,19 @@ pub struct LogEntry {
     /// hex of the leaf hash — real Rekor returns its own UUID.
     pub uuid: String,
 
-    /// Position of this entry in the log. 0-based.
+    /// Global position of this entry in the Rekor log, spanning all
+    /// shards. Mirrors Rekor's top-level `logIndex` field. Used as
+    /// the entry's stable identifier; NOT what the inclusion proof
+    /// reconstructs against (use [`LogEntry::proof_log_index`] for
+    /// that).
     pub log_index: u64,
+
+    /// Shard-local position used for inclusion-proof reconstruction.
+    /// For sharded Rekor instances this is `<shard-local index>`,
+    /// strictly less than [`LogEntry::tree_size`]; for unsharded
+    /// instances it equals [`LogEntry::log_index`]. Mirrors the
+    /// `inclusionProof.logIndex` field of Rekor's response.
+    pub proof_log_index: u64,
 
     /// Total leaves in the tree the inclusion proof is rooted
     /// against.
@@ -60,6 +71,26 @@ pub struct LogEntry {
     /// HTTP client returns whatever the server stored (in
     /// practice, the same shape since Rekor canonicalises).
     pub body: Vec<u8>,
+
+    /// Wall-clock time Rekor integrated the entry, seconds since
+    /// Unix epoch. Real Rekor populates this on submit; the mock
+    /// returns 1 (a non-zero placeholder — sigstore-go bundle
+    /// validation rejects `integrated_time == 0`).
+    pub integrated_time: i64,
+
+    /// SHA-256 of the Rekor instance's public key. Identifies which
+    /// log this entry came from. The mock returns all-zero (the
+    /// "unknown log" sentinel — bundles produced by the mock are
+    /// not intended to round-trip through a real verifier).
+    pub log_id: [u8; 32],
+
+    /// Rekor's signed-entry-timestamp (SET) — the inclusion
+    /// promise. Empty when the server didn't supply one.
+    pub signed_entry_timestamp: Vec<u8>,
+
+    /// Signed checkpoint envelope (note-format). Empty when the
+    /// server didn't supply one (mock doesn't sign).
+    pub checkpoint_envelope: String,
 }
 
 /// Rekor client SPI. v0 has only `submit` (`hashedrekord` schema)
@@ -149,11 +180,20 @@ fn synthesise_log_entry(body: Vec<u8>) -> Result<LogEntry, RekorError> {
     Ok(LogEntry {
         uuid,
         log_index: 0,
+        proof_log_index: 0,
         tree_size: 1,
         leaf_hash,
         inclusion_proof,
         root_hash,
         body,
+        // Non-zero placeholder: sigstore-go bundle validation
+        // rejects `integrated_time == 0`. Mock entries aren't
+        // expected to round-trip through a real verifier, but
+        // the field still has to validate as well-formed.
+        integrated_time: 1,
+        log_id: [0u8; 32],
+        signed_entry_timestamp: Vec::new(),
+        checkpoint_envelope: String::new(),
     })
 }
 
@@ -448,16 +488,35 @@ pub fn decode_log_entry_bytes(raw: &[u8]) -> Result<LogEntry, RekorError> {
         )))
     })?;
 
-    let proof = wire
-        .verification
-        .and_then(|v| v.inclusion_proof)
-        .ok_or_else(|| {
-            // Rekor returns inclusionProof for every fresh submission;
-            // its absence means the server is in an unsupported config.
-            RekorError::Decode(serde_json::Error::custom(
-                "rekor response had no verification.inclusionProof",
-            ))
-        })?;
+    let verification = wire.verification.ok_or_else(|| {
+        RekorError::Decode(serde_json::Error::custom(
+            "rekor response had no verification block",
+        ))
+    })?;
+
+    // SET (signedEntryTimestamp) — base64 of Rekor's signature over
+    // the entry's canonical fields. Optional in the wire shape but
+    // sigstore-go requires either this OR an inclusionProof+checkpoint
+    // for bundle validation.
+    let signed_entry_timestamp = if verification.signed_entry_timestamp.is_empty() {
+        Vec::new()
+    } else {
+        STANDARD
+            .decode(verification.signed_entry_timestamp.as_bytes())
+            .map_err(|e| {
+                RekorError::Decode(serde_json::Error::custom(format!(
+                    "rekor signedEntryTimestamp base64 decode: {e}"
+                )))
+            })?
+    };
+
+    let proof = verification.inclusion_proof.ok_or_else(|| {
+        // Rekor returns inclusionProof for every fresh submission;
+        // its absence means the server is in an unsupported config.
+        RekorError::Decode(serde_json::Error::custom(
+            "rekor response had no verification.inclusionProof",
+        ))
+    })?;
 
     let log_index: u64 = u64::try_from(wire.log_index).map_err(|_| {
         RekorError::Decode(serde_json::Error::custom(format!(
@@ -486,14 +545,27 @@ pub fn decode_log_entry_bytes(raw: &[u8]) -> Result<LogEntry, RekorError> {
         .collect::<Result<Vec<_>, RekorError>>()?;
     let root_hash = decode_hex_32(&proof.root_hash)?;
 
+    // Rekor's logID is hex of SHA-256(public key). 32 bytes when
+    // populated; empty string from servers that don't surface it.
+    let log_id = if wire.log_id.is_empty() {
+        [0u8; 32]
+    } else {
+        decode_hex_32(&wire.log_id)?
+    };
+
     Ok(LogEntry {
         uuid,
-        log_index: proof_log_index.max(log_index),
+        log_index,
+        proof_log_index,
         tree_size,
         leaf_hash,
         inclusion_proof,
         root_hash,
         body,
+        integrated_time: wire.integrated_time,
+        log_id,
+        signed_entry_timestamp,
+        checkpoint_envelope: proof.checkpoint,
     })
 }
 
@@ -539,6 +611,15 @@ struct RekorEntryWire {
     /// Server-assigned 0-based log index.
     #[serde(rename = "logIndex")]
     log_index: i64,
+    /// Wall-clock integration timestamp, seconds since epoch. Real
+    /// Rekor always populates this; the field is mandatory for
+    /// sigstore-go bundle validation downstream.
+    #[serde(rename = "integratedTime", default)]
+    integrated_time: i64,
+    /// Hex of SHA-256 of the Rekor instance's public key. Identifies
+    /// which log signed the SET / checkpoint.
+    #[serde(rename = "logID", default)]
+    log_id: String,
     /// Inclusion proof + signed entry timestamp.
     #[serde(default)]
     verification: Option<VerificationWire>,
@@ -548,6 +629,10 @@ struct RekorEntryWire {
 struct VerificationWire {
     #[serde(rename = "inclusionProof", default)]
     inclusion_proof: Option<InclusionProofWire>,
+    /// Base64-encoded SET — Rekor's promise-to-integrate signature
+    /// over the entry's canonical fields.
+    #[serde(rename = "signedEntryTimestamp", default)]
+    signed_entry_timestamp: String,
 }
 
 #[derive(Deserialize)]
@@ -563,6 +648,13 @@ struct InclusionProofWire {
     /// Total leaves in the tree at proof time.
     #[serde(rename = "treeSize")]
     tree_size: i64,
+    /// Signed checkpoint envelope (note-format text). Required by
+    /// sigstore-go bundle validation when an inclusion proof is
+    /// present — it binds the proof's `root_hash` + `tree_size` to
+    /// a Rekor signature that verifiers check against the trust
+    /// root.
+    #[serde(default)]
+    checkpoint: String,
 }
 
 #[cfg(test)]

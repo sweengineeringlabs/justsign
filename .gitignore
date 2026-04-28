@@ -6,3 +6,8 @@ Cargo.lock.bak
 fuzz/target/
 fuzz/corpus/
 fuzz/artifacts/
+
+# Operator scratch dir for the production round-trip runbook
+# (bundle.json, blob.txt, sign.log, sigstore-go diag tool, etc.).
+# Reproducible on demand; contains operator-bound OIDC identities.
+/roundtrip/
