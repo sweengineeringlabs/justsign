@@ -173,3 +173,22 @@ All of the above categories share the same bar:
 3. **No subprocess calls.** The library must not spawn `cosign`, `openssl`, or any other external binary in the production code path.
 4. **Typed errors.** Every failure path returns a typed variant, not a string. Callers must be able to distinguish `RekorSubmitFailed` from `CertExpired` from `BundleDecodeFailed`.
 5. **Sync and async.** Build tools are synchronous; long-running services are async. A library that forces `tokio` on build tools, or blocks threads in services, isn't production-ready for both.
+
+---
+
+## Footprint
+
+Measured on 2026-04-28, release profile, x86-64 Windows host.
+Dep count: `cargo tree -e no-dev --prefix none | sort -u | wc -l` (unique crates, transitive).
+Binary size: stripped release binary.
+
+| Tool | Dep count | Binary size | Language | Notes |
+|------|----------:|-------------|----------|-------|
+| **justsign** | **198** | **4.5 MB** | Rust | Sync + async; multi-algo; PKCS#11 optional |
+| `sigstore-rs` | ~300+ (est.) | N/A (library) | Rust | Async-only; MSRV unstable; staging API gap |
+| `cosign` | ~300 Go modules | ~50 MB | Go | Subprocess only from Rust; not embeddable |
+| `python-sigstore` | Python ecosystem | N/A | Python | Not embeddable in Rust |
+
+justsign's dep count (~198) reflects the full cryptographic stack (p256, sha2, x509, rustls, reqwest-blocking) plus the PKCS#11 feature gate. This is heavier than a minimal single-algo library would be, and is the honest cost of multi-algo support plus two transport modes.
+
+The relevant comparison is against the `cosign` subprocess path: 50 MB Go binary that must be on `$PATH` vs 4.5 MB Rust binary embedded in the calling tool with no PATH requirement. For hermetic build agents and Windows CI, the dep count matters less than the question "does it build at all?"

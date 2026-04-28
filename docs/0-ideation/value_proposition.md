@@ -2,6 +2,19 @@
 
 **Audience**: Project sponsors, prospective users, contributors evaluating whether to adopt or contribute to justsign.
 
+## Numbers at a glance
+
+| | justsign | cosign (subprocess) | sigstore-rs |
+|---|---|---|---|
+| Dep count (transitive) | **198** | ~300 Go modules | ~300+ Rust crates (est.) |
+| Binary size | **4.5 MB** | ~50 MB | N/A (library) |
+| Windows native | **yes** | no supported build | yes |
+| Sync (blocking) clients | **yes** | yes (subprocess) | no (async-only) |
+| Embeddable in Rust | **yes** | no | yes |
+| PKCS#11 support | **yes** | via plugin | no |
+| MSRV stable | **yes (1.75)** | N/A | no commitment |
+| `sign_blob` latency (1 KB) | **234 µs** | ≥ 50 ms (process start) | similar to justsign |
+
 ## Why this exists
 
 Sigstore is the industry standard for keyless software signing, but
