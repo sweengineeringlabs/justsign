@@ -1,0 +1,44 @@
+# Benchmark cases for the justsign workspace.
+#
+# Add entries here to bench additional runners or payload sizes.
+# `runner` must match a compiled-in feature flag (e.g. "justsign", "cosign").
+# All fields beyond `runner` and `label` are forwarded as params to
+# the runner — see each runner's source for required keys.
+
+# ── justsign (in-process, pure Rust) ────────────────────────────────────────
+
+[[case]]
+runner        = "justsign"
+label         = "justsign/1kb"
+payload_bytes = 1024
+
+[[case]]
+runner        = "justsign"
+label         = "justsign/64kb"
+payload_bytes = 65536
+
+[[case]]
+runner        = "justsign"
+label         = "justsign/1mb"
+payload_bytes = 1048576
+
+# ── cosign (subprocess, Linux/WSL2 only) ────────────────────────────────────
+# Enable with: --features cosign
+# Requires cosign 2.x on PATH. Not available on Windows without WSL2.
+# Only sign() is benchmarked — verify requires Rekor bundle round-trip
+# which is not suitable for an offline Criterion loop.
+
+[[case]]
+runner        = "cosign"
+label         = "cosign/1kb"
+payload_bytes = 1024
+
+[[case]]
+runner        = "cosign"
+label         = "cosign/64kb"
+payload_bytes = 65536
+
+[[case]]
+runner        = "cosign"
+label         = "cosign/1mb"
+payload_bytes = 1048576

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["spec", "fulcio", "tuf", "rekor", "sign", "cli"]
+members = ["spec", "fulcio", "tuf", "rekor", "sign", "cli", "bench"]
 # `fuzz/` is a separate cargo-fuzz package — explicitly excluded so
 # `cargo build --workspace` doesn't try to build it. cargo-fuzz
 # requires nightly + libfuzzer-sys instrumentation, which we keep
