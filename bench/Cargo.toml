@@ -22,6 +22,7 @@ p256        = { version = "0.13", default-features = false, features = ["std", "
 rand_chacha = { version = "0.3", default-features = false, optional = true }
 rand_core   = { version = "0.6", default-features = false, optional = true }
 tempfile    = { version = "3", optional = true }
+dirs        = "6"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

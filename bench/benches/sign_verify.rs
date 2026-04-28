@@ -11,8 +11,6 @@
 //!   cargo bench -p swe_justsign_bench --bench sign_verify -- "sign_blob/justsign/1kb"
 //!   cargo bench -p swe_justsign_bench --bench sign_verify -- "verify_blob/justsign/1mb"
 
-use std::path::Path;
-
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
 use swe_justsign_bench::load_runners;
@@ -45,8 +43,12 @@ fn bench_verify(c: &mut Criterion) {
 
 criterion_group! {
     name    = benches;
-    config  = Criterion::default()
-        .output_directory(Path::new("../docs/5-testing/bench_results"));
+    config  = {
+        let out = dirs::data_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from(".local/share"))
+            .join("justsign/bench_results");
+        Criterion::default().output_directory(&out)
+    };
     targets = bench_sign, bench_verify
 }
 criterion_main!(benches);
