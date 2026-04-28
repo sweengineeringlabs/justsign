@@ -115,7 +115,7 @@ tr:nth-child(even) td{background:var(--surface)}
     <nav id="nav">
       <a href="#results">Results</a>
       <a href="#what-measured">What is measured</a>
-      <a href="#headline">The 230× gap</a>
+      <a href="#headline">The ~12,000× gap</a>
       <a href="#sign-vs-verify">Sign vs verify</a>
       <a href="#throughput">Throughput scaling</a>
       <a href="#keyless">Keyless caveat</a>
@@ -125,52 +125,50 @@ tr:nth-child(even) td{background:var(--surface)}
   </div>
   <div class="key-numbers">
     <h2>Key numbers</h2>
-    <div class="kn-item"><span>sign_blob (1 KB)</span><span class="kn-val">215 µs</span></div>
-    <div class="kn-item"><span>cosign subprocess</span><span class="kn-val">≥ 50 ms</span></div>
-    <div class="kn-item"><span>Speedup</span><span class="kn-val">230×+</span></div>
-    <div class="kn-item"><span>1 000 artifacts</span><span class="kn-val">215 ms</span></div>
-    <div class="kn-item"><span>verify (1 MB)</span><span class="kn-val">601 MiB/s</span></div>
+    <div class="kn-item"><span>sign_blob (1 KB)</span><span class="kn-val">312 µs</span></div>
+    <div class="kn-item"><span>cosign (1 KB)</span><span class="kn-val">3,750 ms</span></div>
+    <div class="kn-item"><span>Speedup</span><span class="kn-val">~12,000×</span></div>
+    <div class="kn-item"><span>1 000 artifacts</span><span class="kn-val">312 ms</span></div>
+    <div class="kn-item"><span>verify (1 MB)</span><span class="kn-val">683 MiB/s</span></div>
   </div>
   <button class="theme-btn" onclick="toggleTheme()">Toggle light/dark</button>
 </aside>
 
 <main>
   <section class="hero">
-    <h1>justsign: 215 µs signing vs 50 ms cosign subprocess</h1>
-    <p class="subtitle">Pure-Rust in-process Sigstore signing. No Go binary, no subprocess, no startup tax. Here is what the numbers actually mean.</p>
+    <h1>justsign: 312 µs signing vs 3,750 ms cosign subprocess</h1>
+    <p class="subtitle">Pure-Rust in-process Sigstore signing. No Go binary, no subprocess, no scrypt-per-call tax. Here is what the numbers actually mean.</p>
 
     <div class="stat-cards">
-      <div class="card"><div class="card-val">215 µs</div><div class="card-sub">sign_blob, 1 KB, P-256</div></div>
-      <div class="card"><div class="card-val">230×+</div><div class="card-sub">vs cosign subprocess</div></div>
-      <div class="card"><div class="card-val">215 ms</div><div class="card-sub">1 000 artifacts (justsign)</div></div>
-      <div class="card"><div class="card-val">50 s+</div><div class="card-sub">1 000 artifacts (cosign)</div></div>
-      <div class="card"><div class="card-val">601 MiB/s</div><div class="card-sub">verify_blob, 1 MB</div></div>
+      <div class="card"><div class="card-val">312 µs</div><div class="card-sub">sign_blob, 1 KB, P-256</div></div>
+      <div class="card"><div class="card-val">~12,000×</div><div class="card-sub">vs cosign subprocess</div></div>
+      <div class="card"><div class="card-val">312 ms</div><div class="card-sub">1 000 artifacts (justsign)</div></div>
+      <div class="card"><div class="card-val">62 min</div><div class="card-sub">1 000 artifacts (cosign)</div></div>
+      <div class="card"><div class="card-val">683 MiB/s</div><div class="card-sub">verify_blob, 1 MB</div></div>
     </div>
   </section>
 
   <section id="results">
     <h2>Results</h2>
-    <p>Measured on Windows 11 x86-64, Criterion 0.5, 100 samples, 3 s warmup, release profile. Pure in-process — no Fulcio, no Rekor, no network. Seeded RNG (<code>ChaCha20Rng::from_seed([0x42u8; 32])</code>) for deterministic, reproducible keypairs.</p>
+    <p>Measured on Ubuntu 24.04 / WSL2 x86-64, Criterion 0.5, 100 samples, 3 s warmup, release profile. Pure in-process — no Fulcio, no Rekor, no network. Seeded RNG (<code>ChaCha20Rng::from_seed([0x42u8; 32])</code>) for deterministic, reproducible keypairs. cosign v3.0.6.</p>
 
     <h3>sign_blob — P-256, static key, no Rekor</h3>
     <p>Measures: DSSE PAE encoding + P-256 ECDSA sign + Sigstore Bundle v0.3 JSON serialization.</p>
     <table>
       <tr><th>Payload</th><th>Mean time</th><th>Throughput</th></tr>
-      <tr><td>1 KB</td><td><strong>215 µs</strong></td><td>4.54 MiB/s</td></tr>
-      <tr><td>64 KB</td><td><strong>254 µs</strong></td><td>245.7 MiB/s</td></tr>
-      <tr><td>1 MB</td><td><strong>2.13 ms</strong></td><td>468.7 MiB/s</td></tr>
+      <tr><td>1 KB</td><td><strong>312 µs</strong></td><td>3.12 MiB/s</td></tr>
+      <tr><td>64 KB</td><td><strong>415 µs</strong></td><td>150.8 MiB/s</td></tr>
+      <tr><td>1 MB</td><td><strong>2.61 ms</strong></td><td>383 MiB/s</td></tr>
     </table>
 
     <h3>verify_blob — P-256, static key, no Rekor</h3>
     <p>Measures: DSSE PAE re-derivation + P-256 ECDSA verify + bundle JSON access.</p>
     <table>
       <tr><th>Payload</th><th>Mean time</th><th>Throughput</th></tr>
-      <tr><td>1 KB</td><td><strong>379 µs</strong></td><td>2.58 MiB/s</td></tr>
-      <tr><td>64 KB</td><td><strong>428 µs</strong></td><td>146.2 MiB/s</td></tr>
-      <tr><td>1 MB</td><td><strong>1.66 ms</strong></td><td>600.8 MiB/s</td></tr>
+      <tr><td>1 KB</td><td><strong>466 µs</strong></td><td>2.09 MiB/s</td></tr>
+      <tr><td>64 KB</td><td><strong>487 µs</strong></td><td>128.3 MiB/s</td></tr>
+      <tr><td>1 MB</td><td><strong>1.46 ms</strong></td><td>683 MiB/s</td></tr>
     </table>
-
-    <p>High variance (up to 10% outliers) is expected on a Windows dev machine. Re-run on an idle Linux host for tighter confidence intervals.</p>
   </section>
 
   <section id="what-measured">
@@ -193,78 +191,72 @@ c.bench_function("sign_blob/1kb", |b| {
   </section>
 
   <section id="headline">
-    <h2>The 230× gap</h2>
-    <p><code>sign_blob</code> at 215 µs vs <code>cosign sign-blob</code> at ≥ 50 ms. The gap is not algorithmic — both use P-256 ECDSA on the same DSSE-encoded bytes. The gap is architectural.</p>
+    <h2>The ~12,000× gap</h2>
+    <p><code>sign_blob</code> at 312 µs vs <code>cosign sign-blob</code> at 3,750 ms. The gap is not algorithmic — both use P-256 ECDSA on the same DSSE-encoded bytes. The gap is structural.</p>
 
     <div class="bar-chart">
       <div class="bar-row">
-        <div class="bar-label">Go runtime startup</div>
-        <div class="bar-track"><div class="bar-fill subprocess" style="width:30%">~15 ms</div></div>
+        <div class="bar-label">scrypt key decrypt</div>
+        <div class="bar-track"><div class="bar-fill subprocess" style="width:91%">~3,400 ms</div></div>
       </div>
       <div class="bar-row">
-        <div class="bar-label">Dynamic linker + stdlib</div>
-        <div class="bar-track"><div class="bar-fill subprocess" style="width:14%">~7 ms</div></div>
+        <div class="bar-label">Go runtime + stdlib</div>
+        <div class="bar-track"><div class="bar-fill subprocess" style="width:3%">~100 ms</div></div>
       </div>
       <div class="bar-row">
-        <div class="bar-label">Flag parse + CLI dispatch</div>
-        <div class="bar-track"><div class="bar-fill subprocess" style="width:6%">~3 ms</div></div>
-      </div>
-      <div class="bar-row">
-        <div class="bar-label">Key file read + parse</div>
-        <div class="bar-track"><div class="bar-fill subprocess" style="width:5%">~2.5 ms</div></div>
-      </div>
-      <div class="bar-row">
-        <div class="bar-label">Other subprocess overhead</div>
-        <div class="bar-track"><div class="bar-fill subprocess" style="width:43%">~21.5 ms</div></div>
+        <div class="bar-label">Flag parse + file I/O</div>
+        <div class="bar-track"><div class="bar-fill subprocess" style="width:0.3%">~10 ms</div></div>
       </div>
       <div class="bar-row">
         <div class="bar-label">P-256 sign + DSSE + JSON</div>
-        <div class="bar-track"><div class="bar-fill crypto" style="width:0.5%">0.2 ms</div></div>
+        <div class="bar-track"><div class="bar-fill crypto" style="width:0.01%">0.3 ms</div></div>
       </div>
     </div>
 
     <div class="callout green">
-      Only ~0.4% of cosign's time is the cryptographic operation. The other 99.6% is subprocess overhead that justsign never pays.
+      ~91% of cosign's time is scrypt key decryption — run on every invocation because cosign reads the key file from disk each call. justsign holds the parsed key in memory.
     </div>
 
     <table>
-      <tr><th>Category</th><th>cosign pays</th><th>justsign pays?</th></tr>
-      <tr><td>Go runtime startup</td><td>~10–20 ms</td><td>No</td></tr>
-      <tr><td>Dynamic linker + stdlib init</td><td>~5–10 ms</td><td>No</td></tr>
-      <tr><td>Flag parsing + CLI dispatch</td><td>~1–5 ms</td><td>No</td></tr>
-      <tr><td>Key file read + parse</td><td>~1–5 ms</td><td>No (key in memory)</td></tr>
-      <tr><td><strong>P-256 sign + DSSE + JSON</strong></td><td><strong>~0.2 ms</strong></td><td><strong>Yes — 215 µs</strong></td></tr>
+      <tr><th>Category</th><th>cosign pays per call</th><th>justsign pays?</th></tr>
+      <tr><td>Go runtime startup + stdlib init</td><td>~50–100 ms</td><td>No</td></tr>
+      <tr><td><strong>scrypt key decryption (N=65536)</strong></td><td><strong>~3,400 ms</strong></td><td><strong>No (key in memory)</strong></td></tr>
+      <tr><td>Key file read + parse</td><td>~5 ms</td><td>No</td></tr>
+      <tr><td>Flag parsing + CLI dispatch</td><td>~5 ms</td><td>No</td></tr>
+      <tr><td><strong>P-256 sign + DSSE + JSON</strong></td><td><strong>~0.3 ms</strong></td><td><strong>Yes — 312 µs</strong></td></tr>
     </table>
 
-    <p>For a release pipeline signing 1 000 artifacts, the difference is <strong>215 ms</strong> (justsign) vs <strong>50 s+</strong> (cosign subprocess) for the signing loop alone. At 10 000 artifacts: 2.15 s vs 8+ minutes.</p>
+    <p>cosign v3 generates keys in <code>ENCRYPTED SIGSTORE PRIVATE KEY</code> format using <code>scrypt(N=65536, r=8, p=1)</code>. That KDF runs in full on every <code>sign-blob</code> call, even with an empty password. It is not negligence — it is correct key-at-rest security. The problem is it is the wrong design for a signing loop.</p>
+
+    <p>For a release pipeline signing 1,000 artifacts: <strong>312 ms</strong> (justsign) vs <strong>~62 minutes</strong> (cosign subprocess) for the signing loop alone.</p>
   </section>
 
   <section id="sign-vs-verify">
     <h2>Why verify is slower than sign for small payloads</h2>
-    <p>At 1 KB, <code>sign_blob</code> takes 215 µs but <code>verify_blob</code> takes 379 µs — verify is <strong>1.76× slower</strong> for the same payload size.</p>
+    <p>At 1 KB, <code>sign_blob</code> takes 312 µs but <code>verify_blob</code> takes 466 µs — verify is <strong>1.49× slower</strong> for the same payload size.</p>
 
     <div class="bar-chart">
       <div class="bar-row">
         <div class="bar-label">sign (1 KB)</div>
-        <div class="bar-track"><div class="bar-fill sign" style="width:10%">215 µs</div></div>
+        <div class="bar-track"><div class="bar-fill sign" style="width:12%">312 µs</div></div>
       </div>
       <div class="bar-row">
         <div class="bar-label">verify (1 KB)</div>
-        <div class="bar-track"><div class="bar-fill verify" style="width:18%">379 µs</div></div>
+        <div class="bar-track"><div class="bar-fill verify" style="width:18%">466 µs</div></div>
       </div>
       <div class="bar-row">
         <div class="bar-label">sign (1 MB)</div>
-        <div class="bar-track"><div class="bar-fill sign" style="width:100%">2.13 ms</div></div>
+        <div class="bar-track"><div class="bar-fill sign" style="width:100%">2.61 ms</div></div>
       </div>
       <div class="bar-row">
         <div class="bar-label">verify (1 MB)</div>
-        <div class="bar-track"><div class="bar-fill verify" style="width:78%">1.66 ms</div></div>
+        <div class="bar-track"><div class="bar-fill verify" style="width:56%">1.46 ms</div></div>
       </div>
     </div>
 
     <p>P-256 ECDSA verification requires <strong>two</strong> scalar multiplications (one for the public key, one for the signature point). Signing requires <strong>one</strong>. For small payloads, SHA-256 hashing is negligible and the scalar multiplications dominate — verify loses.</p>
 
-    <p>At 1 MB the order reverses: SHA-256 hashing of the PAE bytes (proportional to payload) dominates and the verify path has cheaper post-hash dispatch. Verify at 1 MB reaches 600.8 MiB/s vs sign's 468.7 MiB/s.</p>
+    <p>At 1 MB the order reverses: SHA-256 hashing of the PAE bytes (proportional to payload) dominates and the verify path has cheaper post-hash dispatch. Verify at 1 MB reaches 683 MiB/s vs sign's 383 MiB/s.</p>
 
     <p>This is not a justsign implementation choice — it is a property of ECDSA arithmetic on any P-256 implementation.</p>
   </section>
@@ -275,9 +267,9 @@ c.bench_function("sign_blob/1kb", |b| {
 
     <table>
       <tr><th>Payload</th><th>sign_blob</th><th>verify_blob</th><th>Bottleneck</th></tr>
-      <tr><td>1 KB</td><td>215 µs / 4.54 MiB/s</td><td>379 µs / 2.58 MiB/s</td><td>Scalar multiplications</td></tr>
-      <tr><td>64 KB</td><td>254 µs / 245.7 MiB/s</td><td>428 µs / 146.2 MiB/s</td><td>SHA-256 + scalar</td></tr>
-      <tr><td>1 MB</td><td>2.13 ms / 468.7 MiB/s</td><td>1.66 ms / 600.8 MiB/s</td><td>SHA-256 (SHA-NI)</td></tr>
+      <tr><td>1 KB</td><td>312 µs / 3.12 MiB/s</td><td>466 µs / 2.09 MiB/s</td><td>Scalar multiplications</td></tr>
+      <tr><td>64 KB</td><td>415 µs / 150.8 MiB/s</td><td>487 µs / 128.3 MiB/s</td><td>SHA-256 + scalar</td></tr>
+      <tr><td>1 MB</td><td>2.61 ms / 383 MiB/s</td><td>1.46 ms / 683 MiB/s</td><td>SHA-256 (SHA-NI)</td></tr>
     </table>
   </section>
 
@@ -297,13 +289,18 @@ c.bench_function("sign_blob/1kb", |b| {
   </section>
 
   <section id="comparison">
-    <h2>vs cosign</h2>
-    <p>Run <code>scripts/bench/compare_cosign.sh</code> on Linux or WSL2 (cosign requires Linux for the static-key flow). The script generates a throwaway P-256 key and times <code>cosign sign-blob --key</code> for each payload size.</p>
+    <h2>vs cosign — measured (WSL2, cosign v3.0.6)</h2>
+    <p>Both runners use the same Criterion harness, 100 samples, 3 s warmup. P-256 static key, no Rekor. cosign verify is not benched — it requires a pre-written bundle file, coupling the two runs.</p>
 
-    <p>The cosign numbers include Go subprocess startup (~50 ms floor). The comparison targets the common-ancestor case — P-256 static key — where both tools perform the same cryptographic work. The only difference is in-process vs subprocess.</p>
+    <table>
+      <tr><th>Payload</th><th>justsign (in-process)</th><th>cosign (subprocess)</th><th>advantage</th></tr>
+      <tr><td>1 KB</td><td><strong>312 µs</strong></td><td>3,750 ms</td><td>~12,000×</td></tr>
+      <tr><td>64 KB</td><td><strong>415 µs</strong></td><td>4,181 ms</td><td>~10,000×</td></tr>
+      <tr><td>1 MB</td><td><strong>2.61 ms</strong></td><td>3,800 ms</td><td>~1,455×</td></tr>
+    </table>
 
     <div class="callout">
-      cosign is not a bad tool. It is a subprocess designed for interactive use, not for embedding in signing loops. The 50 ms floor is not negligence — it is a property of what a Go subprocess is. justsign is the library answer to the same problem.
+      cosign is not a bad tool. It is designed for interactive use and correct key-at-rest security (scrypt N=65536). The problem is that security posture is applied on every invocation. justsign is the library answer: parse the key once, sign in a loop. The cryptographic work is identical — the difference is purely architectural.
     </div>
   </section>
 
@@ -323,8 +320,11 @@ c.bench_function("sign_blob/1kb", |b| {
     <pre><code>git clone git@github.com:sweengineeringlabs/justsign.git
 cd justsign</code></pre>
 
-    <p><strong>2. Run the benchmark</strong></p>
+    <p><strong>2. Run the benchmark (justsign only)</strong></p>
     <pre><code>cargo bench -p swe_justsign_bench --bench sign_verify</code></pre>
+
+    <p><strong>3. Run with cosign comparison (Linux/WSL2)</strong></p>
+    <pre><code>cargo bench -p swe_justsign_bench --bench sign_verify --features cosign</code></pre>
 
     <p><strong>3. Run a single case</strong></p>
     <pre><code>cargo bench -p swe_justsign_bench --bench sign_verify -- "sign_blob/1kb"

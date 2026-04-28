@@ -2,11 +2,11 @@
 
 **Audience**: Contributors, adopters evaluating signing pipeline latency.
 
-> **TLDR**: `sign_blob` takes **215 µs** for a 1 KB payload in-process. `cosign sign-blob` (subprocess) costs ≥ 50 ms just for Go binary startup — a **230×+ gap** for small-payload signing loops. Run `cargo bench -p swe_justsign_bench --bench sign_verify` to reproduce. Compare against `cosign` via `scripts/bench/compare_cosign.sh`.
+> **TLDR**: `sign_blob` takes **312 µs** for a 1 KB payload in-process. `cosign sign-blob` costs **3,750 ms** per call — a **~12,000× gap** driven by scrypt key decryption on every invocation plus Go subprocess overhead. Run `cargo bench -p swe_justsign_bench --bench sign_verify --features cosign` on Linux/WSL2 to reproduce.
 
 ## Bench architecture
 
-The benchmark lives in `bench/benches/sign_verify.rs`. It exercises `sign_blob` and `verify_blob` as pure in-process cryptographic operations — no Fulcio, no Rekor, no network.
+The benchmark lives in `bench/benches/sign_verify.rs`. It exercises `sign_blob` and `verify_blob` as pure in-process cryptographic operations — no Fulcio, no Rekor, no network. The `cosign` feature adds a `CosignRunner` that invokes `cosign sign-blob` as a subprocess for direct comparison.
 
 ### Signer SPI
 
@@ -50,11 +50,12 @@ The timing window covers:
 | Field | Value |
 |---|---|
 | Date | 2026-04-28 |
-| Host | Windows 11, x86-64 |
+| Host | Ubuntu 24.04 (WSL2), x86-64 |
 | Toolchain | stable (release profile) |
 | Bench harness | Criterion 0.5 |
 | Samples | 100 per case |
 | Warmup | 3 s |
+| cosign version | v3.0.6 |
 
 ## Results — `sign_blob` (P-256, static key, no Rekor)
 
@@ -62,11 +63,9 @@ Measures: DSSE PAE encoding + P-256 ECDSA sign + bundle JSON serialization.
 
 | Payload | Mean time | Throughput |
 |---|---|---|
-| 1 KB | **215 µs** | 4.54 MiB/s |
-| 64 KB | **254 µs** | 245.7 MiB/s |
-| 1 MB | **2.13 ms** | 468.7 MiB/s |
-
-High variance (up to 10% outliers) is expected on a Windows dev machine. Re-run on an idle Linux host for tighter confidence intervals.
+| 1 KB | **312 µs** | 3.12 MiB/s |
+| 64 KB | **415 µs** | 150.8 MiB/s |
+| 1 MB | **2.61 ms** | 383 MiB/s |
 
 ## Results — `verify_blob` (P-256, static key, no Rekor)
 
@@ -74,47 +73,49 @@ Measures: DSSE PAE re-derivation + P-256 ECDSA verify + bundle JSON access.
 
 | Payload | Mean time | Throughput |
 |---|---|---|
-| 1 KB | **379 µs** | 2.58 MiB/s |
-| 64 KB | **428 µs** | 146.2 MiB/s |
-| 1 MB | **1.66 ms** | 600.8 MiB/s |
+| 1 KB | **466 µs** | 2.09 MiB/s |
+| 64 KB | **487 µs** | 128.3 MiB/s |
+| 1 MB | **1.46 ms** | 683 MiB/s |
+
+## Comparison — sign: justsign vs cosign
+
+cosign has no offline verify bench — `cosign verify-blob` for a static key requires the bundle written by a prior `sign-blob` call, coupling the two runs. Only sign is compared here.
+
+| Payload | justsign (in-process) | cosign (subprocess) | advantage |
+|---|---|---|---|
+| 1 KB | **312 µs** | 3,750 ms | **~12,000×** |
+| 64 KB | **415 µs** | 4,181 ms | **~10,000×** |
+| 1 MB | **2.61 ms** | 3,800 ms | **~1,455×** |
 
 ## What the numbers mean
 
-### The 230× headline
+### The ~12,000× gap
 
-`sign_blob` at 215 µs vs `cosign sign-blob` at ≥ 50 ms. For a release pipeline signing 1 000 artifacts, that's **215 ms** (justsign, embedded) vs **50 s+** (cosign subprocess) for the signing loop alone.
+cosign's ~3.5–4 s floor breaks down into two structural costs:
 
-The gap is not algorithmic — both use P-256 ECDSA on the same data. The gap is architectural:
-
-| Category | cosign pays | justsign pays? |
+| Category | cosign pays per call | justsign pays? |
 |---|---|---|
-| Go runtime startup | ~10–20 ms | No |
-| Dynamic linker + stdlib init | ~5–10 ms | No |
-| Flag parsing + CLI dispatch | ~1–5 ms | No |
-| Key file read + parse | ~1–5 ms | No (key held in memory) |
-| **Actual P-256 sign + DSSE + serialization** | **~0.2 ms** | **Yes — 215 µs** |
+| Go runtime startup + stdlib init | ~50–100 ms | No (in-process) |
+| **scrypt key decryption** (`N=65536`) | **~3,400 ms** | **No (key held in memory)** |
+| Key file read + parse | ~5 ms | No |
+| Flag parsing + CLI dispatch | ~5 ms | No |
+| **Actual P-256 sign + DSSE + serialization** | **~0.3 ms** | **Yes — 312 µs** |
 
-Only ~0.4% of cosign's time is the cryptographic operation. The rest is subprocess overhead that justsign never pays — the same structural dynamic as any in-process library vs subprocess comparison.
+The dominant cost is **scrypt key decryption on every invocation**. cosign v3 generates keys in `ENCRYPTED SIGSTORE PRIVATE KEY` format using `scrypt(N=65536, r=8, p=1)` — deliberately expensive for key storage security. The problem is it runs the full KDF on every `sign-blob` call, even with an empty password. justsign parses and holds the key in memory once at process startup; in a batch pipeline that cost is paid once not per-artifact.
 
-The caveat: the keyless path (`sign_blob_keyless`) adds one Fulcio HTTPS round-trip (~100–300 ms) and one Rekor submission (~100–200 ms). These are network operations and are identical in cost whether you use justsign or cosign. The 200× advantage applies to the signing operation itself, which dominates in high-throughput batch pipelines.
+For a release pipeline signing 1,000 artifacts: **312 ms** (justsign) vs **~3,750 s / 62 minutes** (cosign subprocess) for the signing loop alone.
 
 ### Why verify is slower than sign for small payloads
 
-At 1 KB, `sign_blob` takes 215 µs but `verify_blob` takes 379 µs — verify is **1.76× slower** for the same payload.
+At 1 KB, `sign_blob` takes 312 µs but `verify_blob` takes 466 µs — verify is **1.49× slower** for the same payload.
 
-P-256 ECDSA verification requires **two** scalar multiplications (one for the public key, one for the signature point). Signing requires **one**. For small payloads the SHA-256 hash is negligible and the scalar multiplications dominate. This is not a justsign implementation choice — it is a property of ECDSA arithmetic.
+P-256 ECDSA verification requires **two** scalar multiplications (one for the public key, one for the signature point). Signing requires **one**. For small payloads the SHA-256 hash is negligible and the scalar multiplications dominate. This is a property of ECDSA arithmetic, not a justsign implementation choice.
 
-At 1 MB the order reverses: verify reaches 600.8 MiB/s vs sign's 468.7 MiB/s. SHA-256 hashing of the PAE bytes (proportional to payload) dominates, and the verify path has a cheaper post-hash dispatch.
+At 1 MB the order reverses: verify reaches 683 MiB/s vs sign's 383 MiB/s. SHA-256 hashing of the PAE bytes dominates, and the verify path has a cheaper post-hash dispatch.
 
 ### Throughput at large payloads
 
-At 1 MB, both paths reach 468–600 MiB/s. The bottleneck at this scale is SHA-256 throughput — the PAE encoding hashes the full payload. This is an x86 SHA-NI hardware ceiling, not a justsign implementation ceiling. Any P-256 DSSE implementation using the same digest hits the same wall.
-
-## Market comparison
-
-Run `scripts/bench/compare_cosign.sh` on Linux or WSL2 (cosign requires Linux for the static-key flow). The script generates a throwaway P-256 key and times `cosign sign-blob --key` for the same payload sizes.
-
-The cosign numbers include Go subprocess startup (~50 ms). The script notes this explicitly. The comparison targets the common-ancestor case (P-256 static key) where both tools perform the same cryptographic work — the only difference is in-process vs subprocess.
+At 1 MB, sign reaches 383 MiB/s and verify 683 MiB/s. The bottleneck is SHA-256 throughput — the PAE encoding hashes the full payload. This is an x86 SHA-NI ceiling, not a justsign implementation ceiling.
 
 ## Reproducing
 
@@ -123,7 +124,7 @@ The cosign numbers include Go subprocess startup (~50 ms). The script notes this
 | Requirement | Notes |
 |---|---|
 | Rust stable toolchain | required |
-| `cosign` (comparison only) | Linux/WSL2; GitHub release or `brew install cosign` |
+| cosign 2.x+ (comparison only) | Linux/WSL2 — `~/.local/bin/cosign` or `brew install cosign` |
 
 ### Steps
 
@@ -134,23 +135,23 @@ git clone git@github.com:sweengineeringlabs/justsign.git
 cd justsign
 ```
 
-**2. Run the benchmark**
+**2. Run the benchmark (justsign only)**
 
 ```sh
 cargo bench -p swe_justsign_bench --bench sign_verify
 ```
 
-**3. Run a single case**
+**3. Run with cosign comparison (Linux/WSL2)**
 
 ```sh
-cargo bench -p swe_justsign_bench --bench sign_verify -- "sign_blob/1kb"
-cargo bench -p swe_justsign_bench --bench sign_verify -- "verify_blob/1mb"
+cargo bench -p swe_justsign_bench --bench sign_verify --features cosign
 ```
 
-**4. Compare against cosign (WSL2/Linux)**
+**4. Run a single case**
 
 ```sh
-bash scripts/bench/compare_cosign.sh
+cargo bench -p swe_justsign_bench --bench sign_verify -- "sign_blob/justsign/1kb"
+cargo bench -p swe_justsign_bench --bench sign_verify -- "verify_blob/justsign/1mb"
 ```
 
 ### Output

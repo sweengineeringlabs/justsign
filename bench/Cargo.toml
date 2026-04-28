@@ -12,7 +12,7 @@ rust-version.workspace = true
 [features]
 default  = ["justsign"]
 justsign = ["dep:sign", "dep:p256", "dep:rand_chacha", "dep:rand_core"]
-cosign   = ["dep:tempfile", "dep:p256", "dep:rand_chacha", "dep:rand_core"]
+cosign   = ["dep:tempfile"]
 
 [dependencies]
 serde       = { version = "1", features = ["derive"] }
