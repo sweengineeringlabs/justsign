@@ -2,11 +2,11 @@
 
 **Audience**: Contributors, adopters evaluating signing pipeline latency.
 
-> **TLDR**: `sign_blob` takes **234 µs** for a 1 KB payload in-process. `cosign sign-blob` (subprocess) costs ≥ 50 ms just for Go binary startup — a **200×+ gap** for small-payload signing loops. Run `cargo bench -p swe_justsign_sign --bench sign_verify` to reproduce. Compare against `cosign` via `scripts/bench/compare_cosign.sh`.
+> **TLDR**: `sign_blob` takes **215 µs** for a 1 KB payload in-process. `cosign sign-blob` (subprocess) costs ≥ 50 ms just for Go binary startup — a **230×+ gap** for small-payload signing loops. Run `cargo bench -p swe_justsign_bench --bench sign_verify` to reproduce. Compare against `cosign` via `scripts/bench/compare_cosign.sh`.
 
 ## Bench architecture
 
-The benchmark lives in `sign/benches/sign_verify.rs`. It exercises `sign_blob` and `verify_blob` as pure in-process cryptographic operations — no Fulcio, no Rekor, no network.
+The benchmark lives in `bench/benches/sign_verify.rs`. It exercises `sign_blob` and `verify_blob` as pure in-process cryptographic operations — no Fulcio, no Rekor, no network.
 
 ### Signer SPI
 
@@ -62,9 +62,9 @@ Measures: DSSE PAE encoding + P-256 ECDSA sign + bundle JSON serialization.
 
 | Payload | Mean time | Throughput |
 |---|---|---|
-| 1 KB | **234 µs** | 4.2 MiB/s |
-| 64 KB | **905 µs** | 67.4 MiB/s |
-| 1 MB | **4.94 ms** | 202 MiB/s |
+| 1 KB | **215 µs** | 4.54 MiB/s |
+| 64 KB | **254 µs** | 245.7 MiB/s |
+| 1 MB | **2.13 ms** | 468.7 MiB/s |
 
 High variance (up to 10% outliers) is expected on a Windows dev machine. Re-run on an idle Linux host for tighter confidence intervals.
 
@@ -74,15 +74,15 @@ Measures: DSSE PAE re-derivation + P-256 ECDSA verify + bundle JSON access.
 
 | Payload | Mean time | Throughput |
 |---|---|---|
-| 1 KB | **1.07 ms** | 0.93 MiB/s |
-| 64 KB | **784 µs** | 77.9 MiB/s |
-| 1 MB | **2.30 ms** | 434 MiB/s |
+| 1 KB | **379 µs** | 2.58 MiB/s |
+| 64 KB | **428 µs** | 146.2 MiB/s |
+| 1 MB | **1.66 ms** | 600.8 MiB/s |
 
 ## What the numbers mean
 
-### The 200× headline
+### The 230× headline
 
-`sign_blob` at 234 µs vs `cosign sign-blob` at ≥ 50 ms. For a release pipeline signing 1 000 artifacts, that's **234 ms** (justsign, embedded) vs **50 s+** (cosign subprocess) for the signing loop alone.
+`sign_blob` at 215 µs vs `cosign sign-blob` at ≥ 50 ms. For a release pipeline signing 1 000 artifacts, that's **215 ms** (justsign, embedded) vs **50 s+** (cosign subprocess) for the signing loop alone.
 
 The gap is not algorithmic — both use P-256 ECDSA on the same data. The gap is architectural:
 
@@ -92,7 +92,7 @@ The gap is not algorithmic — both use P-256 ECDSA on the same data. The gap is
 | Dynamic linker + stdlib init | ~5–10 ms | No |
 | Flag parsing + CLI dispatch | ~1–5 ms | No |
 | Key file read + parse | ~1–5 ms | No (key held in memory) |
-| **Actual P-256 sign + DSSE + serialization** | **~0.2 ms** | **Yes — 234 µs** |
+| **Actual P-256 sign + DSSE + serialization** | **~0.2 ms** | **Yes — 215 µs** |
 
 Only ~0.4% of cosign's time is the cryptographic operation. The rest is subprocess overhead that justsign never pays — the same structural dynamic as any in-process library vs subprocess comparison.
 
@@ -100,15 +100,15 @@ The caveat: the keyless path (`sign_blob_keyless`) adds one Fulcio HTTPS round-t
 
 ### Why verify is slower than sign for small payloads
 
-At 1 KB, `sign_blob` takes 234 µs but `verify_blob` takes 1.07 ms — verify is **4.6× slower** for the same payload.
+At 1 KB, `sign_blob` takes 215 µs but `verify_blob` takes 379 µs — verify is **1.76× slower** for the same payload.
 
 P-256 ECDSA verification requires **two** scalar multiplications (one for the public key, one for the signature point). Signing requires **one**. For small payloads the SHA-256 hash is negligible and the scalar multiplications dominate. This is not a justsign implementation choice — it is a property of ECDSA arithmetic.
 
-At 1 MB the order reverses: verify reaches 434 MiB/s vs sign's 202 MiB/s. SHA-256 hashing of the PAE bytes (proportional to payload) dominates, and the verify path has a cheaper post-hash dispatch.
+At 1 MB the order reverses: verify reaches 600.8 MiB/s vs sign's 468.7 MiB/s. SHA-256 hashing of the PAE bytes (proportional to payload) dominates, and the verify path has a cheaper post-hash dispatch.
 
 ### Throughput at large payloads
 
-At 1 MB, both paths reach 200–430 MiB/s. The bottleneck at this scale is SHA-256 throughput — the PAE encoding hashes the full payload. This is an x86 SHA-NI hardware ceiling, not a justsign implementation ceiling. Any P-256 DSSE implementation using the same digest hits the same wall.
+At 1 MB, both paths reach 468–600 MiB/s. The bottleneck at this scale is SHA-256 throughput — the PAE encoding hashes the full payload. This is an x86 SHA-NI hardware ceiling, not a justsign implementation ceiling. Any P-256 DSSE implementation using the same digest hits the same wall.
 
 ## Market comparison
 
@@ -137,14 +137,14 @@ cd justsign
 **2. Run the benchmark**
 
 ```sh
-cargo bench -p swe_justsign_sign --bench sign_verify
+cargo bench -p swe_justsign_bench --bench sign_verify
 ```
 
 **3. Run a single case**
 
 ```sh
-cargo bench -p swe_justsign_sign --bench sign_verify -- "sign_blob/1kb"
-cargo bench -p swe_justsign_sign --bench sign_verify -- "verify_blob/1mb"
+cargo bench -p swe_justsign_bench --bench sign_verify -- "sign_blob/1kb"
+cargo bench -p swe_justsign_bench --bench sign_verify -- "verify_blob/1mb"
 ```
 
 **4. Compare against cosign (WSL2/Linux)**
