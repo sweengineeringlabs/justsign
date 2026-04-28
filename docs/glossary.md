@@ -78,7 +78,7 @@ Alphabetised list of terms used in justsign. Acronyms include their expansion. C
 
 **MessageSignature** - The non-DSSE bundle content type: a raw signature over the payload's SHA-256 digest, plus the digest itself. The interop shape for `cosign verify-blob`. Justsign's `sign_blob_message` and `verify_blob_message` are the MessageSignature surface; default for the `sign-blob` CLI.
 
-**MSRV** - Minimum Supported Rust Version. The oldest `rustc` toolchain justsign commits to building on. Justsign's MSRV policy lives at [`docs/4-development/msrv_policy.md`](4-development/msrv_policy.md).
+**MSRV** - Minimum Supported Rust Version. The oldest `rustc` toolchain justsign commits to building on. Justsign's MSRV policy lives at [`docs/4-development/guide/msrv_policy.md`](4-development/guide/msrv_policy.md).
 
 ---
 

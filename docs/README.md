@@ -20,6 +20,8 @@ The docs are organised around a five-phase OSS-slim SDLC (`0-ideation` / `3-desi
 
 → [`0-ideation/value_proposition.md`](0-ideation/value_proposition.md) — what problem justsign solves, who it's for, where it sits in the Sigstore ecosystem, and the alternatives.
 
+→ [`0-ideation/market_research.md`](0-ideation/market_research.md) — ecosystem survey: existing Rust Sigstore clients, cosign subprocess problems, producer categories who need an embeddable pure-Rust library.
+
 ### "I'm an architect or security reviewer — show me the system"
 
 | Doc | What it covers |
@@ -38,8 +40,8 @@ The docs are organised around a five-phase OSS-slim SDLC (`0-ideation` / `3-desi
 | Doc | What it covers |
 |---|---|
 | [`4-development/developer_guide.md`](4-development/developer_guide.md) | Local clone-to-PR workflow, build commands, lint / test gates. |
-| [`4-development/msrv_policy.md`](4-development/msrv_policy.md) | When MSRV bumps and what that means for downstream. |
-| [`4-development/migration_guide.md`](4-development/migration_guide.md) | API changes between justsign releases that need caller adjustment. |
+| [`4-development/guide/msrv_policy.md`](4-development/guide/msrv_policy.md) | When MSRV bumps and what that means for downstream. |
+| [`4-development/guide/migration_guide.md`](4-development/guide/migration_guide.md) | API changes between justsign releases that need caller adjustment. |
 | [`5-testing/testing_strategy.md`](5-testing/testing_strategy.md) | Four-layer test pyramid, regression-test convention, what's NOT yet tested. |
 
 ### "I'm operating justsign in a release pipeline"

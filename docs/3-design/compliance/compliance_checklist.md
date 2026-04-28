@@ -75,7 +75,7 @@ Reference: [`../architecture.md`](../architecture.md) — "Trait SPI everywhere"
 
 ### 3.1 Public trait surface
 
-- [ ] `RekorClient`, `FulcioClient`, `Signer`, and the `*Verifier` trait surfaces in `sign` are not changed without a corresponding entry in [`../../4-development/migration_guide.md`](../../4-development/migration_guide.md).
+- [ ] `RekorClient`, `FulcioClient`, `Signer`, and the `*Verifier` trait surfaces in `sign` are not changed without a corresponding entry in [`../../4-development/guide/migration_guide.md`](../../4-development/guide/migration_guide.md).
 - [ ] Trait additions are NON-default-method-only OR have a default impl that won't break external implementors. Required-method additions are a SemVer break and tracked as such.
 - [ ] `LogEntry`, `Bundle`, `TlogEntry`, `MessageSignature`, `DsseEnvelope`, `Certificate`, `LogId` field additions are non-breaking only when they have `#[serde(default)]` for deserialise + a sensible default for in-memory construction.
 

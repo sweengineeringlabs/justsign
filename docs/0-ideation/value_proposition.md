@@ -44,11 +44,9 @@ Three alternatives exist today, each with a real but structural cost:
   TUF span-preserving signature verification — each of these has
   silent failure modes that don't surface until production).
 
-`justsign` exists because at least one consumer in the SWE Engineering
-Labs ecosystem (`justoci`, the OCI image builder + attestor) had a
-concrete need for a Rust-side Sigstore stack that did not pull
-`sigstore-rs`'s tree, did not shell out, and did not require the
-consumer to re-implement DSSE PAE.
+`justsign` exists because Rust-side consumers of Sigstore needed a
+stack that did not pull `sigstore-rs`'s tree, did not shell out, and
+did not require re-implementing DSSE PAE from scratch.
 
 ## Target users
 

@@ -7,6 +7,7 @@
 # Ideation
 
 - [Value proposition](0-ideation/value_proposition.md)
+- [Market research](0-ideation/market_research.md)
 
 # Design
 
@@ -19,8 +20,8 @@
 # Development
 
 - [Developer guide](4-development/developer_guide.md)
-- [MSRV policy](4-development/msrv_policy.md)
-- [Migration guide](4-development/migration_guide.md)
+- [MSRV policy](4-development/guide/msrv_policy.md)
+- [Migration guide](4-development/guide/migration_guide.md)
 
 # Testing
 

@@ -74,7 +74,7 @@ a tracking issue; the README will be updated as they close.
   production Fulcio + Rekor (logIndex
   [1396196448](https://search.sigstore.dev/?logIndex=1396196448)).
   Re-running it on every wire-shape change is currently a manual step
-  per [`docs/6-deployment/production_round_trip_runbook.md`](docs/6-deployment/production_round_trip_runbook.md);
+  per the production round-trip runbook in [`docs/README.md`](docs/README.md);
   CI automation lands later.
 - **No fuzzing harness yet** for the wire-decode parsers (Bundle JSON,
   DSSE envelope, in-toto Statement, TUF metadata). In flight — see
@@ -160,8 +160,9 @@ lands once, in one place.
 
 ## Documentation
 
-- [Threat model](docs/3-design/threat_model.md) — what the v0 verifier
-  guarantees, what it doesn't, and the caller-side checklist.
+See [`docs/README.md`](docs/README.md) for the full documentation hub — architecture, threat model, integration guide, developer guide, testing strategy, and deployment runbooks.
+
+See [`docs/SUMMARY.md`](docs/SUMMARY.md) for the mdbook-style reading order.
 
 ## Build
 
