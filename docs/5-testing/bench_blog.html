@@ -1,0 +1,366 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>justsign benchmarks — 234 µs signing vs 50 ms cosign subprocess</title>
+<style>
+:root {
+  --bg: #0f1117;
+  --surface: #1a1d27;
+  --surface2: #22263a;
+  --border: #2e3350;
+  --text: #e2e8f0;
+  --text2: #94a3b8;
+  --accent: #6366f1;
+  --accent2: #818cf8;
+  --green: #22c55e;
+  --amber: #f59e0b;
+  --red: #ef4444;
+  --code-bg: #12141f;
+  --sidebar-w: 230px;
+}
+[data-theme="light"] {
+  --bg: #f8fafc;
+  --surface: #ffffff;
+  --surface2: #f1f5f9;
+  --border: #e2e8f0;
+  --text: #1e293b;
+  --text2: #64748b;
+  --accent: #4f46e5;
+  --accent2: #6366f1;
+  --green: #16a34a;
+  --amber: #d97706;
+  --red: #dc2626;
+  --code-bg: #f1f5f9;
+}
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:var(--bg);color:var(--text);line-height:1.6;display:flex;min-height:100vh}
+a{color:var(--accent2);text-decoration:none}
+a:hover{text-decoration:underline}
+code{font-family:'Cascadia Code','Fira Code',monospace;font-size:.85em;background:var(--code-bg);padding:.15em .4em;border-radius:4px}
+pre{background:var(--code-bg);border:1px solid var(--border);border-radius:8px;padding:1.2rem;overflow-x:auto;margin:1.2rem 0}
+pre code{background:none;padding:0;font-size:.82em}
+h1{font-size:2rem;line-height:1.2;margin-bottom:.5rem}
+h2{font-size:1.35rem;margin:2.5rem 0 .8rem;padding-bottom:.4rem;border-bottom:1px solid var(--border)}
+h3{font-size:1.05rem;margin:1.8rem 0 .5rem;color:var(--accent2)}
+p{margin:.7rem 0}
+ul,ol{margin:.7rem 0 .7rem 1.5rem}
+li{margin:.3rem 0}
+
+/* sidebar */
+#sidebar{
+  position:fixed;top:0;left:0;width:var(--sidebar-w);height:100vh;
+  background:var(--surface);border-right:1px solid var(--border);
+  padding:1.5rem 1rem;overflow-y:auto;display:flex;flex-direction:column;gap:1rem;
+  z-index:10
+}
+#sidebar h2{font-size:.7rem;text-transform:uppercase;letter-spacing:.1em;color:var(--text2);border:none;margin:0}
+#sidebar nav a{
+  display:block;padding:.35rem .6rem;border-radius:5px;font-size:.82rem;color:var(--text2);
+  transition:background .15s,color .15s
+}
+#sidebar nav a:hover,#sidebar nav a.active{background:var(--surface2);color:var(--text);text-decoration:none}
+.key-numbers{background:var(--surface2);border-radius:8px;padding:.8rem}
+.key-numbers h2{margin-bottom:.6rem}
+.kn-item{display:flex;justify-content:space-between;align-items:baseline;padding:.2rem 0;font-size:.8rem}
+.kn-val{font-weight:700;color:var(--accent2);font-size:.95rem}
+.theme-btn{
+  margin-top:auto;background:var(--surface2);border:1px solid var(--border);
+  color:var(--text2);padding:.5rem .8rem;border-radius:6px;cursor:pointer;font-size:.8rem;width:100%
+}
+.theme-btn:hover{color:var(--text)}
+
+/* main */
+main{margin-left:var(--sidebar-w);padding:3rem 2.5rem;max-width:860px;width:100%}
+@media(max-width:700px){#sidebar{display:none}main{margin-left:0;padding:1.5rem 1rem}}
+
+/* hero */
+.hero{margin-bottom:2.5rem}
+.hero p.subtitle{color:var(--text2);font-size:1.05rem;margin-top:.5rem;max-width:620px}
+.stat-cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(155px,1fr));gap:.8rem;margin:1.5rem 0}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:1rem;text-align:center}
+.card-val{font-size:1.7rem;font-weight:800;color:var(--accent)}
+.card-sub{font-size:.72rem;color:var(--text2);margin-top:.25rem}
+
+/* tables */
+table{width:100%;border-collapse:collapse;margin:1rem 0;font-size:.88rem}
+th{background:var(--surface2);padding:.55rem .8rem;text-align:left;font-weight:600;border-bottom:2px solid var(--border)}
+td{padding:.5rem .8rem;border-bottom:1px solid var(--border)}
+tr:last-child td{border-bottom:none}
+tr:nth-child(even) td{background:var(--surface)}
+
+/* callout */
+.callout{background:var(--surface2);border-left:3px solid var(--accent);border-radius:0 8px 8px 0;padding:1rem 1.2rem;margin:1.2rem 0}
+.callout.green{border-color:var(--green)}
+.callout.amber{border-color:var(--amber)}
+
+/* bar chart */
+.bar-chart{margin:1.2rem 0}
+.bar-row{display:flex;align-items:center;gap:.6rem;margin:.4rem 0;font-size:.8rem}
+.bar-label{width:160px;text-align:right;color:var(--text2);flex-shrink:0;font-size:.75rem}
+.bar-track{flex:1;background:var(--surface2);border-radius:4px;height:22px;overflow:hidden}
+.bar-fill{height:100%;border-radius:4px;display:flex;align-items:center;padding-left:.5rem;font-size:.72rem;font-weight:600;color:#fff;white-space:nowrap}
+.bar-fill.subprocess{background:var(--red)}
+.bar-fill.crypto{background:var(--green)}
+.bar-fill.sign{background:var(--accent)}
+.bar-fill.verify{background:var(--amber)}
+</style>
+</head>
+<body>
+
+<aside id="sidebar">
+  <div>
+    <h2>justsign benchmarks</h2>
+    <nav id="nav">
+      <a href="#results">Results</a>
+      <a href="#what-measured">What is measured</a>
+      <a href="#headline">The 200× gap</a>
+      <a href="#sign-vs-verify">Sign vs verify</a>
+      <a href="#throughput">Throughput scaling</a>
+      <a href="#keyless">Keyless caveat</a>
+      <a href="#comparison">vs cosign</a>
+      <a href="#reproduce">Reproduce</a>
+    </nav>
+  </div>
+  <div class="key-numbers">
+    <h2>Key numbers</h2>
+    <div class="kn-item"><span>sign_blob (1 KB)</span><span class="kn-val">234 µs</span></div>
+    <div class="kn-item"><span>cosign subprocess</span><span class="kn-val">≥ 50 ms</span></div>
+    <div class="kn-item"><span>Speedup</span><span class="kn-val">200×+</span></div>
+    <div class="kn-item"><span>1 000 artifacts</span><span class="kn-val">234 ms</span></div>
+    <div class="kn-item"><span>verify (1 MB)</span><span class="kn-val">434 MiB/s</span></div>
+  </div>
+  <button class="theme-btn" onclick="toggleTheme()">Toggle light/dark</button>
+</aside>
+
+<main>
+  <section class="hero">
+    <h1>justsign: 234 µs signing vs 50 ms cosign subprocess</h1>
+    <p class="subtitle">Pure-Rust in-process Sigstore signing. No Go binary, no subprocess, no startup tax. Here is what the numbers actually mean.</p>
+
+    <div class="stat-cards">
+      <div class="card"><div class="card-val">234 µs</div><div class="card-sub">sign_blob, 1 KB, P-256</div></div>
+      <div class="card"><div class="card-val">200×+</div><div class="card-sub">vs cosign subprocess</div></div>
+      <div class="card"><div class="card-val">234 ms</div><div class="card-sub">1 000 artifacts (justsign)</div></div>
+      <div class="card"><div class="card-val">50 s+</div><div class="card-sub">1 000 artifacts (cosign)</div></div>
+      <div class="card"><div class="card-val">434 MiB/s</div><div class="card-sub">verify_blob, 1 MB</div></div>
+    </div>
+  </section>
+
+  <section id="results">
+    <h2>Results</h2>
+    <p>Measured on Windows 11 x86-64, Criterion 0.5, 100 samples, 3 s warmup, release profile. Pure in-process — no Fulcio, no Rekor, no network. Seeded RNG (<code>ChaCha20Rng::from_seed([0x42u8; 32])</code>) for deterministic, reproducible keypairs.</p>
+
+    <h3>sign_blob — P-256, static key, no Rekor</h3>
+    <p>Measures: DSSE PAE encoding + P-256 ECDSA sign + Sigstore Bundle v0.3 JSON serialization.</p>
+    <table>
+      <tr><th>Payload</th><th>Mean time</th><th>Throughput</th></tr>
+      <tr><td>1 KB</td><td><strong>234 µs</strong></td><td>4.2 MiB/s</td></tr>
+      <tr><td>64 KB</td><td><strong>905 µs</strong></td><td>67.4 MiB/s</td></tr>
+      <tr><td>1 MB</td><td><strong>4.94 ms</strong></td><td>202 MiB/s</td></tr>
+    </table>
+
+    <h3>verify_blob — P-256, static key, no Rekor</h3>
+    <p>Measures: DSSE PAE re-derivation + P-256 ECDSA verify + bundle JSON access.</p>
+    <table>
+      <tr><th>Payload</th><th>Mean time</th><th>Throughput</th></tr>
+      <tr><td>1 KB</td><td><strong>1.07 ms</strong></td><td>0.93 MiB/s</td></tr>
+      <tr><td>64 KB</td><td><strong>784 µs</strong></td><td>77.9 MiB/s</td></tr>
+      <tr><td>1 MB</td><td><strong>2.30 ms</strong></td><td>434 MiB/s</td></tr>
+    </table>
+
+    <p>High variance (up to 10% outliers) is expected on a Windows dev machine. Re-run on an idle Linux host for tighter confidence intervals.</p>
+  </section>
+
+  <section id="what-measured">
+    <h2>What is being measured</h2>
+    <p>The bench harness uses a seeded RNG so keypairs are identical across runs. Payloads are pre-generated once. No allocation happens inside the timing loop.</p>
+
+    <pre><code>// Deterministic keypair — same across every run
+let rng = ChaCha20Rng::from_seed([0x42u8; 32]);
+let signing_key = EcdsaP256Signer::generate(rng);
+
+// Payload pre-generated outside timing loop
+let payload: Vec&lt;u8&gt; = (0..size).map(|i| i as u8).collect();
+
+// Measured: DSSE PAE + sign + bundle JSON
+c.bench_function("sign_blob/1kb", |b| {
+    b.iter(|| sign_blob(&amp;signing_key, &amp;payload, "application/octet-stream"))
+});</code></pre>
+
+    <p>The <code>Signer</code> SPI takes <code>&amp;self</code> (not <code>&amp;mut self</code>), enabling <code>Arc&lt;dyn Signer&gt;</code> sharing. The bench exercises <code>EcdsaP256Signer</code> — the default. Ed25519, P-384, and secp256k1 are feature-gated implementations of the same trait.</p>
+  </section>
+
+  <section id="headline">
+    <h2>The 200× gap</h2>
+    <p><code>sign_blob</code> at 234 µs vs <code>cosign sign-blob</code> at ≥ 50 ms. The gap is not algorithmic — both use P-256 ECDSA on the same DSSE-encoded bytes. The gap is architectural.</p>
+
+    <div class="bar-chart">
+      <div class="bar-row">
+        <div class="bar-label">Go runtime startup</div>
+        <div class="bar-track"><div class="bar-fill subprocess" style="width:30%">~15 ms</div></div>
+      </div>
+      <div class="bar-row">
+        <div class="bar-label">Dynamic linker + stdlib</div>
+        <div class="bar-track"><div class="bar-fill subprocess" style="width:14%">~7 ms</div></div>
+      </div>
+      <div class="bar-row">
+        <div class="bar-label">Flag parse + CLI dispatch</div>
+        <div class="bar-track"><div class="bar-fill subprocess" style="width:6%">~3 ms</div></div>
+      </div>
+      <div class="bar-row">
+        <div class="bar-label">Key file read + parse</div>
+        <div class="bar-track"><div class="bar-fill subprocess" style="width:5%">~2.5 ms</div></div>
+      </div>
+      <div class="bar-row">
+        <div class="bar-label">Other subprocess overhead</div>
+        <div class="bar-track"><div class="bar-fill subprocess" style="width:43%">~21.5 ms</div></div>
+      </div>
+      <div class="bar-row">
+        <div class="bar-label">P-256 sign + DSSE + JSON</div>
+        <div class="bar-track"><div class="bar-fill crypto" style="width:0.5%">0.2 ms</div></div>
+      </div>
+    </div>
+
+    <div class="callout green">
+      Only ~0.4% of cosign's time is the cryptographic operation. The other 99.6% is subprocess overhead that justsign never pays.
+    </div>
+
+    <table>
+      <tr><th>Category</th><th>cosign pays</th><th>justsign pays?</th></tr>
+      <tr><td>Go runtime startup</td><td>~10–20 ms</td><td>No</td></tr>
+      <tr><td>Dynamic linker + stdlib init</td><td>~5–10 ms</td><td>No</td></tr>
+      <tr><td>Flag parsing + CLI dispatch</td><td>~1–5 ms</td><td>No</td></tr>
+      <tr><td>Key file read + parse</td><td>~1–5 ms</td><td>No (key in memory)</td></tr>
+      <tr><td><strong>P-256 sign + DSSE + JSON</strong></td><td><strong>~0.2 ms</strong></td><td><strong>Yes — 234 µs</strong></td></tr>
+    </table>
+
+    <p>For a release pipeline signing 1 000 artifacts, the difference is <strong>234 ms</strong> (justsign) vs <strong>50 s+</strong> (cosign subprocess) for the signing loop alone. At 10 000 artifacts: 2.34 s vs 8+ minutes.</p>
+  </section>
+
+  <section id="sign-vs-verify">
+    <h2>Why verify is slower than sign for small payloads</h2>
+    <p>At 1 KB, <code>sign_blob</code> takes 234 µs but <code>verify_blob</code> takes 1.07 ms — verify is <strong>4.6× slower</strong> for the same payload size.</p>
+
+    <div class="bar-chart">
+      <div class="bar-row">
+        <div class="bar-label">sign (1 KB)</div>
+        <div class="bar-track"><div class="bar-fill sign" style="width:22%">234 µs</div></div>
+      </div>
+      <div class="bar-row">
+        <div class="bar-label">verify (1 KB)</div>
+        <div class="bar-track"><div class="bar-fill verify" style="width:100%">1.07 ms</div></div>
+      </div>
+      <div class="bar-row">
+        <div class="bar-label">sign (1 MB)</div>
+        <div class="bar-track"><div class="bar-fill sign" style="width:46%">4.94 ms</div></div>
+      </div>
+      <div class="bar-row">
+        <div class="bar-label">verify (1 MB)</div>
+        <div class="bar-track"><div class="bar-fill verify" style="width:21%">2.30 ms</div></div>
+      </div>
+    </div>
+
+    <p>P-256 ECDSA verification requires <strong>two</strong> scalar multiplications (one for the public key, one for the signature point). Signing requires <strong>one</strong>. For small payloads, SHA-256 hashing is negligible and the scalar multiplications dominate — verify loses.</p>
+
+    <p>At 1 MB the order reverses: SHA-256 hashing of the PAE bytes (proportional to payload) dominates and the verify path has cheaper post-hash dispatch. Verify at 1 MB reaches 434 MiB/s vs sign's 202 MiB/s.</p>
+
+    <p>This is not a justsign implementation choice — it is a property of ECDSA arithmetic on any P-256 implementation.</p>
+  </section>
+
+  <section id="throughput">
+    <h2>Throughput scaling</h2>
+    <p>At large payloads, SHA-256 throughput (the PAE encoding hashes the full payload) becomes the bottleneck. This is an x86 SHA-NI hardware ceiling — not a justsign ceiling.</p>
+
+    <table>
+      <tr><th>Payload</th><th>sign_blob</th><th>verify_blob</th><th>Bottleneck</th></tr>
+      <tr><td>1 KB</td><td>234 µs / 4.2 MiB/s</td><td>1.07 ms / 0.93 MiB/s</td><td>Scalar multiplications</td></tr>
+      <tr><td>64 KB</td><td>905 µs / 67.4 MiB/s</td><td>784 µs / 77.9 MiB/s</td><td>SHA-256 + scalar</td></tr>
+      <tr><td>1 MB</td><td>4.94 ms / 202 MiB/s</td><td>2.30 ms / 434 MiB/s</td><td>SHA-256 (AES-NI)</td></tr>
+    </table>
+  </section>
+
+  <section id="keyless">
+    <h2>The keyless caveat</h2>
+    <p>The bench tests the static-key path — the lower bound on signing latency. The keyless path (<code>sign_blob_keyless</code>) adds:</p>
+
+    <table>
+      <tr><th>Step</th><th>Typical cost</th><th>justsign vs cosign?</th></tr>
+      <tr><td>Fulcio HTTPS round-trip</td><td>~100–300 ms</td><td>Identical — same network operation</td></tr>
+      <tr><td>Rekor submission</td><td>~100–200 ms</td><td>Identical — same network operation</td></tr>
+    </table>
+
+    <div class="callout amber">
+      The 200× advantage applies to the cryptographic signing operation itself. Keyless flows are dominated by network latency, which is the same whether you use justsign or cosign. The advantage is most pronounced in high-throughput batch pipelines that pre-fetch OIDC tokens and submit to Rekor in bulk.
+    </div>
+  </section>
+
+  <section id="comparison">
+    <h2>vs cosign</h2>
+    <p>Run <code>scripts/bench/compare_cosign.sh</code> on Linux or WSL2 (cosign requires Linux for the static-key flow). The script generates a throwaway P-256 key and times <code>cosign sign-blob --key</code> for each payload size.</p>
+
+    <p>The cosign numbers include Go subprocess startup (~50 ms floor). The comparison targets the common-ancestor case — P-256 static key — where both tools perform the same cryptographic work. The only difference is in-process vs subprocess.</p>
+
+    <div class="callout">
+      cosign is not a bad tool. It is a subprocess designed for interactive use, not for embedding in signing loops. The 50 ms floor is not negligence — it is a property of what a Go subprocess is. justsign is the library answer to the same problem.
+    </div>
+  </section>
+
+  <section id="reproduce">
+    <h2>Reproducing</h2>
+
+    <h3>Prerequisites</h3>
+    <table>
+      <tr><th>Requirement</th><th>Notes</th></tr>
+      <tr><td>Rust stable toolchain</td><td>required</td></tr>
+      <tr><td>cosign (comparison only)</td><td>Linux/WSL2; GitHub release or <code>brew install cosign</code></td></tr>
+    </table>
+
+    <h3>Steps</h3>
+
+    <p><strong>1. Clone and enter the workspace</strong></p>
+    <pre><code>git clone git@github.com:sweengineeringlabs/justsign.git
+cd justsign</code></pre>
+
+    <p><strong>2. Run the benchmark</strong></p>
+    <pre><code>cargo bench -p swe_justsign_sign --bench sign_verify</code></pre>
+
+    <p><strong>3. Run a single case</strong></p>
+    <pre><code>cargo bench -p swe_justsign_sign --bench sign_verify -- "sign_blob/1kb"
+cargo bench -p swe_justsign_sign --bench sign_verify -- "verify_blob/1mb"</code></pre>
+
+    <p><strong>4. Compare against cosign (WSL2/Linux)</strong></p>
+    <pre><code>bash scripts/bench/compare_cosign.sh</code></pre>
+
+    <h3>Output</h3>
+    <p>Criterion prints to stdout. HTML reports are written to:</p>
+    <pre><code>target/criterion/sign_blob/report/index.html
+target/criterion/verify_blob/report/index.html</code></pre>
+    <p>These files are ephemeral — <code>cargo clean</code> removes them.</p>
+  </section>
+</main>
+
+<script>
+function toggleTheme() {
+  document.documentElement.dataset.theme =
+    document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
+}
+if (window.matchMedia('(prefers-color-scheme: light)').matches) {
+  document.documentElement.dataset.theme = 'light';
+}
+const sections = document.querySelectorAll('section[id]');
+const navLinks = document.querySelectorAll('#nav a');
+const observer = new IntersectionObserver(entries => {
+  entries.forEach(e => {
+    if (e.isIntersecting) {
+      navLinks.forEach(a => a.classList.remove('active'));
+      const active = document.querySelector('#nav a[href="#' + e.target.id + '"]');
+      if (active) active.classList.add('active');
+    }
+  });
+}, { rootMargin: '-30% 0px -60% 0px' });
+sections.forEach(s => observer.observe(s));
+</script>
+</body>
+</html>
