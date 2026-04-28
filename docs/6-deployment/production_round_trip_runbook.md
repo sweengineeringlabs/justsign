@@ -8,6 +8,21 @@ Operator-actionable runbook for executing the production Sigstore round-trip des
 
 > **Status (2026-04-28):** the round-trip was executed by phdsystems and verified `OK` by cosign 3.0.6 against production Fulcio + Rekor. Permanent evidence at <https://search.sigstore.dev/?logIndex=1396196448>. Issue #23 is closed. Re-run this runbook on every wire-shape change touching `spec`, `rekor`, or `sign`.
 
+## What counts as a wire-shape change
+
+Re-run this runbook before merging any PR that touches:
+
+| Crate / file | Why it triggers a re-run |
+|---|---|
+| `spec/src/sigstore_bundle.rs` | Changes the JSON structure cosign parses |
+| `spec/src/dsse.rs` | Changes the DSSE envelope encoding |
+| `spec/src/in_toto.rs` | Changes the in-toto statement shape inside the bundle |
+| `rekor/src/client.rs` | Changes what we submit to Rekor or how we parse the response |
+| `sign/src/lib.rs` (`sign_blob*`) | Changes the signing flow or cert handling |
+| `fulcio/src/client.rs` | Changes the CSR format or cert-chain handling |
+
+Changes to `tuf/`, `oidc/`, test files, docs, or CI config do NOT require a re-run.
+
 ## Why this runbook exists
 
 Every live test in justsign's CI matrix points at **staging** Sigstore endpoints (`fulcio.sigstage.dev` / `rekor.sigstage.dev` / `tuf-repo-cdn.sigstage.dev`). We have no automated proof that signatures justsign produces verify against the **production** Sigstore trust roots, or that production Fulcio + Rekor accept our wire shape unchanged from staging.
@@ -18,11 +33,16 @@ The single most likely failure mode for a v0.1.0 launch is "signed something aga
 
 - A justsign binary built with `--features oidc-browser`. Build:
   ```sh
+  # Unix
+  cargo build --release --bin justsign --features oidc-browser
+
+  # Windows (PowerShell)
   cargo build --release --bin justsign --features oidc-browser
   ```
   The `oidc-browser` feature pulls in the local HTTP listener used by the interactive OAuth flow. The lighter `--features oidc` is enough only if you have a pre-minted Sigstore-trusted OIDC token in `SIGSTORE_ID_TOKEN`.
 - Upstream `cosign` binary, **3.0+** — the `--new-bundle-format` flag is required, and 2.x will not parse our v0.3 bundle. Latest 3.x release from <https://github.com/sigstore/cosign/releases>.
 - A browser on the same machine that can reach `https://oauth2.sigstore.dev/auth` and `http://localhost:NNNNN` (ephemeral port the listener picks).
+- **Go 1.23+** — required only for the diagnostic snippet in step 4 when cosign rejects a bundle. Install from <https://go.dev/dl/>. Skip if you don't anticipate needing the diag tool.
 
 ### Picking an OIDC issuer
 
@@ -44,15 +64,27 @@ This runbook uses the **interactive-browser** path because it works for any oper
 Anything you're willing to permanently associate with your OIDC identity in the public Rekor log. **The signature is immutable.** A safe choice: a string with a UTC timestamp written to a tempfile.
 
 ```sh
+# Unix
 mkdir -p roundtrip
 ARTEFACT=roundtrip/blob.txt
-echo "justsign #23 production round-trip $(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$ARTEFACT"
+echo "justsign production round-trip $(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$ARTEFACT"
 sha256sum "$ARTEFACT"
+```
+
+```powershell
+# Windows (PowerShell)
+New-Item -ItemType Directory -Force roundtrip | Out-Null
+$ARTEFACT = "roundtrip\blob.txt"
+"justsign production round-trip $((Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ'))" | Set-Content $ARTEFACT
+Get-FileHash $ARTEFACT -Algorithm SHA256
 ```
 
 ### 2. Sign against production Sigstore
 
+Run the appropriate variant for your shell:
+
 ```sh
+# Unix
 ./target/release/justsign sign-blob "$ARTEFACT" \
   --keyless \
   --fulcio https://fulcio.sigstore.dev \
@@ -62,10 +94,21 @@ sha256sum "$ARTEFACT"
   --output-bundle roundtrip/bundle.json
 ```
 
+```powershell
+# Windows (PowerShell)
+.\target\release\justsign.exe sign-blob $ARTEFACT `
+  --keyless `
+  --fulcio https://fulcio.sigstore.dev `
+  --oidc-provider interactive-browser `
+  --rekor=https://rekor.sigstore.dev `
+  --shape message `
+  --output-bundle roundtrip\bundle.json
+```
+
 Important:
 
 - **Production endpoints MUST be passed explicitly** — the CLI defaults to staging (`https://fulcio.sigstage.dev` / `https://rekor.sigstage.dev`) so a typo'd command doesn't burn a permanent identity entry into the public production Rekor log.
-- `--shape message` is the cosign-blob interop shape (MessageSignature content + `hashedrekord` Rekor schema). Use `--shape dsse` only when you need cosign-attestation interop (DSSE envelope + `dsse` Rekor schema).
+- `--shape message` is the cosign-blob interop shape (MessageSignature content + `hashedrekord` Rekor schema). Use `--shape dsse` only when you need cosign-attestation interop (DSSE envelope + `dsse` Rekor schema). See [step 2b](#2b-dsse-shape-variant) below if you need to verify the DSSE path.
 - The CLI prints an `https://oauth2.sigstore.dev/auth/auth?…` URL to stderr. **Open it** (it may auto-open in your default browser). Pick GitHub / Google / Microsoft, complete 2FA, and the redirect to `localhost:NNNNN` lands a "authentication complete — close this tab" page. The listener waits 15 minutes; after that it times out.
 
 What the CLI does per call:
@@ -79,24 +122,66 @@ What the CLI does per call:
 
 Expected size: bundle is ~5 KB.
 
+### 2b. DSSE shape variant
+
+Run this in addition to step 2 when any PR touches `spec/src/dsse.rs`, `rekor/src/client.rs` (DSSE submission path), or the `sign_oci` / `attest` API surface. The `message` shape above does not exercise the DSSE encoder.
+
+```sh
+# Unix
+./target/release/justsign sign-blob "$ARTEFACT" \
+  --keyless \
+  --fulcio https://fulcio.sigstore.dev \
+  --oidc-provider interactive-browser \
+  --rekor=https://rekor.sigstore.dev \
+  --shape dsse \
+  --output-bundle roundtrip/bundle-dsse.json
+```
+
+```powershell
+# Windows (PowerShell)
+.\target\release\justsign.exe sign-blob $ARTEFACT `
+  --keyless `
+  --fulcio https://fulcio.sigstore.dev `
+  --oidc-provider interactive-browser `
+  --rekor=https://rekor.sigstore.dev `
+  --shape dsse `
+  --output-bundle roundtrip\bundle-dsse.json
+```
+
+Then verify (step 4) substituting `bundle-dsse.json` for `bundle.json`. Document both Rekor log indices in the result comment.
+
 ### 3. Inspect the cert
 
 The leaf cert's Subject Alternative Name is the Fulcio-embedded OIDC subject (your email or workflow ID). Inspect with:
 
 ```sh
+# Unix
 jq -r '.verificationMaterial.certificate.rawBytes' roundtrip/bundle.json \
   | base64 -d \
   | openssl x509 -inform DER -text -noout \
   | grep -A1 "Subject Alternative Name"
 ```
 
+```powershell
+# Windows (PowerShell) — requires openssl on PATH (e.g. from Git for Windows)
+$raw = (Get-Content roundtrip\bundle.json | ConvertFrom-Json).verificationMaterial.certificate.rawBytes
+[System.IO.File]::WriteAllBytes("roundtrip\leaf.der", [Convert]::FromBase64String($raw))
+openssl x509 -inform DER -in roundtrip\leaf.der -text -noout | Select-String -A1 "Subject Alternative Name"
+```
+
 The OIDC issuer is encoded in the cert's `1.3.6.1.4.1.57264.1.1` extension — extract it with `openssl x509 -text` if you don't remember which provider you picked:
 
 ```sh
+# Unix
 jq -r '.verificationMaterial.certificate.rawBytes' roundtrip/bundle.json \
   | base64 -d \
   | openssl x509 -inform DER -text -noout \
   | grep -A1 "1.3.6.1.4.1.57264.1.1"
+```
+
+```powershell
+# Windows (PowerShell)
+openssl x509 -inform DER -in roundtrip\leaf.der -text -noout | Select-String -A1 "1.3.6.1.4.1.57264.1.1"
 ```
 
 Note: justsign emits the protobuf-specs v0.3 final singular `certificate` leaf shape (cosign 3.0+ requirement). For bundles produced by cosign 2.x or older sigstore-rs, the leaf lived under `verificationMaterial.x509CertificateChain.certificates[0].rawBytes` instead — substitute that path when inspecting legacy bundles. Our decoder accepts both for back-compat.
@@ -105,15 +190,40 @@ Note: justsign emits the protobuf-specs v0.3 final singular `certificate` leaf s
 
 This is the load-bearing check. justsign verifying its own output proves only self-consistency. cosign accepting the bundle is the test that actually proves Sigstore-ecosystem compatibility — if cosign rejects, the "drop-in replacement for sigstore-rs" claim is false.
 
-(justsign's own `verify-blob` does NOT yet support a `--keyless` flag — that's a tracked v0 follow-up. For this runbook we rely on cosign as the keyless verifier.)
+**4a. justsign self-verify (static key only — placeholder)**
+
+justsign's `verify-blob` does not yet support `--keyless` (tracked v0 follow-up, issue #TBD). Once that ships, add this step before the cosign check:
 
 ```sh
+# Not yet available — update this runbook when --keyless lands in verify-blob.
+# Expected command shape:
+# ./target/release/justsign verify-blob roundtrip/blob.txt \
+#   --bundle roundtrip/bundle.json \
+#   --keyless \
+#   --certificate-identity "$YOUR_OIDC_SUBJECT" \
+#   --certificate-oidc-issuer "$YOUR_OIDC_ISSUER"
+```
+
+**4b. cosign cross-verify**
+
+```sh
+# Unix
 cosign verify-blob \
   --bundle roundtrip/bundle.json \
   --new-bundle-format \
   --certificate-identity "$YOUR_OIDC_SUBJECT" \
   --certificate-oidc-issuer "$YOUR_OIDC_ISSUER" \
   roundtrip/blob.txt
+```
+
+```powershell
+# Windows (PowerShell)
+cosign verify-blob `
+  --bundle roundtrip\bundle.json `
+  --new-bundle-format `
+  --certificate-identity $YOUR_OIDC_SUBJECT `
+  --certificate-oidc-issuer $YOUR_OIDC_ISSUER `
+  roundtrip\blob.txt
 ```
 
 `$YOUR_OIDC_ISSUER` is the URL inside the cert's `1.3.6.1.4.1.57264.1.1` extension. For the common providers:
