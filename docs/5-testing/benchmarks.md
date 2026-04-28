@@ -56,4 +56,4 @@ Run `scripts/bench/compare_cosign.sh` on Linux or WSL2 (cosign requires Linux fo
 cargo bench -p swe_justsign_sign --bench sign_verify
 ```
 
-HTML report: `target/criterion/sign_blob/report/index.html`
+The bench generates an HTML report at `target/criterion/sign_blob/report/index.html` (ephemeral — deleted by `cargo clean`; re-run the bench to regenerate).
