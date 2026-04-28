@@ -1,25 +1,28 @@
-# Manual-dispatch staging tests for justsign.
+# Staging tests for justsign.
 #
 # These jobs talk to real Sigstore staging endpoints
-# (fulcio.sigstage.dev / rekor.sigstage.dev). They are gated to
-# `workflow_dispatch` only — never on push or pull_request — because:
+# (fulcio.sigstage.dev / rekor.sigstage.dev). They run:
 #
-#   1. Staging enforces rate quotas; a per-push run would burn
-#      through budget shared with the wider Sigstore community.
-#   2. Fulcio requires a live OIDC token that cannot be minted by a
-#      stock GHA runner; the test SKIPs without
-#      `JUSTSIGN_OIDC_TOKEN` so forks lacking the secret stay clean.
-#   3. The default `cargo test` flow already prints a SKIP line and
-#      returns success when the corresponding env var is unset, so
-#      these jobs would silently mask wire-format drift if they ran
-#      every time.
+#   - Nightly at 02:00 UTC — continuous wire-format drift detection
+#   - On manual dispatch — on-demand verification
 #
-# Run from the Actions tab → "Staging (manual)" → Run workflow.
+# NOT on push or pull_request because:
+#   1. Staging enforces rate quotas; per-push runs would burn through
+#      budget shared with the wider Sigstore community.
+#   2. The default `cargo test` flow prints a SKIP line and returns
+#      success when env vars are unset — running on every push would
+#      silently mask drift on forks lacking secrets.
+#
+# Fulcio job: on scheduled runs the GitHub Actions OIDC token is
+# self-issued (id-token: write permission). On manual dispatch a
+# stored JUSTSIGN_OIDC_TOKEN secret is used as fallback.
 
-name: Staging (manual)
+name: Staging
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: '0 2 * * *'
 
 env:
   CARGO_TERM_COLOR: always
@@ -29,13 +32,30 @@ jobs:
   fulcio:
     name: cargo test (staging-fulcio)
     runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
     env:
       JUSTSIGN_FULCIO_STAGING: "1"
-      JUSTSIGN_OIDC_TOKEN: ${{ secrets.JUSTSIGN_OIDC_TOKEN }}
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Fetch OIDC token (scheduled) or use stored secret (manual)
+        # Scheduled runs self-issue a GitHub Actions OIDC token scoped
+        # to the sigstore audience — no stored secret needed.
+        # Manual dispatch falls back to JUSTSIGN_OIDC_TOKEN secret for
+        # cases where a human wants to supply a different identity.
+        run: |
+          if [ -n "${{ secrets.JUSTSIGN_OIDC_TOKEN }}" ]; then
+            echo "JUSTSIGN_OIDC_TOKEN=${{ secrets.JUSTSIGN_OIDC_TOKEN }}" >> "${GITHUB_ENV}"
+          else
+            TOKEN=$(curl -fsSL \
+              -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+              "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=sigstore" \
+              | jq -r '.value')
+            echo "JUSTSIGN_OIDC_TOKEN=${TOKEN}" >> "${GITHUB_ENV}"
+          fi
       - name: cargo test (skip-pass)
         run: cargo test -p swe_justsign_fulcio test_http_fulcio_client_signs_cert_against_staging -- --nocapture
 
