@@ -68,9 +68,14 @@ balloon scoped.
 These are the known production-readiness gaps for v0.1.0. Each has
 a tracking issue; the README will be updated as they close.
 
-- **Production Sigstore round-trip not yet validated** — fulcio/rekor
-  unit tests run against staging only; the prod-vs-staging drift
-  matrix isn't in CI yet. See [#23][i23].
+- **Production Sigstore round-trip not yet automated in CI** — the
+  one-shot manual round-trip ([#23][i23]) is **PASSED** as of
+  2026-04-28: cosign 3.0.6 verified a justsign-keyless bundle against
+  production Fulcio + Rekor (logIndex
+  [1396196448](https://search.sigstore.dev/?logIndex=1396196448)).
+  Re-running it on every wire-shape change is currently a manual step
+  per [`docs/6-deployment/production_round_trip_runbook.md`](docs/6-deployment/production_round_trip_runbook.md);
+  CI automation lands later.
 - **No fuzzing harness yet** for the wire-decode parsers (Bundle JSON,
   DSSE envelope, in-toto Statement, TUF metadata). In flight — see
   [#24][i24].
