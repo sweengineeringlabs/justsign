@@ -1808,6 +1808,7 @@ dependencies = [
  "criterion",
  "cryptoki",
  "der",
+ "ecdsa",
  "ed25519-dalek",
  "k256",
  "open",
