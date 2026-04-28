@@ -29,6 +29,7 @@
 # Testing
 
 - [Testing strategy](5-testing/testing_strategy.md)
+- [Benchmarks](5-testing/benchmarks.md)
 
 # Deployment
 
