@@ -42,6 +42,7 @@ The single most likely failure mode for a v0.1.0 launch is "signed something aga
   The `oidc-browser` feature pulls in the local HTTP listener used by the interactive OAuth flow. The lighter `--features oidc` is enough only if you have a pre-minted Sigstore-trusted OIDC token in `SIGSTORE_ID_TOKEN`.
 - Upstream `cosign` binary, **3.0+** — the `--new-bundle-format` flag is required, and 2.x will not parse our v0.3 bundle. Latest 3.x release from <https://github.com/sigstore/cosign/releases>.
 - A browser on the same machine that can reach `https://oauth2.sigstore.dev/auth` and `http://localhost:NNNNN` (ephemeral port the listener picks).
+  > **Human in the loop required.** Step 2 opens a browser login page (Google / GitHub / Microsoft via Sigstore's Dex broker). You must complete the OAuth flow interactively — there is no way to skip this when running locally. For headless or remote machines, pre-obtain a token on a browser-accessible machine first (`justsign oidc-token --oidc-provider interactive-browser`) and export it as `JUSTSIGN_OIDC_TOKEN` before running step 2. The nightly CI job (`staging.yml`) self-issues a GitHub Actions OIDC token and requires no browser.
 - **Go 1.23+** — required only for the diagnostic snippet in step 4 when cosign rejects a bundle. Install from <https://go.dev/dl/>. Skip if you don't anticipate needing the diag tool.
 
 ### Picking an OIDC issuer
