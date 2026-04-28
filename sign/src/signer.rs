@@ -126,6 +126,21 @@ pub trait Signer: Send + Sync {
     /// raw `r||s`. Verifiers downstream must know which is which
     /// from the key's algorithm.
     fn sign(&self, pae_bytes: &[u8]) -> Result<Vec<u8>, SignerError>;
+
+    /// Sign a pre-computed digest directly, bypassing the signer's
+    /// internal hash pass. Used by callers that already hold the
+    /// SHA-256 of the payload (e.g. from a prior build step) and want
+    /// to avoid a redundant pass over the data.
+    ///
+    /// `digest` must be the raw hash output bytes (32 bytes for
+    /// SHA-256). Callers are responsible for producing a digest with
+    /// the algorithm this signer expects.
+    ///
+    /// ECDSA implementations use `signature::hazmat::PrehashSigner`
+    /// to sign the digest directly without another internal hash pass.
+    /// Implementations that cannot support prehash (e.g. Ed25519)
+    /// fall back to treating `digest` as a regular message input.
+    fn sign_prehash(&self, digest: &[u8]) -> Result<Vec<u8>, SignerError>;
 }
 
 // Blanket impl so `Arc<dyn Signer>` and `Arc<EcdsaP256Signer>`
@@ -136,6 +151,9 @@ impl<T: Signer + ?Sized> Signer for Arc<T> {
     }
     fn sign(&self, pae_bytes: &[u8]) -> Result<Vec<u8>, SignerError> {
         (**self).sign(pae_bytes)
+    }
+    fn sign_prehash(&self, digest: &[u8]) -> Result<Vec<u8>, SignerError> {
+        (**self).sign_prehash(digest)
     }
 }
 
@@ -191,6 +209,15 @@ impl Signer for EcdsaP256Signer {
         let sig: P256Signature = self.key.sign(pae_bytes);
         Ok(sig.to_der().as_bytes().to_vec())
     }
+
+    fn sign_prehash(&self, digest: &[u8]) -> Result<Vec<u8>, SignerError> {
+        use p256::ecdsa::signature::hazmat::PrehashSigner as _;
+        let sig: P256Signature = self
+            .key
+            .sign_prehash(digest)
+            .map_err(|e| SignerError::Other(e.to_string()))?;
+        Ok(sig.to_der().as_bytes().to_vec())
+    }
 }
 
 /// Test-only signer that returns canned bytes.
@@ -222,6 +249,10 @@ impl Signer for MockSigner {
     }
 
     fn sign(&self, _pae_bytes: &[u8]) -> Result<Vec<u8>, SignerError> {
+        Ok(self.canned.clone())
+    }
+
+    fn sign_prehash(&self, _digest: &[u8]) -> Result<Vec<u8>, SignerError> {
         Ok(self.canned.clone())
     }
 }
@@ -295,6 +326,13 @@ impl Signer for Ed25519Signer {
         let sig: ed25519_dalek::Signature = self.key.sign(pae_bytes);
         Ok(sig.to_bytes().to_vec())
     }
+
+    fn sign_prehash(&self, digest: &[u8]) -> Result<Vec<u8>, SignerError> {
+        // PureEd25519 has no prehash mode — sign the digest bytes as a
+        // regular message input. Callers requiring Ed25519ph must use a
+        // dedicated signer; this path is a best-effort fallback.
+        self.sign(digest)
+    }
 }
 
 /// ECDSA-with-SHA384 signer over the P-384 curve.
@@ -341,6 +379,15 @@ impl Signer for EcdsaP384Signer {
         // encoding stays standard for ECDSA signatures.
         use p384::ecdsa::signature::Signer as _;
         let sig: p384::ecdsa::Signature = self.key.sign(pae_bytes);
+        Ok(sig.to_der().as_bytes().to_vec())
+    }
+
+    fn sign_prehash(&self, digest: &[u8]) -> Result<Vec<u8>, SignerError> {
+        use p384::ecdsa::signature::hazmat::PrehashSigner as _;
+        let sig: p384::ecdsa::Signature = self
+            .key
+            .sign_prehash(digest)
+            .map_err(|e| SignerError::Other(e.to_string()))?;
         Ok(sig.to_der().as_bytes().to_vec())
     }
 }
@@ -390,6 +437,15 @@ impl Signer for Secp256k1Signer {
         // form for ECDSA. Same shape as EcdsaP256Signer.
         use k256::ecdsa::signature::Signer as _;
         let sig: k256::ecdsa::Signature = self.key.sign(pae_bytes);
+        Ok(sig.to_der().as_bytes().to_vec())
+    }
+
+    fn sign_prehash(&self, digest: &[u8]) -> Result<Vec<u8>, SignerError> {
+        use k256::ecdsa::signature::hazmat::PrehashSigner as _;
+        let sig: k256::ecdsa::Signature = self
+            .key
+            .sign_prehash(digest)
+            .map_err(|e| SignerError::Other(e.to_string()))?;
         Ok(sig.to_der().as_bytes().to_vec())
     }
 }

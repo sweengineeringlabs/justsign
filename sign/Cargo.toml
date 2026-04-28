@@ -66,6 +66,7 @@ rekor      = { workspace = true }
 # RustCrypto stack — versions match `swe_justsign_fulcio` so cargo
 # resolves a single copy of each crate in the dependency tree.
 p256      = { version = "0.13", default-features = false, features = ["std", "ecdsa", "pkcs8"] }
+ecdsa     = { version = "0.16", default-features = false, features = ["signing", "hazmat", "der"] }
 signature = { version = "2", default-features = false, features = ["std"] }
 sha2      = { version = "0.10", default-features = false, features = ["std"] }
 

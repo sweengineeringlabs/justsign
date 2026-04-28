@@ -452,6 +452,57 @@ pub fn sign_blob_message(
     })
 }
 
+/// Optimised variant of [`sign_blob_message`] for callers that already
+/// hold a pre-computed SHA-256 digest of the payload (e.g. from a prior
+/// OCI build step that computed the layer digest).
+///
+/// Skips both the explicit `Sha256::digest(payload)` call and the
+/// signer's internal SHA-256 pass by using
+/// [`Signer::sign_prehash`]. The resulting bundle is wire-identical to
+/// [`sign_blob_message`] output — same `MessageSignature` content shape,
+/// same `SHA2_256` algorithm field.
+///
+/// `digest` must be the raw 32-byte SHA-256 output (not hex-encoded).
+/// The caller is responsible for ensuring the digest was computed over
+/// the same payload bytes the bundle is meant to cover.
+pub fn sign_blob_message_prehashed(
+    digest: [u8; 32],
+    signer: &dyn Signer,
+    rekor: Option<&dyn RekorClient>,
+) -> Result<Bundle, SignError> {
+    let sig_bytes = signer
+        .sign_prehash(&digest)
+        .map_err(|e| SignError::Signer(e.to_string()))?;
+    let key_id = signer.key_id();
+
+    let message_signature = SpecMessageSignature {
+        message_digest: HashOutput {
+            algorithm: SHA2_256_ALGORITHM.to_string(),
+            digest: digest.to_vec(),
+        },
+        signature: sig_bytes.clone(),
+    };
+
+    let tlog_entries = if let Some(client) = rekor {
+        let entry = build_hashed_rekord_prehashed(&digest, &sig_bytes, Vec::new());
+        let log_entry = client.submit(&entry)?;
+        vec![log_entry_to_tlog_entry(&log_entry, "hashedrekord")]
+    } else {
+        Vec::new()
+    };
+
+    let _ = key_id;
+    Ok(Bundle {
+        media_type: SIGSTORE_BUNDLE_V0_3_MEDIA_TYPE.to_string(),
+        verification_material: VerificationMaterial {
+            certificate: None,
+            tlog_entries,
+            timestamp_verification_data: None,
+        },
+        content: BundleContent::MessageSignature(message_signature),
+    })
+}
+
 /// Keyless variant of [`sign_blob_message`] — adds a Fulcio cert
 /// chain to the bundle, and uses the leaf cert PEM as the rekor
 /// `publicKey.content`. Mirror of [`sign_blob_keyless`] but emits a
@@ -1058,6 +1109,29 @@ fn build_hashed_rekord(
             hash: HashedRekordHash {
                 algorithm: "sha256".to_string(),
                 value: hex_lower(&digest),
+            },
+        },
+    }
+}
+
+/// Prehashed variant of [`build_hashed_rekord`] — accepts a raw 32-byte
+/// SHA-256 digest instead of the full payload, avoiding a redundant hash pass.
+fn build_hashed_rekord_prehashed(
+    digest: &[u8; 32],
+    sig_bytes: &[u8],
+    pubkey_pem_for_rekor: Vec<u8>,
+) -> HashedRekord {
+    HashedRekord {
+        signature: rekor::Signature {
+            content: sig_bytes.to_vec(),
+            public_key: PublicKey {
+                content: pubkey_pem_for_rekor,
+            },
+        },
+        data: rekor::Data {
+            hash: HashedRekordHash {
+                algorithm: "sha256".to_string(),
+                value: hex_lower(digest),
             },
         },
     }
