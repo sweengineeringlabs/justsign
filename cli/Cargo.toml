@@ -13,7 +13,7 @@ authors.workspace      = true
 rust-version.workspace = true
 
 [[bin]]
-name = "justsign"
+name = "sign"
 path = "src/main.rs"
 
 [lib]
