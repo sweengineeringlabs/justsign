@@ -228,10 +228,15 @@ pub fn extract_san(leaf_der: &[u8]) -> Result<Vec<String>, ChainError> {
 /// * [`ChainError::Decode`] — any cert fails to decode.
 /// * [`ChainError::EmptyTrustAnchors`] — `trust_anchors_der` empty.
 /// * [`ChainError::BrokenSignature`] — any pairwise signature fails.
-/// * [`ChainError::RootNotTrusted`] — topmost cert isn't itself a
-///   trust anchor AND no trust anchor signs it.
+/// * [`ChainError::RootNotTrusted`] — topmost cert has a supported
+///   (ECDSA-P256-SHA256) signature algorithm, isn't itself a trust
+///   anchor, AND no trust anchor signs it.
 /// * [`ChainError::UnsupportedAlgorithm`] — non-ECDSA-P256-SHA256
-///   signature_algorithm OID encountered.
+///   signature_algorithm OID encountered. This includes the topmost
+///   cert when it is not itself a trust anchor: an unsupported
+///   algorithm takes precedence over `RootNotTrusted` because no
+///   anchor could have verified it, so "root not trusted" would
+///   misdirect the operator away from the real cause.
 ///
 /// # Panics
 ///
@@ -312,6 +317,20 @@ pub fn verify_chain(
     }
 
     if !anchor_satisfied {
+        // Attribute the failure correctly. The per-anchor loop above
+        // swallows errors on purpose (see its comment), but the
+        // signature-algorithm gate looks only at the top cert, so its
+        // verdict is the same for every anchor: if the top cert's
+        // algorithm is unsupported, NO anchor could ever have
+        // verified it. Say so, rather than the misleading "root not
+        // in trust anchors" when the anchor is in fact the right one.
+        let top_alg_oid = top_cert.signature_algorithm.oid;
+        if top_alg_oid != ECDSA_WITH_SHA256_OID {
+            return Err(ChainError::UnsupportedAlgorithm {
+                at_index: top_idx,
+                oid: top_alg_oid.to_string(),
+            });
+        }
         return Err(ChainError::RootNotTrusted {
             found_subject: top_cert.tbs_certificate.subject.to_string(),
         });
@@ -608,6 +627,66 @@ mod tests {
             entries.iter().any(|e| e == &synth.leaf_uri),
             "URI SAN missing — got {entries:?}"
         );
+    }
+
+    #[test]
+    fn test_verify_chain_ed25519_top_cert_with_matching_anchor_returns_unsupported_algorithm() {
+        let (anchor_der, top_der) = build_ed25519_root_and_intermediate();
+
+        // The anchor really is the issuer: only the algorithm is wrong.
+        let err = verify_chain(&[top_der], &[anchor_der])
+            .expect_err("Ed25519-signed chain must be rejected");
+
+        match err {
+            ChainError::UnsupportedAlgorithm { at_index, oid } => {
+                assert_eq!(at_index, 0, "the top (only) cert is at index 0");
+                assert_eq!(oid, "1.3.101.112", "Ed25519 signature algorithm OID");
+            }
+            other => panic!(
+                "expected UnsupportedAlgorithm (the anchor is correct, the algorithm is not), got {other:?}"
+            ),
+        }
+    }
+
+    /// Bug it catches: attributing the algorithm fix to the wrong
+    /// place and breaking multi-anchor lookup, e.g. returning early
+    /// on the first anchor that cannot be used. The first anchor is
+    /// an Ed25519 root (cannot verify a P-256 chain), the second is
+    /// the real P-256 root; the chain must still verify.
+    #[test]
+    fn test_verify_chain_unusable_anchor_before_valid_anchor_still_succeeds() {
+        let synth = build_three_level_chain();
+        let (ed_anchor_der, _) = build_ed25519_root_and_intermediate();
+
+        verify_chain(&synth.chain, &[ed_anchor_der, synth.root_der])
+            .expect("a later valid anchor must still be found");
+    }
+
+    /// Build a self-signed Ed25519 root and an Ed25519 intermediate
+    /// it signs. Returns `(root_der, intermediate_der)`. Mirrors what
+    /// `a2ac-ca` issues, the real-world input that exposed the
+    /// misleading `RootNotTrusted` error.
+    fn build_ed25519_root_and_intermediate() -> (Vec<u8>, Vec<u8>) {
+        let root_kp = KeyPair::generate_for(&rcgen::PKCS_ED25519).expect("ed25519 root keypair");
+        let mut root_params = CertificateParams::new(Vec::<String>::new()).expect("root params");
+        root_params
+            .distinguished_name
+            .push(DnType::CommonName, "ed25519-root");
+        root_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let root_cert = root_params.self_signed(&root_kp).expect("root self-sign");
+
+        let int_kp = KeyPair::generate_for(&rcgen::PKCS_ED25519).expect("ed25519 int keypair");
+        let mut int_params =
+            CertificateParams::new(Vec::<String>::new()).expect("intermediate params");
+        int_params
+            .distinguished_name
+            .push(DnType::CommonName, "ed25519-intermediate");
+        int_params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
+        let int_cert = int_params
+            .signed_by(&int_kp, &root_cert, &root_kp)
+            .expect("intermediate sign");
+
+        (root_cert.der().to_vec(), int_cert.der().to_vec())
     }
 
     /// Bug it catches: a verifier that "succeeds" with

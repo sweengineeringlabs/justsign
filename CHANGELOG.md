@@ -31,6 +31,10 @@ All notable changes to this project are recorded here. Format follows [Keep a Ch
 
 - `try_verify` (in `verify_blob_message`) now hands `payload` (not `pinned_digest`) to RustCrypto's verify, symmetric with the signer's `Signer::sign(payload)` convention. Off-by-one-hash regression caught and fixed in #23.
 
+### Fixed
+
+- `cert_chain::verify_chain` now returns `ChainError::UnsupportedAlgorithm` (naming the OID and chain index) instead of `RootNotTrusted` when the topmost certificate is signed with a non-ECDSA-P256-SHA256 algorithm (e.g. Ed25519) and is not itself a trust anchor. Previously the correct trust anchor was reported as untrusted (#42).
+
 ## [0.1.0] — TBD (pre-release)
 
 This is the initial release. v0.1.0 is the cut at which the public API stabilises and crates.io publication begins; until then the workspace is on `0.1.0-pre`. See [issue #15](https://github.com/sweengineeringlabs/justsign/issues/15) for the publication plan.
