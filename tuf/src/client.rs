@@ -195,7 +195,7 @@ impl TufClient {
     pub fn sigstore(cache_dir: impl Into<PathBuf>) -> Result<Self, TufError> {
         let bytes = crate::embedded::SIGSTORE_PRODUCTION_ROOT_BYTES;
         let client = Self::with_initial_root_bytes(bytes, SIGSTORE_PROD_URL, cache_dir)?;
-        verify_bundled_root_self_signature(bytes)?;
+        verify_root_self_signature(bytes)?;
         Ok(client)
     }
 
@@ -668,7 +668,15 @@ fn check_initial_root_not_expired(root: &Root, now: SystemTime) -> Result<(), Tu
     Ok(())
 }
 
-/// Self-signature gate for the bundled Sigstore production root.
+/// Self-signature gate for a TUF root: the bundled Sigstore production
+/// root, or one an operator supplies (`sign tuf-root verify --root`).
+///
+/// # Errors
+///
+/// [`TufError::Json`] if `bytes` is not a root envelope;
+/// [`TufError::BelowThreshold`] if the root's own `root` role does not
+/// approve its canonical `signed` body to threshold (tampered or
+/// corrupt); other [`TufError`] variants for unsupported key types.
 ///
 /// Equivalent to the "new self-signs" half of TUF spec §5.3.4 run
 /// against the bootstrap asset itself: the root's `roles.root` must
@@ -685,7 +693,7 @@ fn check_initial_root_not_expired(root: &Root, now: SystemTime) -> Result<(), Tu
 /// the bug is in the bundled root, the network, or the freshly-
 /// fetched chain step. Pre-flight verifying the bundled root
 /// localises the diagnostic.
-fn verify_bundled_root_self_signature(bytes: &[u8]) -> Result<(), TufError> {
+pub fn verify_root_self_signature(bytes: &[u8]) -> Result<(), TufError> {
     let v: serde_json::Value = serde_json::from_slice(bytes).map_err(TufError::Json)?;
     let signed_value = v.get("signed").cloned().ok_or_else(|| {
         TufError::Json(<serde_json::Error as serde::de::Error>::custom(
@@ -2217,12 +2225,12 @@ mod tests {
     fn test_sigstore_constructor_self_verifies_bundled_root() {
         let dir = unique_temp_dir("sigstore_ctor_self_verifies");
         // The constructor MUST internally call
-        // `verify_bundled_root_self_signature` against the embedded
+        // `verify_root_self_signature` against the embedded
         // bytes. The most direct way to assert that is to call the
         // helper ourselves and confirm it succeeds; if either path
         // breaks (the helper or the constructor wiring), one of the
         // two assertions below catches it.
-        super::verify_bundled_root_self_signature(crate::embedded::SIGSTORE_PRODUCTION_ROOT_BYTES)
+        super::verify_root_self_signature(crate::embedded::SIGSTORE_PRODUCTION_ROOT_BYTES)
             .expect("bundled Sigstore root must self-verify at the helper level");
         TufClient::sigstore(&dir)
             .expect("TufClient::sigstore must succeed end-to-end including self-verification");
@@ -2240,7 +2248,7 @@ mod tests {
     /// but provide no real protection.
     ///
     /// Bug it catches: an implementation of
-    /// `verify_bundled_root_self_signature` that returns Ok
+    /// `verify_root_self_signature` that returns Ok
     /// unconditionally, or one whose canonicalisation no longer
     /// matches what tuf-on-ci emits (a regression we landed and
     /// fixed once already in the v0.x cycle).
@@ -2269,7 +2277,7 @@ mod tests {
         );
         bytes[target] += 1;
 
-        let err = super::verify_bundled_root_self_signature(&bytes)
+        let err = super::verify_root_self_signature(&bytes)
             .expect_err("tampered bytes must not self-verify");
         assert!(
             matches!(err, TufError::BelowThreshold { .. }),

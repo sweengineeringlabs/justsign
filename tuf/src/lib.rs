@@ -90,7 +90,7 @@ pub mod span;
 pub mod types;
 
 pub use canonical::{canonicalize, CanonicalizationError};
-pub use client::TufClient;
+pub use client::{verify_root_self_signature, TufClient};
 pub use embedded::{
     SIGSTORE_PRODUCTION_ROOT_BYTES, SIGSTORE_PRODUCTION_ROOT_FETCHED_AT,
     SIGSTORE_PRODUCTION_ROOT_SHA256, SIGSTORE_PRODUCTION_ROOT_SOURCE,

@@ -28,7 +28,16 @@ curl -fsS https://tuf-repo-cdn.sigstore.dev/16.root.json | sha256sum
 curl -fsS https://raw.githubusercontent.com/sigstore/root-signing/main/metadata/root_history/16.root.json | sha256sum
 ```
 
-From a compiled consumer, read `tuf::SIGSTORE_PRODUCTION_ROOT_VERSION` and `tuf::SIGSTORE_PRODUCTION_ROOT_SHA256`. Do not rely on the number alone; compare the hash. If the CDN and GitHub hashes differ, **stop** and treat it as an incident: report it to Sigstore and do not refresh.
+From a pre-built binary, ask it directly:
+
+```sh
+sign tuf-root show      # version, sha256, source, fetched_at, expires
+sign tuf-root verify    # parse, shape, not expired, self-signature to threshold
+```
+
+`verify` also takes `--root <path>` to check any root file. Its exit code says why it failed: `0` ok, `1` usage or unreadable file, `3` malformed (not JSON, or not a root), `4` expired, `5` the root's own signatures do not reach threshold (altered or corrupt). `show` keeps working after the root expires.
+
+From Rust, read `tuf::SIGSTORE_PRODUCTION_ROOT_VERSION` and `tuf::SIGSTORE_PRODUCTION_ROOT_SHA256`. Do not rely on the number alone; compare the hash. If the CDN and GitHub hashes differ, **stop** and treat it as an incident: report it to Sigstore and do not refresh.
 
 ## 3. Normal refresh (automated)
 
@@ -68,11 +77,11 @@ Symptoms: `cargo build` panics with "embedded TUF asset … has expired", or a d
 **Waiting for a patch release is the default.** To recover sooner:
 
 1. Fetch the current root: `curl -fsS https://tuf-repo-cdn.sigstore.dev/<N>.root.json`, walking `<N>` upward until a 404 (the script in §2 does this).
-2. Verify it with the three-way hash comparison in §2.
+2. Verify it with the three-way hash comparison in §2, then `sign tuf-root verify --root <file>` (must exit `0`).
 3. Pass it to `with_initial_root_bytes` as in §4.
 
 The new root must itself be unexpired, and an old ancestor will not work: it is rejected as expired. For a source build, run `python3 scripts/sigstore_root_refresh.py --apply`, review the diff, then build.
 
 ## 6. Not yet available
 
-There is no `justsign tuf-root verify` command (issue #35) and no cross-check against cosign's bundled root (issue #34). Until they exist, §2 and §5 are manual.
+There is no cross-check against cosign's bundled root yet (issue #34). Until it exists, the independent-corroboration step is manual.

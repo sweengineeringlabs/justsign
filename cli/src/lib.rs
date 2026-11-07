@@ -64,6 +64,8 @@ use sign::{
 #[cfg(feature = "oidc-browser")]
 use sign::InteractiveBrowserOidcProvider;
 use sign::{GcpMetadataOidcProvider, GitHubActionsOidcProvider, OidcProvider, StaticOidcProvider};
+// The CLI reaches the TUF client through `sign`, which re-exports it.
+use sign::tuf;
 
 /// Default Rekor base URL when `--rekor` is passed without a value.
 ///
@@ -198,6 +200,21 @@ pub fn print_usage<W: Write>(out: &mut W) -> std::io::Result<()> {
         out,
         "      lets operators preview the token resolution without driving a sign call."
     )?;
+    writeln!(out, "  sign tuf-root show")?;
+    writeln!(
+        out,
+        "      prints the bundled Sigstore TUF root: version, sha256, source, fetched-at, expires."
+    )?;
+    writeln!(out, "  sign tuf-root verify [--root <path>]")?;
+    writeln!(
+        out,
+        "      checks the bundled root (or the root.json at <path>): parse, shape, not expired,"
+    )?;
+    writeln!(
+        out,
+        "      and self-signature to threshold. Exit codes: 0 ok, 1 usage/IO, 3 malformed,"
+    )?;
+    writeln!(out, "      4 expired, 5 signature below threshold.")?;
     Ok(())
 }
 
@@ -973,6 +990,159 @@ fn fetch_interactive_browser_token() -> Result<String, sign::OidcError> {
         "interactive-browser provider not compiled in (rebuild with --features oidc-browser)"
             .to_string(),
     ))
+}
+
+// ---------------------------------------------------------------------------
+// tuf-root (issue #35)
+// ---------------------------------------------------------------------------
+
+/// Failure of a `tuf-root` subcommand, carrying the process exit code
+/// so scripts can route on *why* it failed. Distinct from [`CliError`]
+/// (which always exits 1) because "the root is expired" and "the file
+/// is garbage" call for different operator action.
+#[derive(Debug)]
+pub enum TufRootError {
+    /// Bad arguments or an unreadable file. Exit 1.
+    Usage(String),
+    /// Not a TUF root envelope: invalid JSON, or the wrong shape. Exit 3.
+    Malformed(String),
+    /// A well-formed root whose `expires` is in the past. Exit 4.
+    Expired(String),
+    /// A well-formed, unexpired root whose own signatures do not reach
+    /// its threshold (tampered or corrupt). Exit 5.
+    Untrusted(String),
+}
+
+impl TufRootError {
+    /// Process exit code for this failure. Documented in `--help`.
+    #[must_use]
+    pub fn exit_code(&self) -> u8 {
+        match self {
+            Self::Usage(_) => 1,
+            Self::Malformed(_) => 3,
+            Self::Expired(_) => 4,
+            Self::Untrusted(_) => 5,
+        }
+    }
+
+    fn from_tuf(err: tuf::TufError) -> Self {
+        use tuf::TufError;
+        let msg = err.to_string();
+        match err {
+            TufError::EmbeddedRootExpired { .. } | TufError::Expired { .. } => Self::Expired(msg),
+            TufError::BelowThreshold { .. } | TufError::UnknownKeyId { .. } => Self::Untrusted(msg),
+            _ => Self::Malformed(msg),
+        }
+    }
+}
+
+impl std::fmt::Display for TufRootError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (Self::Usage(m) | Self::Malformed(m) | Self::Expired(m) | Self::Untrusted(m)) = self;
+        write!(f, "{m}")
+    }
+}
+
+impl std::error::Error for TufRootError {}
+
+/// `tuf-root <show|verify>` dispatcher.
+///
+/// # Errors
+///
+/// [`TufRootError`] with the exit code described in `--help`.
+pub fn cmd_tuf_root<W: Write>(args: &[String], out: &mut W) -> Result<(), TufRootError> {
+    match args.first().map(String::as_str) {
+        Some("show") if args.len() == 1 => cmd_tuf_root_show(out),
+        Some("show") => Err(TufRootError::Usage(
+            "tuf-root show takes no arguments".to_string(),
+        )),
+        Some("verify") => cmd_tuf_root_verify(&args[1..], out),
+        Some(other) => Err(TufRootError::Usage(format!(
+            "unknown tuf-root subcommand: {other} (expected show or verify)"
+        ))),
+        None => Err(TufRootError::Usage(
+            "tuf-root needs a subcommand: show or verify".to_string(),
+        )),
+    }
+}
+
+/// `tuf-root show` -- print the trust anchor this binary carries.
+///
+/// One `key: value` per line in a fixed order, so scripts can parse it
+/// and diffs between releases are readable.
+fn cmd_tuf_root_show<W: Write>(out: &mut W) -> Result<(), TufRootError> {
+    let root = parse_root_bytes(tuf::SIGSTORE_PRODUCTION_ROOT_BYTES)?;
+    let lines = [
+        ("version", tuf::SIGSTORE_PRODUCTION_ROOT_VERSION.to_string()),
+        ("sha256", tuf::SIGSTORE_PRODUCTION_ROOT_SHA256.to_string()),
+        ("source", tuf::SIGSTORE_PRODUCTION_ROOT_SOURCE.to_string()),
+        (
+            "fetched_at",
+            tuf::SIGSTORE_PRODUCTION_ROOT_FETCHED_AT.to_string(),
+        ),
+        ("expires", root.expires),
+    ];
+    for (key, value) in lines {
+        writeln!(out, "{key}: {value}")
+            .map_err(|e| TufRootError::Usage(format!("write stdout: {e}")))?;
+    }
+    Ok(())
+}
+
+/// Parse a root envelope's typed `signed` body. Deliberately NOT through
+/// `TufClient::with_initial_root_bytes`: `show` must keep working once the
+/// bundled root has expired, which is exactly when an operator needs to see
+/// what they are running.
+fn parse_root_bytes(bytes: &[u8]) -> Result<tuf::Root, TufRootError> {
+    tuf::parse_with_signed_span::<tuf::Root>(bytes)
+        .map(|spanned| spanned.signed)
+        .map_err(|e| TufRootError::Malformed(e.to_string()))
+}
+
+/// `tuf-root verify [--root <path>]` -- the in-process equivalent of
+/// the build-time check plus the runtime guard, on the bundled root or
+/// an operator-supplied one.
+fn cmd_tuf_root_verify<W: Write>(args: &[String], out: &mut W) -> Result<(), TufRootError> {
+    let (label, bytes): (String, Vec<u8>) = match args {
+        [] => (
+            "bundled Sigstore production root".to_string(),
+            tuf::SIGSTORE_PRODUCTION_ROOT_BYTES.to_vec(),
+        ),
+        [flag, path] if flag == "--root" => {
+            let bytes = std::fs::read(path)
+                .map_err(|e| TufRootError::Usage(format!("read {path}: {e}")))?;
+            (path.clone(), bytes)
+        }
+        _ => {
+            return Err(TufRootError::Usage(
+                "usage: tuf-root verify [--root <path>]".to_string(),
+            ))
+        }
+    };
+
+    // 1. Parse + shape + expiry, via the same constructor operators use
+    //    for the override path. The cache dir is never written to: this
+    //    makes no network call.
+    let cache = std::env::temp_dir().join(format!("sign-tuf-root-verify-{}", std::process::id()));
+    let client = tuf::TufClient::with_initial_root_bytes(&bytes, "https://unused.invalid", &cache)
+        .map_err(TufRootError::from_tuf);
+    let _ = std::fs::remove_dir_all(&cache);
+    let client = client?;
+    let root = client
+        .bootstrap_root()
+        .ok_or_else(|| TufRootError::Malformed("no bootstrap root after load".to_string()))?;
+
+    // 2. The root must approve itself to its own threshold; this is what
+    //    catches a tampered or corrupt copy.
+    tuf::verify_root_self_signature(&bytes).map_err(TufRootError::from_tuf)?;
+
+    writeln!(
+        out,
+        "OK: {label}: version {}, expires {}, self-signature valid",
+        root.version, root.expires
+    )
+    .map_err(|e| TufRootError::Usage(format!("write stdout: {e}")))?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1918,5 +2088,33 @@ mod tests {
         if let Some(v) = prev {
             std::env::set_var("SIGSTORE_ID_TOKEN", v);
         }
+    }
+
+    /// `show` must work on an EXPIRED root: that is exactly when an
+    /// operator needs to see what they are running.
+    ///
+    /// Bug it catches: parsing through the expiry-checking constructor,
+    /// which would make `show` fail with "expired" instead of printing the
+    /// version and expiry date.
+    #[test]
+    fn test_parse_root_bytes_expired_root_still_parses() {
+        let expired = include_bytes!("../tests/fixtures/sigstore_v14_expired.root.json");
+        let root = parse_root_bytes(expired).expect("an expired root must still parse for `show`");
+        assert_eq!(root.version, 14);
+        assert_eq!(root.expires, "2026-06-22T13:27:01Z");
+    }
+
+    /// Bug it catches: a `from_tuf` mapping that sends an expired root and
+    /// a tampered root to the same exit code, so scripts cannot tell "wait
+    /// for a refresh" from "this file was altered".
+    #[test]
+    fn test_tuf_root_error_exit_codes_are_distinct_and_documented() {
+        let codes = [
+            TufRootError::Usage(String::new()).exit_code(),
+            TufRootError::Malformed(String::new()).exit_code(),
+            TufRootError::Expired(String::new()).exit_code(),
+            TufRootError::Untrusted(String::new()).exit_code(),
+        ];
+        assert_eq!(codes, [1, 3, 4, 5]);
     }
 }

@@ -6,8 +6,8 @@ use std::io::{self, Write};
 use std::process::ExitCode;
 
 use cli::{
-    cmd_generate_key_pair, cmd_oidc_token, cmd_public_key, cmd_sign_blob, cmd_verify_blob,
-    print_usage, CliError,
+    cmd_generate_key_pair, cmd_oidc_token, cmd_public_key, cmd_sign_blob, cmd_tuf_root,
+    cmd_verify_blob, print_usage, CliError,
 };
 
 fn main() -> ExitCode {
@@ -16,6 +16,18 @@ fn main() -> ExitCode {
     let mut out = stdout.lock();
     let stderr = io::stderr();
     let mut err = stderr.lock();
+
+    // `tuf-root` reports distinct exit codes (expired vs malformed vs
+    // untrusted), so it is handled before the generic CliError path.
+    if argv.get(1).map(String::as_str) == Some("tuf-root") {
+        return match cmd_tuf_root(&argv[2..], &mut out) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                let _ = writeln!(err, "error: {e}");
+                ExitCode::from(e.exit_code())
+            }
+        };
+    }
 
     let result = match argv.get(1).map(String::as_str) {
         Some("generate-key-pair") => cmd_generate_key_pair(&argv[2..], &mut out),
