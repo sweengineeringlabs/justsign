@@ -1948,18 +1948,26 @@ mod tests {
     fn test_verify_bundled_root_self_signature_rejects_tampered_bytes() {
         let mut bytes: Vec<u8> = crate::embedded::SIGSTORE_PRODUCTION_ROOT_BYTES.to_vec();
         // Flip one ASCII byte inside the `signed` body. The byte
-        // we pick is the `4` in `"version": 14`; toggling its low
-        // bit changes the canonical form (numbers pass through to
-        // the canonical encoding) and so flips every signature.
-        let needle = b"\"version\": 14";
+        // we pick is the last digit of the `"version": N` marker (N
+        // tracks `SIGSTORE_PRODUCTION_ROOT_VERSION`, so a root
+        // refresh needs no edit here); incrementing it changes the
+        // canonical form (numbers pass through to the canonical
+        // encoding) and so flips every signature.
+        let needle = format!(
+            "\"version\": {}",
+            crate::embedded::SIGSTORE_PRODUCTION_ROOT_VERSION
+        )
+        .into_bytes();
         let pos = bytes
             .windows(needle.len())
-            .position(|w| w == needle)
-            .expect("bundled root contains version 14 marker");
-        // Mutate the ASCII '4' (0x34) -> '5' (0x35).
+            .position(|w| w == needle.as_slice())
+            .expect("bundled root contains the version marker");
         let target = pos + needle.len() - 1;
-        assert_eq!(bytes[target], b'4');
-        bytes[target] = b'5';
+        assert!(
+            (b'0'..=b'8').contains(&bytes[target]),
+            "version's last digit must be 0-8 so +1 stays a single digit"
+        );
+        bytes[target] += 1;
 
         let err = super::verify_bundled_root_self_signature(&bytes)
             .expect_err("tampered bytes must not self-verify");
