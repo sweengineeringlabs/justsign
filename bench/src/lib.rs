@@ -36,10 +36,9 @@ pub trait SignRunner {
 
 pub fn load_runners() -> Vec<Box<dyn SignRunner>> {
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/bench.toml");
-    let src = std::fs::read_to_string(path)
-        .unwrap_or_else(|e| panic!("cannot read {path}: {e}"));
-    let config: BenchConfig = toml::from_str(&src)
-        .unwrap_or_else(|e| panic!("invalid bench.toml: {e}"));
+    let src = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("cannot read {path}: {e}"));
+    let config: BenchConfig =
+        toml::from_str(&src).unwrap_or_else(|e| panic!("invalid bench.toml: {e}"));
     config.case.into_iter().filter_map(build_runner).collect()
 }
 
@@ -56,7 +55,7 @@ fn build_runner(case: CaseConfig) -> Option<Box<dyn SignRunner>> {
     }
 }
 
-#[cfg(feature = "justsign")]
-mod justsign_runner;
 #[cfg(feature = "cosign")]
 mod cosign_runner;
+#[cfg(feature = "justsign")]
+mod justsign_runner;

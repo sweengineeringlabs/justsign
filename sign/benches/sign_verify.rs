@@ -10,11 +10,11 @@
 //! Market comparison (subprocess startup included):
 //!   scripts/bench/compare_cosign.sh   (requires cosign 3.x on PATH)
 
-use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use p256::ecdsa::SigningKey;
 use rand_chacha::ChaCha20Rng;
 use rand_core::SeedableRng;
-use sign::{EcdsaP256Signer, VerifyingKey, sign_blob, verify_blob};
+use sign::{sign_blob, verify_blob, EcdsaP256Signer, VerifyingKey};
 
 /// Seeded RNG — deterministic across runs so the keypair is stable.
 fn seeded_rng() -> ChaCha20Rng {
@@ -24,11 +24,7 @@ fn seeded_rng() -> ChaCha20Rng {
 fn bench_sign_blob(c: &mut Criterion) {
     let mut group = c.benchmark_group("sign_blob");
 
-    let payloads: &[(usize, &str)] = &[
-        (1_024,        "1KB"),
-        (64_000,       "64KB"),
-        (1_048_576,    "1MB"),
-    ];
+    let payloads: &[(usize, &str)] = &[(1_024, "1KB"), (64_000, "64KB"), (1_048_576, "1MB")];
 
     for &(size, label) in payloads {
         let payload: Vec<u8> = (0..size).map(|i| i as u8).collect();
@@ -36,16 +32,12 @@ fn bench_sign_blob(c: &mut Criterion) {
         let signer = EcdsaP256Signer::new(sk, None);
 
         group.throughput(Throughput::Bytes(size as u64));
-        group.bench_with_input(
-            BenchmarkId::new("justsign", label),
-            &payload,
-            |b, p| {
-                b.iter(|| {
-                    sign_blob(p, "application/octet-stream", &signer, None)
-                        .expect("sign_blob must succeed")
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("justsign", label), &payload, |b, p| {
+            b.iter(|| {
+                sign_blob(p, "application/octet-stream", &signer, None)
+                    .expect("sign_blob must succeed")
+            });
+        });
     }
     group.finish();
 }
@@ -53,11 +45,7 @@ fn bench_sign_blob(c: &mut Criterion) {
 fn bench_verify_blob(c: &mut Criterion) {
     let mut group = c.benchmark_group("verify_blob");
 
-    let payloads: &[(usize, &str)] = &[
-        (1_024,        "1KB"),
-        (64_000,       "64KB"),
-        (1_048_576,    "1MB"),
-    ];
+    let payloads: &[(usize, &str)] = &[(1_024, "1KB"), (64_000, "64KB"), (1_048_576, "1MB")];
 
     for &(size, label) in payloads {
         let payload: Vec<u8> = (0..size).map(|i| i as u8).collect();

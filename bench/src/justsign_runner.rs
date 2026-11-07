@@ -2,7 +2,7 @@ use p256::ecdsa::SigningKey;
 use rand_chacha::ChaCha20Rng;
 use rand_core::SeedableRng;
 use sign::spec::sigstore_bundle::Bundle;
-use sign::{EcdsaP256Signer, VerifyingKey, sign_blob, verify_blob};
+use sign::{sign_blob, verify_blob, EcdsaP256Signer, VerifyingKey};
 
 use crate::{CaseConfig, SignRunner};
 
@@ -22,8 +22,12 @@ impl JustsignRunner {
             .params
             .get("payload_bytes")
             .and_then(|v| v.as_integer())
-            .unwrap_or_else(|| panic!("justsign case '{}': missing param 'payload_bytes'", case.label))
-            as usize;
+            .unwrap_or_else(|| {
+                panic!(
+                    "justsign case '{}': missing param 'payload_bytes'",
+                    case.label
+                )
+            }) as usize;
 
         let payload: Vec<u8> = (0..payload_bytes).map(|i| i as u8).collect();
 
@@ -36,7 +40,13 @@ impl JustsignRunner {
         let bundle = sign_blob(&payload, "application/octet-stream", &signer, None)
             .expect("justsign bench: setup sign_blob must succeed");
 
-        Self { label: case.label, payload, signer, bundle, trusted }
+        Self {
+            label: case.label,
+            payload,
+            signer,
+            bundle,
+            trusted,
+        }
     }
 }
 
@@ -50,8 +60,13 @@ impl SignRunner for JustsignRunner {
     }
 
     fn sign(&self) {
-        sign_blob(&self.payload, "application/octet-stream", &self.signer, None)
-            .expect("justsign bench: sign_blob must succeed");
+        sign_blob(
+            &self.payload,
+            "application/octet-stream",
+            &self.signer,
+            None,
+        )
+        .expect("justsign bench: sign_blob must succeed");
     }
 
     fn verify(&self) {

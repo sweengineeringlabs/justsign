@@ -117,8 +117,7 @@ use spec::{
     Bundle, BundleContent, BundleContentKind, Certificate as SpecCertificate, Checkpoint, Envelope,
     HashOutput, InclusionPromise, InclusionProof, KindVersion, LogId,
     MessageSignature as SpecMessageSignature, Signature as DsseSignature, Statement, Subject,
-    TlogEntry, VerificationMaterial,
-    IN_TOTO_STATEMENT_V1_TYPE, SIGSTORE_BUNDLE_V0_3_MEDIA_TYPE,
+    TlogEntry, VerificationMaterial, IN_TOTO_STATEMENT_V1_TYPE, SIGSTORE_BUNDLE_V0_3_MEDIA_TYPE,
 };
 use std::collections::BTreeMap;
 

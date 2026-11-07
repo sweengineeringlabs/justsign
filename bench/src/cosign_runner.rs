@@ -22,8 +22,12 @@ impl CosignRunner {
             .params
             .get("payload_bytes")
             .and_then(|v| v.as_integer())
-            .unwrap_or_else(|| panic!("cosign case '{}': missing param 'payload_bytes'", case.label))
-            as u64;
+            .unwrap_or_else(|| {
+                panic!(
+                    "cosign case '{}': missing param 'payload_bytes'",
+                    case.label
+                )
+            }) as u64;
 
         let tmp = TempDir::new().expect("cosign bench: failed to create work dir");
 
@@ -38,17 +42,25 @@ impl CosignRunner {
             .stderr(Stdio::null())
             .status()
             .expect("cosign bench: failed to spawn cosign generate-key-pair");
-        assert!(status.success(), "cosign generate-key-pair exited with {status}");
+        assert!(
+            status.success(),
+            "cosign generate-key-pair exited with {status}"
+        );
 
         let key_path = tmp.path().join("key.key");
 
         // Write payload once; re-used across all iterations.
         let payload: Vec<u8> = (0..payload_bytes as usize).map(|i| i as u8).collect();
         let payload_path = tmp.path().join("payload.bin");
-        fs::write(&payload_path, &payload)
-            .expect("cosign bench: failed to write payload");
+        fs::write(&payload_path, &payload).expect("cosign bench: failed to write payload");
 
-        Self { label: case.label, payload_bytes, key_path, payload_path, _tmp: tmp }
+        Self {
+            label: case.label,
+            payload_bytes,
+            key_path,
+            payload_path,
+            _tmp: tmp,
+        }
     }
 }
 
@@ -70,7 +82,9 @@ impl SignRunner for CosignRunner {
                 "--bundle",
                 "/dev/null",
                 "--yes",
-                self.payload_path.to_str().expect("payload path is valid utf-8"),
+                self.payload_path
+                    .to_str()
+                    .expect("payload path is valid utf-8"),
             ])
             .env("COSIGN_PASSWORD", "")
             .stdout(Stdio::null())

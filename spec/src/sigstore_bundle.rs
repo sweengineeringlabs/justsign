@@ -57,8 +57,7 @@ use crate::dsse::Envelope;
 /// cosign 3.x and sigstore-go 0.6+ require the new form. Verifiers
 /// pinned to the old string will silently reject our bundles with
 /// "bundle does not contain cert for verification".
-pub const SIGSTORE_BUNDLE_V0_3_MEDIA_TYPE: &str =
-    "application/vnd.dev.sigstore.bundle.v0.3+json";
+pub const SIGSTORE_BUNDLE_V0_3_MEDIA_TYPE: &str = "application/vnd.dev.sigstore.bundle.v0.3+json";
 
 /// Decoded Sigstore bundle.
 #[derive(Debug, Clone, PartialEq, Eq)]
