@@ -47,6 +47,10 @@ const HTTP_TIMEOUT_SECS: u64 = 30;
 /// [`crate::RekorClient`] one-for-one — only the `async fn` /
 /// `Future` shape differs. Object-safe via `async_trait`.
 #[async_trait]
+// `async_trait` boxes the future, and clippy 1.99+ then reports
+// `double_must_use` against the macro's own expansion (the attribute
+// is generated, not written here). A false positive; allow it narrowly.
+#[allow(clippy::double_must_use)]
 pub trait AsyncRekorClient: Send + Sync {
     /// Submit a `hashedrekord` entry, return the resulting
     /// [`LogEntry`] (UUID, log index, inclusion proof, body).

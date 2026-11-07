@@ -44,6 +44,10 @@ use crate::error::FulcioError;
 /// [`crate::FulcioClient`] one-for-one — only the `async fn` /
 /// `Future` shape differs. Object-safe via `async_trait`.
 #[async_trait]
+// `async_trait` boxes the future, and clippy 1.99+ then reports
+// `double_must_use` against the macro's own expansion (the attribute
+// is generated, not written here). A false positive; allow it narrowly.
+#[allow(clippy::double_must_use)]
 pub trait AsyncFulcioClient: Send + Sync {
     /// Submit a CSR + OIDC token, return the signed cert chain.
     async fn sign_csr(&self, csr: &Csr, oidc_token: &str) -> Result<CertChain, FulcioError>;

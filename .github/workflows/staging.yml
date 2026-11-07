@@ -146,7 +146,7 @@ jobs:
       - name: cargo test (pkcs11 e2e)
         run: |
           cargo test -p swe_justsign_sign --features pkcs11 \
-            test_pkcs11_signer_signs_against_softhsm_when_configured \
+            against_softhsm_when_configured \
             -- --nocapture
 
   tuf:

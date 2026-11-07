@@ -423,18 +423,19 @@ mod tests {
         }
     }
 
-    /// Bug it catches: drift between our `cryptoki` calls and the
-    /// real PKCS#11 ABI as exposed by SoftHSM2 / YubiKey. Unit
-    /// tests cover the input plumbing and the DER conversion;
-    /// only a live token surfaces a wrong `Mechanism::Ecdsa` /
-    /// missing C_Login / unsupported attribute combination.
-    ///
-    /// SKIP-pass shape — always-on, returns success when the env
-    /// vars aren't all set so CI on PRs without a SoftHSM2
-    /// fixture stays clean. Mirrors the Fulcio + Rekor staging
-    /// tests.
-    #[test]
-    fn test_pkcs11_signer_signs_against_softhsm_when_configured() {
+    /// A configured SoftHSM2 / PKCS#11 token, read from the
+    /// `JUSTSIGN_SOFTHSM_*` env vars. `None` (after printing a SKIP
+    /// line) when they are not all set, so CI without a token stays
+    /// green. Mirrors the Fulcio + Rekor staging tests.
+    struct SoftHsmFixture {
+        signer: Pkcs11Signer,
+        lib: String,
+        slot_id: u64,
+        pin: String,
+        label: String,
+    }
+
+    fn load_softhsm_fixture(test_name: &str) -> Option<SoftHsmFixture> {
         let lib = std::env::var("JUSTSIGN_SOFTHSM_LIB");
         let pin = std::env::var("JUSTSIGN_SOFTHSM_PIN");
         let label = std::env::var("JUSTSIGN_SOFTHSM_KEY_LABEL");
@@ -443,11 +444,10 @@ mod tests {
             (Ok(l), Ok(p), Ok(k)) if !l.is_empty() && !k.is_empty() => (l, p, k),
             _ => {
                 eprintln!(
-                    "SKIP: test_pkcs11_signer_signs_against_softhsm_when_configured \
-                     — set JUSTSIGN_SOFTHSM_LIB + JUSTSIGN_SOFTHSM_PIN + \
-                     JUSTSIGN_SOFTHSM_KEY_LABEL to enable"
+                    "SKIP: {test_name} - set JUSTSIGN_SOFTHSM_LIB + \
+                     JUSTSIGN_SOFTHSM_PIN + JUSTSIGN_SOFTHSM_KEY_LABEL to enable"
                 );
-                return;
+                return None;
             }
         };
 
@@ -455,7 +455,7 @@ mod tests {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or_else(|| {
-                // Discover the first slot with a token — SoftHSM2
+                // Discover the first slot with a token - SoftHSM2
                 // reassigns slot ids on init, so hardcoding is
                 // fragile. Calling get_slots_with_token here is
                 // the same dance softhsm2-util prints.
@@ -475,38 +475,147 @@ mod tests {
         let signer = Pkcs11Signer::new(
             &lib,
             slot_id,
-            if pin.is_empty() { None } else { Some(pin) },
+            if pin.is_empty() {
+                None
+            } else {
+                Some(pin.clone())
+            },
             &label,
         );
+        Some(SoftHsmFixture {
+            signer,
+            lib,
+            slot_id,
+            pin,
+            label,
+        })
+    }
+
+    /// Read the token's public key (the object sharing the signing
+    /// key's label) as a P-256 verifying key, so tests can check
+    /// signatures cryptographically instead of only their shape.
+    fn read_token_public_key(fx: &SoftHsmFixture) -> p256::ecdsa::VerifyingKey {
+        use cryptoki::object::AttributeType;
+
+        let pkcs11 = Pkcs11::new(&fx.lib).expect("load module");
+        pkcs11
+            .initialize(CInitializeArgs::OsThreads)
+            .expect("C_Initialize");
+        let slot = Slot::try_from(fx.slot_id).expect("slot id");
+        let session = pkcs11.open_ro_session(slot).expect("open session");
+        if !fx.pin.is_empty() {
+            session
+                .login(UserType::User, Some(&AuthPin::new(fx.pin.clone())))
+                .expect("login");
+        }
+        let handle = session
+            .find_objects(&[
+                Attribute::Class(ObjectClass::PUBLIC_KEY),
+                Attribute::Label(fx.label.as_bytes().to_vec()),
+            ])
+            .expect("find public key")
+            .into_iter()
+            .next()
+            .expect("token must hold a public key with the signing key's label");
+        let attrs = session
+            .get_attributes(handle, &[AttributeType::EcPoint])
+            .expect("read CKA_EC_POINT");
+        let point = attrs
+            .into_iter()
+            .find_map(|a| match a {
+                Attribute::EcPoint(p) => Some(p),
+                _ => None,
+            })
+            .expect("CKA_EC_POINT present");
+
+        // CKA_EC_POINT is a DER OCTET STRING wrapping the SEC1 point
+        // (04 <len> 04 || X || Y). Unwrap it when the wrapper is there.
+        let sec1: &[u8] =
+            if point.len() > 2 && point[0] == 0x04 && point[1] as usize == point.len() - 2 {
+                &point[2..]
+            } else {
+                &point
+            };
+        p256::ecdsa::VerifyingKey::from_sec1_bytes(sec1).expect("token key is a P-256 point")
+    }
+
+    /// Bug it catches: drift between our `cryptoki` calls and the
+    /// real PKCS#11 ABI as exposed by SoftHSM2 / YubiKey. Unit
+    /// tests cover the input plumbing and the DER conversion;
+    /// only a live token surfaces a wrong `Mechanism::Ecdsa` /
+    /// missing C_Login / unsupported attribute combination.
+    ///
+    /// The signature is VERIFIED against the token's public key
+    /// (SHA-256 of the payload), not just shape-checked: a signer
+    /// that returns well-formed DER of the wrong value must fail.
+    #[test]
+    fn test_pkcs11_signer_signs_against_softhsm_when_configured() {
+        use p256::ecdsa::signature::Verifier as _;
+
+        let Some(fx) =
+            load_softhsm_fixture("test_pkcs11_signer_signs_against_softhsm_when_configured")
+        else {
+            return;
+        };
 
         let payload = b"justsign pkcs11 e2e payload";
-        let sig = signer
+        let sig = fx
+            .signer
             .sign(payload)
             .expect("PKCS#11 signing against a configured token must succeed");
 
-        // Smoke-shape the DER output. ECDSA-P256 DER signatures are
-        // 70-72 bytes typically, never fewer than 8 (SEQUENCE { 0,
-        // INTEGER { 0 }, INTEGER { 0 } }), never more than 72.
+        let vk = read_token_public_key(&fx);
+        let parsed =
+            p256::ecdsa::DerSignature::try_from(sig.as_slice()).expect("signature is valid DER");
+        vk.verify(payload, &parsed)
+            .expect("signature must verify against the token's public key");
+
+        // Negative: the same signature must NOT verify for other bytes.
         assert!(
-            sig.len() >= 8 && sig.len() <= 72,
-            "P-256 DER signature length out of expected range: {}",
-            sig.len()
+            vk.verify(b"a different payload", &parsed).is_err(),
+            "signature must not verify over a different payload"
         );
-        assert_eq!(sig[0], 0x30, "DER signature must start with SEQUENCE tag");
-        let body_len = sig[1] as usize;
-        assert_eq!(
-            body_len + 2,
-            sig.len(),
-            "DER outer length must equal body bytes"
-        );
-        assert_eq!(sig[2], 0x02, "first body element must be INTEGER (r)");
-        let r_len = sig[3] as usize;
-        assert!(r_len > 0 && r_len <= 33, "r length out of range: {r_len}");
-        let s_tag_idx = 4 + r_len;
-        assert!(s_tag_idx < sig.len(), "DER body too short for s INTEGER");
-        assert_eq!(
-            sig[s_tag_idx], 0x02,
-            "second body element must be INTEGER (s)"
+    }
+
+    /// `sign_prehash` against a real token: the caller's SHA-256
+    /// digest is signed as-is, and the result verifies as a prehash
+    /// signature over that digest AND as an ordinary signature over
+    /// the original payload (both are SHA-256-then-ECDSA).
+    ///
+    /// Bug it catches: a `sign_prehash` that hashes the digest again
+    /// (double hashing) or signs the wrong bytes - the signature
+    /// would be well-formed but would not verify against the payload.
+    #[test]
+    fn test_pkcs11_signer_sign_prehash_against_softhsm_when_configured() {
+        use p256::ecdsa::signature::hazmat::PrehashVerifier as _;
+        use p256::ecdsa::signature::Verifier as _;
+
+        let Some(fx) =
+            load_softhsm_fixture("test_pkcs11_signer_sign_prehash_against_softhsm_when_configured")
+        else {
+            return;
+        };
+
+        let payload = b"justsign pkcs11 e2e prehash payload";
+        let digest = Sha256::digest(payload);
+        let sig = fx
+            .signer
+            .sign_prehash(&digest)
+            .expect("PKCS#11 prehash signing against a configured token must succeed");
+
+        let vk = read_token_public_key(&fx);
+        let parsed =
+            p256::ecdsa::DerSignature::try_from(sig.as_slice()).expect("signature is valid DER");
+        vk.verify_prehash(&digest, &parsed)
+            .expect("signature must verify over the digest");
+        vk.verify(payload, &parsed)
+            .expect("prehash signature over SHA-256(payload) must verify over the payload");
+
+        // Negative: a different digest must not verify.
+        let other = Sha256::digest(b"a different payload");
+        assert!(
+            vk.verify_prehash(&other, &parsed).is_err(),
+            "signature must not verify over a different digest"
         );
     }
 
