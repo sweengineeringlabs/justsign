@@ -662,6 +662,34 @@ mod tests {
             .expect("a later valid anchor must still be found");
     }
 
+    /// Bug it catches: an anchor loop that gives up on the first
+    /// anchor that fails to verify the chain (e.g. `?` on the
+    /// per-anchor result) instead of trying the rest. The first
+    /// anchor is an unrelated but perfectly valid P-256 root; only
+    /// the second is the real issuer.
+    #[test]
+    fn test_verify_chain_unrelated_p256_anchor_before_valid_anchor_succeeds() {
+        let synth = build_three_level_chain();
+        let unrelated = build_three_level_chain();
+
+        verify_chain(&synth.chain, &[unrelated.root_der, synth.root_der])
+            .expect("the second, valid anchor must still be found");
+    }
+
+    /// Bug it catches: dropping the exact-DER anchor match ("Case A")
+    /// so that pinning an *intermediate* as the trust anchor stops
+    /// working. The intermediate is not self-signed, so the
+    /// issuer-signature path ("Case B") cannot accept it; only the
+    /// byte-for-byte match can.
+    #[test]
+    fn test_verify_chain_top_cert_pinned_as_anchor_succeeds() {
+        let synth = build_three_level_chain();
+        let intermediate_der = synth.chain[1].clone();
+
+        verify_chain(&synth.chain, &[intermediate_der])
+            .expect("a chain whose top cert is itself a pinned anchor must verify");
+    }
+
     /// Build a self-signed Ed25519 root and an Ed25519 intermediate
     /// it signs. Returns `(root_der, intermediate_der)`. Mirrors what
     /// `a2ac-ca` issues, the real-world input that exposed the
