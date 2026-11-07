@@ -83,6 +83,16 @@ impl Signer for VaultTransitSigner {
             self.full_key_url()
         )))
     }
+
+    fn sign_prehash(&self, digest: &[u8]) -> Result<Vec<u8>, SignerError> {
+        // v0 stub, same posture as `sign`: the real impl (justsign#20)
+        // hands the caller's digest straight to the provider.
+        Err(SignerError::Stubbed(format!(
+            "VaultTransitSigner is a v0 typed stub; SDK integration tracked in justsign#20.              would have signed a {}-byte digest against key_url={}",
+            digest.len(),
+            self.full_key_url()
+        )))
+    }
 }
 
 #[cfg(test)]
@@ -163,5 +173,31 @@ mod tests {
             clean.key_id(),
             Some("https://vault.example.com:8200/v1/transit/keys/release-signer".to_string())
         );
+    }
+
+    /// Bug it catches: a stub that satisfies the `Signer` trait by
+    /// returning `Ok` (or panicking) from `sign_prehash`, which would
+    /// let a caller believe a digest was signed. It must be the same
+    /// typed `Stubbed` error as `sign`, citing the follow-up issue
+    /// and the digest length.
+    #[test]
+    fn test_sign_prehash_returns_stubbed_when_called_digest_length_in_message() {
+        let signer =
+            VaultTransitSigner::new("https://vault.example:8200", "transit", "build-signer");
+        let digest = [0u8; 32];
+
+        match signer.sign_prehash(&digest) {
+            Err(SignerError::Stubbed(msg)) => {
+                assert!(
+                    msg.contains("justsign#20"),
+                    "stub error must cite follow-up issue, got: {msg}"
+                );
+                assert!(
+                    msg.contains("32-byte digest"),
+                    "stub error must echo digest length, got: {msg}"
+                );
+            }
+            other => panic!("expected Stubbed, got {other:?}"),
+        }
     }
 }

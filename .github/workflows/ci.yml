@@ -57,6 +57,23 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+  # Feature-gated code (KMS stubs, PKCS#11, extra algorithms) is not
+  # compiled by the default jobs above, so a change to a shared trait
+  # (e.g. the `Signer::sign_prehash` addition) can break it unnoticed;
+  # it did, and only the nightly Staging job noticed, weeks later.
+  # Compile-only: no HSM / network needed.
+  all-features:
+    name: cargo check (all features)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: all-features
+      - name: cargo check
+        run: cargo check --workspace --all-features --all-targets
+
   fmt:
     name: cargo fmt --check
     runs-on: ubuntu-latest

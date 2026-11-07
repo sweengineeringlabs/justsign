@@ -64,6 +64,17 @@ impl Signer for AwsKmsSigner {
             self.region
         )))
     }
+
+    fn sign_prehash(&self, digest: &[u8]) -> Result<Vec<u8>, SignerError> {
+        // v0 stub, same posture as `sign`: the real impl (justsign#17)
+        // hands the caller's digest straight to the provider.
+        Err(SignerError::Stubbed(format!(
+            "AwsKmsSigner is a v0 typed stub; SDK integration tracked in justsign#17.              would have signed a {}-byte digest against key_arn={} in region={}",
+            digest.len(),
+            self.key_arn,
+            self.region
+        )))
+    }
 }
 
 #[cfg(test)]
@@ -135,5 +146,33 @@ mod tests {
         assert!(msg.contains("arn:aws:kms:ap-south-1:111:key/xyz"));
         assert!(msg.contains("ap-south-1"));
         assert!(msg.contains("0 bytes"));
+    }
+
+    /// Bug it catches: a stub that satisfies the `Signer` trait by
+    /// returning `Ok` (or panicking) from `sign_prehash`, which would
+    /// let a caller believe a digest was signed. It must be the same
+    /// typed `Stubbed` error as `sign`, citing the follow-up issue
+    /// and the digest length.
+    #[test]
+    fn test_sign_prehash_returns_stubbed_when_called_digest_length_in_message() {
+        let signer = AwsKmsSigner::new(
+            "arn:aws:kms:us-east-1:123456789012:key/abcd-1234",
+            "us-east-1",
+        );
+        let digest = [0u8; 32];
+
+        match signer.sign_prehash(&digest) {
+            Err(SignerError::Stubbed(msg)) => {
+                assert!(
+                    msg.contains("justsign#17"),
+                    "stub error must cite follow-up issue, got: {msg}"
+                );
+                assert!(
+                    msg.contains("32-byte digest"),
+                    "stub error must echo digest length, got: {msg}"
+                );
+            }
+            other => panic!("expected Stubbed, got {other:?}"),
+        }
     }
 }

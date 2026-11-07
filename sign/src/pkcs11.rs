@@ -220,6 +220,30 @@ impl Signer for Pkcs11Signer {
     }
 
     fn sign(&self, pae_bytes: &[u8]) -> Result<Vec<u8>, SignerError> {
+        // Hash the PAE bytes with SHA-256 BEFORE handing them to
+        // CKM_ECDSA. The raw `Ecdsa` mechanism in PKCS#11 signs the
+        // digest the caller provides -- it does NOT hash for us
+        // (that is what `CKM_ECDSA_SHA256` is for, but support for
+        // the prehashing variants is uneven across providers, and we
+        // want a single code path that works on SoftHSM2, YubiKey,
+        // AWS CloudHSM, and Thales Luna alike).
+        let mut hasher = Sha256::new();
+        hasher.update(pae_bytes);
+        self.sign_digest(&hasher.finalize())
+    }
+
+    fn sign_prehash(&self, digest: &[u8]) -> Result<Vec<u8>, SignerError> {
+        // The caller already holds the digest; the token signs it
+        // as-is. Callers are responsible for the digest algorithm
+        // (SHA-256 for P-256), per the trait contract.
+        self.sign_digest(digest)
+    }
+}
+
+impl Pkcs11Signer {
+    /// Open a session, find the key, and sign `digest` with raw
+    /// `CKM_ECDSA`. Shared by `sign` and `sign_prehash`.
+    fn sign_digest(&self, digest: &[u8]) -> Result<Vec<u8>, SignerError> {
         // 1. Load the module. Surface the path on every load failure
         //    — this is the highest-frequency operator error and
         //    losing the path makes diagnosis impossible.
@@ -286,22 +310,11 @@ impl Signer for Pkcs11Signer {
             }
         };
 
-        // 6. Hash the PAE bytes with SHA-256 BEFORE handing them to
-        //    CKM_ECDSA. The raw `Ecdsa` mechanism in PKCS#11 signs
-        //    the digest the caller provides — it does NOT hash for
-        //    us (that's what `CKM_ECDSA_SHA256` is for, but support
-        //    for the prehashing variants is uneven across providers,
-        //    and we want a single code path that works on SoftHSM2,
-        //    YubiKey, AWS CloudHSM, and Thales Luna alike).
-        let mut hasher = Sha256::new();
-        hasher.update(pae_bytes);
-        let digest = hasher.finalize();
-
-        // 7. Sign. The token returns r||s fixed-width bytes; we
+        // 6. Sign. The token returns r||s fixed-width bytes; we
         //    convert to DER below to match the wire format the
         //    rest of the crate expects.
         let raw_sig = session
-            .sign(&Mechanism::Ecdsa, key_handle, &digest)
+            .sign(&Mechanism::Ecdsa, key_handle, digest)
             .map_err(|e| SignerError::Pkcs11 {
                 cause: e.to_string(),
             })?;
@@ -383,6 +396,30 @@ mod tests {
                 );
             }
             other => panic!("expected SignerError::ModuleLoad, got {other:?}"),
+        }
+    }
+
+    /// `sign_prehash` must reach the same PKCS#11 session path as
+    /// `sign` (module load first), and must NOT be a stub that
+    /// returns `Ok` or a canned value.
+    ///
+    /// Bug it catches: a `sign_prehash` that returns early (e.g.
+    /// `Ok(digest.to_vec())`) instead of asking the token to sign.
+    /// With a bogus module path the only correct outcome is the
+    /// typed module-load error carrying that path -- the same one
+    /// `sign` produces.
+    #[test]
+    fn test_pkcs11_signer_sign_prehash_with_missing_module_returns_module_load_error() {
+        let bogus_path = "definitely-does-not-exist-libnope-justsign-prehash.so";
+        let signer = Pkcs11Signer::new(bogus_path, 0, None, "any");
+
+        let err = signer
+            .sign_prehash(&[0u8; 32])
+            .expect_err("prehash signing must fail when the module cannot be loaded");
+
+        match err {
+            SignerError::ModuleLoad { path, .. } => assert_eq!(path, bogus_path),
+            other => panic!("expected ModuleLoad, got {other:?}"),
         }
     }
 

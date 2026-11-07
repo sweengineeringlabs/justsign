@@ -53,6 +53,16 @@ impl Signer for GcpKmsSigner {
             self.key_resource_name
         )))
     }
+
+    fn sign_prehash(&self, digest: &[u8]) -> Result<Vec<u8>, SignerError> {
+        // v0 stub, same posture as `sign`: the real impl (justsign#18)
+        // hands the caller's digest straight to the provider.
+        Err(SignerError::Stubbed(format!(
+            "GcpKmsSigner is a v0 typed stub; SDK integration tracked in justsign#18.              would have signed a {}-byte digest against key_resource_name={}",
+            digest.len(),
+            self.key_resource_name
+        )))
+    }
 }
 
 #[cfg(test)]
@@ -123,5 +133,31 @@ mod tests {
         };
         assert!(msg.contains("projects/p/locations/us/keyRings/r/cryptoKeys/k/cryptoKeyVersions/9"));
         assert!(msg.contains("3 bytes"));
+    }
+
+    /// Bug it catches: a stub that satisfies the `Signer` trait by
+    /// returning `Ok` (or panicking) from `sign_prehash`, which would
+    /// let a caller believe a digest was signed. It must be the same
+    /// typed `Stubbed` error as `sign`, citing the follow-up issue
+    /// and the digest length.
+    #[test]
+    fn test_sign_prehash_returns_stubbed_when_called_digest_length_in_message() {
+        let signer =
+            GcpKmsSigner::new("projects/p/locations/l/keyRings/r/cryptoKeys/k/cryptoKeyVersions/1");
+        let digest = [0u8; 32];
+
+        match signer.sign_prehash(&digest) {
+            Err(SignerError::Stubbed(msg)) => {
+                assert!(
+                    msg.contains("justsign#18"),
+                    "stub error must cite follow-up issue, got: {msg}"
+                );
+                assert!(
+                    msg.contains("32-byte digest"),
+                    "stub error must echo digest length, got: {msg}"
+                );
+            }
+            other => panic!("expected Stubbed, got {other:?}"),
+        }
     }
 }
