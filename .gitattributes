@@ -1,3 +1,9 @@
+# Normalize all text files to LF in the repo and in working copies on every
+# OS, overriding core.autocrlf so Windows checkouts show no phantom
+# modifications. Git applies the LAST matching rule, so this catch-all must
+# stay first; the specific rules below override it.
+* text=auto eol=lf
+
 # Pin TUF root metadata assets to byte-exact LF storage.
 #
 # The bundled Sigstore production root in `tuf/assets/sigstore_prod.root.json`
