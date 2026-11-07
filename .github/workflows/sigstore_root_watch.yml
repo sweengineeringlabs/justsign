@@ -109,23 +109,34 @@ jobs:
         run: |
           set -euo pipefail
           branch="chore/sigstore-root-v${NEW_VERSION}"
+          title="chore(tuf): refresh bundled Sigstore production root v${OLD_VERSION} -> v${NEW_VERSION}"
 
-          # Idempotent: a branch or open PR for this version already exists.
-          if git ls-remote --exit-code --heads origin "${branch}" >/dev/null 2>&1; then
-            echo "Branch ${branch} already exists; not opening a duplicate."
+          # Idempotent on the PR, not on the branch: a branch can exist
+          # without a PR (e.g. PR creation was denied on an earlier run),
+          # and skipping on the branch alone would then never open one.
+          open_prs="$(gh pr list --head "${branch}" --state open --json number --jq 'length')"
+          if [ "${open_prs}" != "0" ]; then
+            echo "An open PR for ${branch} already exists; nothing to do."
             exit 0
           fi
 
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git checkout -b "${branch}"
-          git add tuf/assets/sigstore_prod.root.json tuf/src/embedded.rs
-          git commit -m "chore(tuf): refresh bundled Sigstore production root v${OLD_VERSION} -> v${NEW_VERSION}" \
-                     -m "Opened by the sigstore_root_watch workflow. CDN and sigstore/root-signing copies were byte-identical; the signature chain v${OLD_VERSION} -> v${NEW_VERSION} was verified by the live client. See the PR body for hashes."
-          git push origin "${branch}"
+          if git ls-remote --exit-code --heads origin "${branch}" >/dev/null 2>&1; then
+            echo "Branch ${branch} already exists without an open PR; reusing it."
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git checkout -b "${branch}"
+            git add tuf/assets/sigstore_prod.root.json tuf/src/embedded.rs
+            git commit -m "${title}" \
+                       -m "Opened by the sigstore_root_watch workflow. CDN and sigstore/root-signing copies were byte-identical; the signature chain v${OLD_VERSION} -> v${NEW_VERSION} was verified by the live client. See the PR body for hashes."
+            git push origin "${branch}"
+          fi
 
-          gh pr create \
-            --base "${BASE_BRANCH}" \
-            --head "${branch}" \
-            --title "chore(tuf): refresh bundled Sigstore production root v${OLD_VERSION} -> v${NEW_VERSION}" \
-            --body-file "${RUNNER_TEMP}/pr_body.md"
+          if ! gh pr create \
+                 --base "${BASE_BRANCH}" \
+                 --head "${branch}" \
+                 --title "${title}" \
+                 --body-file "${RUNNER_TEMP}/pr_body.md"; then
+            echo "::error title=Could not open the PR::The refresh is verified and pushed to branch ${branch}, but GitHub refused to create the pull request. Most likely the repository setting 'Settings > Actions > General > Allow GitHub Actions to create and approve pull requests' is off. Enable it and re-run, or open the PR by hand: https://github.com/${GITHUB_REPOSITORY}/compare/${BASE_BRANCH}...${branch}?expand=1"
+            exit 1
+          fi
