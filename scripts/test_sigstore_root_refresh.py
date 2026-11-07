@@ -55,6 +55,8 @@ class Workspace(unittest.TestCase):
             shutil.copy(REPO / rel, self.tmp / rel)
         self.asset = self.tmp / r.ASSET_RELPATH
         self.embedded = self.tmp / r.EMBEDDED_RS_RELPATH
+        # Only the real asset's VERSION and bytes are used by tests built on
+        # this fixture, never its expiry (see test_run_not_expiring_soon_*).
         self.old_bytes = self.asset.read_bytes()
         self.old_version = int(json.loads(self.old_bytes)["signed"]["version"])
 
@@ -229,8 +231,15 @@ class TestRun(Workspace):
         self.assertEqual(res["embedded_days_left"], 10)
 
     def test_run_not_expiring_soon_when_far_in_future(self):
-        res = self.run_it(self.mirror_at(self.old_version))
+        # Hermetic: do NOT depend on the repo's real asset expiry. That
+        # asset legitimately nears expiry (it is what this watcher exists
+        # to refresh), and a test reading it would then fail the
+        # watcher's own unit-test step right when it is needed.
+        far = a_root(self.old_version, "2099-01-01T00:00:00Z")
+        self.asset.write_bytes(far)
+        res = self.run_it(FakeMirror({self.old_version: far}, {self.old_version: far}))
         self.assertFalse(res["expiring_soon"])
+        self.assertGreater(res["embedded_days_left"], 365)
 
     def test_run_preserves_crlf_line_endings_of_embedded_rs(self):
         text = self.embedded.read_bytes().decode().replace("\r\n", "\n").replace("\n", "\r\n")
