@@ -33,6 +33,7 @@ All notable changes to this project are recorded here. Format follows [Keep a Ch
 
 ### Fixed
 
+- **TUF client could not verify the live Sigstore mirror.** `TufClient` verified signatures over the raw wire bytes of `signed`, but TUF signatures cover the canonical JSON form and Sigstore serves pretty-printed JSON, so every real root/timestamp failed with `BelowThreshold { valid: 0 }`. It now verifies over the canonical form. It also now requests `<N>.snapshot.json` / `<N>.targets.json` when `consistent_snapshot` is set (the plain names 404 on Sigstore), accepts version-only pins (hashes are optional in TUF) while enforcing `signed.version == pinned version` (new `TufError::VersionMismatch`), and hash-checks when hashes are present. The unit tests used compact, key-sorted fixtures that happen to equal the canonical form, which is why this was never caught; the `live_sigstore` test now passes against the real mirror.
 - `cert_chain::verify_chain` now returns `ChainError::UnsupportedAlgorithm` (naming the OID and chain index) instead of `RootNotTrusted` when the topmost certificate is signed with a non-ECDSA-P256-SHA256 algorithm (e.g. Ed25519) and is not itself a trust anchor. Previously the correct trust anchor was reported as untrusted (#42).
 
 ## [0.1.0] — TBD (pre-release)

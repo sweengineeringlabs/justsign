@@ -391,19 +391,20 @@ impl TufClient {
             };
 
             let spanned = parse_with_signed_span::<Root>(&bytes)?;
-            // Verify against the EXACT wire bytes of the `signed`
-            // field — approach (b) from the canonical-vs-span
-            // trade-off. The verifier sees byte-for-byte what the
-            // signer hashed, with zero re-canonicalisation drift
-            // surface.
-            let signed_wire_bytes = &bytes[spanned.signed_bytes.clone()];
+            // Verify against the CANONICAL form of `signed`. TUF
+            // signatures cover canonical JSON (OLPC), while real
+            // repositories (Sigstore's tuf-on-ci included) serve
+            // pretty-printed JSON, so the raw wire span is not what
+            // the signers hashed. The span is used only to locate
+            // `signed`; its bytes are re-emitted canonically.
+            let signed_canonical_bytes = canonical_signed_bytes(&bytes, &spanned.signed_bytes)?;
 
             // Old signs new: the previous root's root role must
             // approve this version's bytes.
             verify_role(
                 &current_root,
                 "root",
-                signed_wire_bytes,
+                &signed_canonical_bytes,
                 &spanned.signatures,
             )?;
 
@@ -414,7 +415,7 @@ impl TufClient {
             verify_role(
                 &spanned.signed,
                 "root",
-                signed_wire_bytes,
+                &signed_canonical_bytes,
                 &spanned.signatures,
             )?;
 
@@ -453,8 +454,13 @@ impl TufClient {
     pub fn fetch_timestamp(&self, root: &Root) -> Result<Timestamp, TufError> {
         let bytes = self.fetch_or_cached("timestamp.json")?;
         let spanned = parse_with_signed_span::<Timestamp>(&bytes)?;
-        let signed_wire_bytes = &bytes[spanned.signed_bytes.clone()];
-        verify_role(root, "timestamp", signed_wire_bytes, &spanned.signatures)?;
+        let signed_canonical_bytes = canonical_signed_bytes(&bytes, &spanned.signed_bytes)?;
+        verify_role(
+            root,
+            "timestamp",
+            &signed_canonical_bytes,
+            &spanned.signatures,
+        )?;
         if is_expired(&spanned.signed.expires, self.now())? {
             return Err(TufError::Expired {
                 role: "timestamp".to_string(),
@@ -474,7 +480,19 @@ impl TufClient {
     /// snapshot's hash means the verifier rejects any older
     /// snapshot the mirror tries to serve.
     pub fn fetch_snapshot(&self, root: &Root, timestamp: &Timestamp) -> Result<Snapshot, TufError> {
-        let bytes = self.fetch_or_cached("snapshot.json")?;
+        let meta = timestamp
+            .snapshot_meta()
+            .ok_or_else(|| TufError::MissingRole {
+                role: "snapshot.json".to_string(),
+            })?;
+        // With `consistent_snapshot` the file lives at
+        // `<VERSION>.snapshot.json` (VERSION from the timestamp's
+        // pin); the plain name does not exist on such repositories.
+        let bytes = self.fetch_or_cached(&metadata_path(
+            "snapshot.json",
+            root.consistent_snapshot,
+            meta.version,
+        ))?;
 
         // Hash cross-check: the SHA-256 of the on-wire snapshot bytes
         // must match `timestamp.snapshot_meta.hashes.sha256`. We do
@@ -482,16 +500,17 @@ impl TufClient {
         // mismatch is a stronger, cheaper rejection — no point
         // running ed25519 on bytes the timestamp role already
         // disowned.
-        let meta = timestamp
-            .snapshot_meta()
-            .ok_or_else(|| TufError::MissingRole {
-                role: "snapshot.json".to_string(),
-            })?;
         cross_check_sha256(&bytes, "snapshot", meta)?;
 
         let spanned = parse_with_signed_span::<Snapshot>(&bytes)?;
-        let signed_wire_bytes = &bytes[spanned.signed_bytes.clone()];
-        verify_role(root, "snapshot", signed_wire_bytes, &spanned.signatures)?;
+        let signed_canonical_bytes = canonical_signed_bytes(&bytes, &spanned.signed_bytes)?;
+        verify_role(
+            root,
+            "snapshot",
+            &signed_canonical_bytes,
+            &spanned.signatures,
+        )?;
+        check_pinned_version("snapshot", meta.version, spanned.signed.version)?;
         if is_expired(&spanned.signed.expires, self.now())? {
             return Err(TufError::Expired {
                 role: "snapshot".to_string(),
@@ -505,18 +524,27 @@ impl TufClient {
     /// cross-check its SHA-256 against
     /// `snapshot.targets_meta.hashes.sha256`.
     pub fn fetch_targets(&self, root: &Root, snapshot: &Snapshot) -> Result<Targets, TufError> {
-        let bytes = self.fetch_or_cached("targets.json")?;
-
         let meta = snapshot
             .targets_meta()
             .ok_or_else(|| TufError::MissingRole {
                 role: "targets.json".to_string(),
             })?;
+        let bytes = self.fetch_or_cached(&metadata_path(
+            "targets.json",
+            root.consistent_snapshot,
+            meta.version,
+        ))?;
         cross_check_sha256(&bytes, "targets", meta)?;
 
         let spanned = parse_with_signed_span::<Targets>(&bytes)?;
-        let signed_wire_bytes = &bytes[spanned.signed_bytes.clone()];
-        verify_role(root, "targets", signed_wire_bytes, &spanned.signatures)?;
+        let signed_canonical_bytes = canonical_signed_bytes(&bytes, &spanned.signed_bytes)?;
+        verify_role(
+            root,
+            "targets",
+            &signed_canonical_bytes,
+            &spanned.signatures,
+        )?;
+        check_pinned_version("targets", meta.version, spanned.signed.version)?;
         if is_expired(&spanned.signed.expires, self.now())? {
             return Err(TufError::Expired {
                 role: "targets".to_string(),
@@ -676,6 +704,47 @@ fn verify_bundled_root_self_signature(bytes: &[u8]) -> Result<(), TufError> {
     verify_role(&root, "root", &canonical_bytes, &signatures)
 }
 
+/// Canonical (OLPC) bytes of the `signed` value located at `span`
+/// inside the wire document `wire`.
+///
+/// TUF signatures cover the canonical JSON form of `signed`, but
+/// repositories do not have to serve it canonically (Sigstore's is
+/// pretty-printed), so verifying against the raw wire span fails with
+/// `BelowThreshold` on real metadata. The span (from
+/// [`parse_with_signed_span`]) is only used to find `signed`; the
+/// bytes handed to the verifier are re-emitted by
+/// [`crate::canonical::canonicalize`].
+///
+/// # Errors
+///
+/// [`TufError::Json`] if the span is not valid JSON;
+/// [`TufError::Canonicalization`] if it contains a float or an
+/// out-of-range number.
+fn canonical_signed_bytes(wire: &[u8], span: &std::ops::Range<usize>) -> Result<Vec<u8>, TufError> {
+    let signed_wire = wire.get(span.clone()).ok_or_else(|| {
+        TufError::Json(<serde_json::Error as serde::de::Error>::custom(
+            "signed span lies outside the document",
+        ))
+    })?;
+    let value: serde_json::Value = serde_json::from_slice(signed_wire).map_err(TufError::Json)?;
+    Ok(crate::canonical::canonicalize(&value)?)
+}
+
+/// Repository path of a versioned metadata file.
+///
+/// With `consistent_snapshot` (TUF spec 5.6) snapshot and targets
+/// metadata are published as `<VERSION>.<name>`, where VERSION comes
+/// from the referring role's pin; the unprefixed name does not exist
+/// on such repositories (it 404s on Sigstore's). Without it the plain
+/// name is used. Timestamp is never version-prefixed.
+fn metadata_path(name: &str, consistent_snapshot: bool, version: u32) -> String {
+    if consistent_snapshot {
+        format!("{version}.{name}")
+    } else {
+        name.to_string()
+    }
+}
+
 /// Sanitise a TUF metadata path to a safe filename for the cache.
 ///
 /// TUF metadata paths are simple (`timestamp.json`, `7.root.json`)
@@ -687,15 +756,22 @@ fn safe_cache_filename(path: &str) -> String {
 }
 
 /// Cross-check the SHA-256 of `bytes` against `meta.hashes.sha256`.
-/// Returns `Ok(())` only if both are present and identical.
+///
+/// `hashes` and `length` are OPTIONAL in TUF's file metadata
+/// (Sigstore's timestamp pins the snapshot by version only). When
+/// `hashes` is absent there is nothing to compare and this returns
+/// `Ok(())`; the pin is then enforced by [`check_pinned_version`],
+/// which the callers always run. When `hashes` is present it must
+/// contain `sha256` and match, else [`TufError::MissingHash`] /
+/// [`TufError::HashMismatch`].
 fn cross_check_sha256(
     bytes: &[u8],
     role: &str,
     meta: &crate::types::MetaInfo,
 ) -> Result<(), TufError> {
-    let hashes = meta.hashes.as_ref().ok_or_else(|| TufError::MissingHash {
-        role: role.to_string(),
-    })?;
+    let Some(hashes) = meta.hashes.as_ref() else {
+        return Ok(());
+    };
     let expected = hashes.get("sha256").ok_or_else(|| TufError::MissingHash {
         role: role.to_string(),
     })?;
@@ -708,6 +784,22 @@ fn cross_check_sha256(
         });
     }
     Ok(())
+}
+
+/// Require the fetched file's own `signed.version` to equal the
+/// version its referring role pinned (TUF spec 5.5/5.6). With
+/// version-only pins this is the only thing tying the file to the
+/// signed referrer, so it runs whether or not a hash was also present.
+fn check_pinned_version(role: &str, pinned: u32, actual: u32) -> Result<(), TufError> {
+    if pinned == actual {
+        Ok(())
+    } else {
+        Err(TufError::VersionMismatch {
+            role: role.to_string(),
+            pinned,
+            actual,
+        })
+    }
 }
 
 /// Plain SHA-256 lowercase hex. Local impl to avoid pulling another
@@ -1261,6 +1353,62 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// Real TUF repositories (Sigstore's tuf-on-ci among them) serve
+    /// pretty-printed JSON, while signatures cover the CANONICAL form
+    /// of `signed`. `fetch_timestamp` must verify against the
+    /// canonical bytes, not the raw wire span.
+    ///
+    /// Bug it catches: verifying against `&bytes[signed_span]`
+    /// directly. That only works when the producer happened to serve
+    /// canonical bytes (as the compact `serde_json::to_vec` fixtures
+    /// elsewhere in this module do), and fails with
+    /// `BelowThreshold { valid: 0 }` against the live Sigstore mirror.
+    #[test]
+    fn test_fetch_timestamp_pretty_printed_wire_form_verifies_against_canonical_bytes() {
+        let dir = unique_temp_dir("pretty_wire");
+        let (root1, sks1) = build_test_root(1, 1, 1, "2099-01-01T00:00:00Z");
+
+        let mut meta = BTreeMap::new();
+        meta.insert(
+            "snapshot.json".to_string(),
+            crate::types::MetaInfo {
+                version: 1,
+                length: None,
+                hashes: None,
+            },
+        );
+        let ts = Timestamp {
+            type_field: "timestamp".into(),
+            spec_version: "1.0.31".into(),
+            version: 1,
+            expires: "2099-12-31T00:00:00Z".into(),
+            meta,
+        };
+        let signed_value = serde_json::to_value(&ts).unwrap();
+        let canonical = canonicalize(&signed_value).unwrap();
+        let sig = sks1[0].sign(&canonical);
+        let env = json!({
+            "signed": signed_value,
+            "signatures": [{"keyid": "k0", "sig": hex::encode(sig.to_bytes())}]
+        });
+        let bytes = serde_json::to_vec_pretty(&env).unwrap();
+        assert!(
+            !bytes
+                .windows(canonical.len())
+                .any(|w| w == canonical.as_slice()),
+            "fixture must NOT contain the canonical bytes verbatim, or this test proves nothing"
+        );
+
+        let server = LocalServer::start(vec![("timestamp.json".into(), bytes)]);
+        let client = TufClient::new(&server.base_url, &dir).expect("client");
+
+        let fetched = client
+            .fetch_timestamp(&root1)
+            .expect("pretty-printed wire form signed over canonical bytes must verify");
+        assert_eq!(fetched.version, 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// Cache hit path: pre-seed the cache dir; fetch_timestamp must
     /// return the cached bytes WITHOUT making an HTTP request.
     ///
@@ -1423,7 +1571,7 @@ mod tests {
             meta: ts_meta,
         };
 
-        let server = LocalServer::start(vec![("snapshot.json".into(), snap_bytes)]);
+        let server = LocalServer::start(vec![("1.snapshot.json".into(), snap_bytes)]);
         let client = TufClient::new(&server.base_url, &dir).expect("client");
         let err = client
             .fetch_snapshot(&root1, &ts)
@@ -1486,7 +1634,7 @@ mod tests {
             meta: snap_meta,
         };
 
-        let server = LocalServer::start(vec![("targets.json".into(), targets_bytes)]);
+        let server = LocalServer::start(vec![("1.targets.json".into(), targets_bytes)]);
         let client = TufClient::new(&server.base_url, &dir).expect("client");
         let err = client
             .fetch_targets(&root1, &snap)
@@ -1498,6 +1646,217 @@ mod tests {
             }
             other => panic!("expected HashMismatch, got {other:?}"),
         }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Sign `signed_value` with the test root's key and return the
+    /// served envelope bytes.
+    fn sign_envelope(signed_value: &serde_json::Value, sk: &SigningKey) -> Vec<u8> {
+        let canonical = canonicalize(signed_value).unwrap();
+        let sig = sk.sign(&canonical);
+        let env = json!({
+            "signed": signed_value,
+            "signatures": [{"keyid": "k0", "sig": hex::encode(sig.to_bytes())}]
+        });
+        serde_json::to_vec(&env).unwrap()
+    }
+
+    /// Build a `MetaInfo` pinning `bytes` at `version`.
+    fn pin(bytes: &[u8], version: u32) -> crate::types::MetaInfo {
+        let mut hashes = BTreeMap::new();
+        hashes.insert("sha256".to_string(), sha256_lower_hex(bytes));
+        crate::types::MetaInfo {
+            version,
+            length: Some(bytes.len() as u64),
+            hashes: Some(hashes),
+        }
+    }
+
+    fn a_snapshot_envelope(sk: &SigningKey) -> Vec<u8> {
+        let snap = Snapshot {
+            type_field: "snapshot".into(),
+            spec_version: "1.0.31".into(),
+            version: 7,
+            expires: "2099-12-31T00:00:00Z".into(),
+            meta: BTreeMap::new(),
+        };
+        sign_envelope(&serde_json::to_value(&snap).unwrap(), sk)
+    }
+
+    fn a_timestamp_pinning(snapshot_bytes: &[u8], snapshot_version: u32) -> Timestamp {
+        let mut meta = BTreeMap::new();
+        meta.insert(
+            "snapshot.json".to_string(),
+            pin(snapshot_bytes, snapshot_version),
+        );
+        Timestamp {
+            type_field: "timestamp".into(),
+            spec_version: "1.0.31".into(),
+            version: 1,
+            expires: "2099-12-31T00:00:00Z".into(),
+            meta,
+        }
+    }
+
+    /// A timestamp that pins the snapshot by VERSION ONLY (no
+    /// `hashes`) is valid TUF and is exactly what Sigstore serves.
+    ///
+    /// Bug it catches: demanding a sha256 on every pin, which fails
+    /// the live mirror with `MissingHash { role: "snapshot" }`.
+    #[test]
+    fn test_fetch_snapshot_version_only_pin_without_hashes_succeeds() {
+        let dir = unique_temp_dir("snap_version_only");
+        let (root1, sks1) = build_test_root(1, 1, 1, "2099-01-01T00:00:00Z");
+
+        let snap_bytes = a_snapshot_envelope(&sks1[0]);
+        let mut ts = a_timestamp_pinning(&snap_bytes, 7);
+        ts.meta.insert(
+            "snapshot.json".to_string(),
+            crate::types::MetaInfo {
+                version: 7,
+                length: None,
+                hashes: None,
+            },
+        );
+
+        let server = LocalServer::start(vec![("7.snapshot.json".into(), snap_bytes)]);
+        let client = TufClient::new(&server.base_url, &dir).expect("client");
+        let snap = client
+            .fetch_snapshot(&root1, &ts)
+            .expect("a version-only pin must be accepted");
+        assert_eq!(snap.version, 7);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// With a version-only pin there is no hash to catch a stale file,
+    /// so the file's own `signed.version` MUST equal the pinned one.
+    ///
+    /// Bug it catches: dropping the hash requirement WITHOUT adding
+    /// the version binding, which would let a mirror serve an older,
+    /// still validly signed snapshot under the new snapshot's name
+    /// (a rollback / mix-and-match attack).
+    #[test]
+    fn test_fetch_snapshot_version_only_pin_rejects_file_with_different_version() {
+        let dir = unique_temp_dir("snap_version_mismatch");
+        let (root1, sks1) = build_test_root(1, 1, 1, "2099-01-01T00:00:00Z");
+
+        // The served file says version 7 ...
+        let snap_bytes = a_snapshot_envelope(&sks1[0]);
+        // ... but the timestamp pinned version 9, with no hash.
+        let mut ts = a_timestamp_pinning(&snap_bytes, 9);
+        ts.meta.insert(
+            "snapshot.json".to_string(),
+            crate::types::MetaInfo {
+                version: 9,
+                length: None,
+                hashes: None,
+            },
+        );
+
+        let server = LocalServer::start(vec![("9.snapshot.json".into(), snap_bytes)]);
+        let client = TufClient::new(&server.base_url, &dir).expect("client");
+        let err = client
+            .fetch_snapshot(&root1, &ts)
+            .expect_err("a file whose version differs from the pin must be rejected");
+        assert!(
+            matches!(
+                err,
+                TufError::VersionMismatch {
+                    ref role,
+                    pinned: 9,
+                    actual: 7
+                } if role == "snapshot"
+            ),
+            "expected VersionMismatch {{ snapshot, pinned 9, actual 7 }}, got {err:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// With `consistent_snapshot: true` (Sigstore's setting) TUF
+    /// serves the snapshot at `<VERSION>.snapshot.json`, where VERSION
+    /// comes from the timestamp's snapshot pin. The plain
+    /// `snapshot.json` does not exist on such repositories.
+    ///
+    /// Bug it catches: always requesting `snapshot.json`, which 404s
+    /// against the live Sigstore mirror. The server here serves ONLY
+    /// the versioned name, so the plain-name client fails with
+    /// `NotFound`.
+    #[test]
+    fn test_fetch_snapshot_consistent_snapshot_requests_versioned_name() {
+        let dir = unique_temp_dir("snap_consistent");
+        let (root1, sks1) = build_test_root(1, 1, 1, "2099-01-01T00:00:00Z");
+        assert!(root1.consistent_snapshot, "fixture root must be consistent");
+
+        let snap_bytes = a_snapshot_envelope(&sks1[0]);
+        let ts = a_timestamp_pinning(&snap_bytes, 7);
+
+        let server = LocalServer::start(vec![("7.snapshot.json".into(), snap_bytes)]);
+        let client = TufClient::new(&server.base_url, &dir).expect("client");
+        let snap = client
+            .fetch_snapshot(&root1, &ts)
+            .expect("versioned snapshot name must be requested");
+        assert_eq!(snap.version, 7);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Without consistent snapshots the plain name is used.
+    ///
+    /// Bug it catches: over-correcting to always use the versioned
+    /// name, which would break repositories that do not set
+    /// `consistent_snapshot`.
+    #[test]
+    fn test_fetch_snapshot_not_consistent_requests_plain_name() {
+        let dir = unique_temp_dir("snap_plain");
+        let (mut root1, sks1) = build_test_root(1, 1, 1, "2099-01-01T00:00:00Z");
+        root1.consistent_snapshot = false;
+
+        let snap_bytes = a_snapshot_envelope(&sks1[0]);
+        let ts = a_timestamp_pinning(&snap_bytes, 7);
+
+        let server = LocalServer::start(vec![("snapshot.json".into(), snap_bytes)]);
+        let client = TufClient::new(&server.base_url, &dir).expect("client");
+        let snap = client
+            .fetch_snapshot(&root1, &ts)
+            .expect("plain snapshot name must be requested");
+        assert_eq!(snap.version, 7);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Same rule for targets: `<VERSION>.targets.json`, VERSION from
+    /// the snapshot's pin of `targets.json`.
+    ///
+    /// Bug it catches: fixing the snapshot hop but leaving the
+    /// targets hop on the plain name.
+    #[test]
+    fn test_fetch_targets_consistent_snapshot_requests_versioned_name() {
+        let dir = unique_temp_dir("tgts_consistent");
+        let (root1, sks1) = build_test_root(1, 1, 1, "2099-01-01T00:00:00Z");
+
+        let targets = Targets {
+            type_field: "targets".into(),
+            spec_version: "1.0.31".into(),
+            version: 3,
+            expires: "2099-12-31T00:00:00Z".into(),
+            targets: BTreeMap::new(),
+            delegations: None,
+        };
+        let targets_bytes = sign_envelope(&serde_json::to_value(&targets).unwrap(), &sks1[0]);
+        let mut snap_meta = BTreeMap::new();
+        snap_meta.insert("targets.json".to_string(), pin(&targets_bytes, 3));
+        let snap = Snapshot {
+            type_field: "snapshot".into(),
+            spec_version: "1.0.31".into(),
+            version: 7,
+            expires: "2099-12-31T00:00:00Z".into(),
+            meta: snap_meta,
+        };
+
+        let server = LocalServer::start(vec![("3.targets.json".into(), targets_bytes)]);
+        let client = TufClient::new(&server.base_url, &dir).expect("client");
+        let fetched = client
+            .fetch_targets(&root1, &snap)
+            .expect("versioned targets name must be requested");
+        assert_eq!(fetched.version, 3);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1610,62 +1969,35 @@ mod tests {
 
     // ─── span-vs-canonical migration tests ──────────────────────
 
-    /// The migration from approach (a) (re-canonicalise the parsed
-    /// `signed` value) to approach (b) (verify against the exact wire
-    /// bytes of the `signed` field) must produce a verifier that
-    /// accepts a metadata document signed over its on-the-wire form
-    /// even when that form is NOT byte-equal to what our
-    /// canonicaliser would have emitted.
+    /// TUF signatures cover the CANONICAL form of `signed`, so a
+    /// document whose signature was computed over its non-canonical
+    /// wire bytes must be REJECTED.
     ///
-    /// This test constructs exactly that scenario: a `timestamp.json`
-    /// envelope where the `signed` field carries non-canonical
-    /// whitespace (spaces after `:` and `,`). The signature is
-    /// computed over those EXACT wire bytes, not over the
-    /// canonicalised form. The post-#22 `TufClient` must accept it.
+    /// History: an earlier version of this test (and of the client)
+    /// asserted the opposite -- that the verifier should hash the
+    /// exact wire bytes. That premise is wrong for real TUF metadata:
+    /// Sigstore serves pretty-printed JSON whose signatures verify
+    /// only over the canonical form, so the wire-bytes client failed
+    /// `BelowThreshold { valid: 0 }` against the live mirror (see
+    /// `test_fetch_timestamp_pretty_printed_wire_form_verifies_against_canonical_bytes`).
     ///
-    /// To prove this is the migration's value (not an accident of
-    /// the test fixture matching the canonicaliser), we additionally
-    /// re-parse the same `signed` field and re-canonicalise it; the
-    /// resulting bytes must DIFFER from the wire bytes, AND a manual
-    /// `verify_role` call against those canonicalised bytes must
-    /// fail. That second assertion is the load-bearing one: it shows
-    /// the (a) approach this slice replaces would have rejected this
-    /// document, while the (b) approach now wired into `TufClient`
-    /// accepts it.
-    ///
-    /// Bug it catches: a `TufClient` that internally re-canonicalises
-    /// before verifying (the (a) approach pre-#22) — would silently
-    /// reject any producer whose canonicalisation differs from ours
-    /// even by one byte. Real-world hazard: a Sigstore root signed
-    /// with a slightly different escape policy than our encoder
-    /// emits. The (b) path eliminates this entire bug class because
-    /// the verifier sees the exact bytes the producer hashed.
+    /// Bug it catches: a verifier that hashes whatever bytes are on
+    /// the wire, and therefore accepts signatures no conforming TUF
+    /// producer would emit while rejecting every real one.
     #[test]
-    fn test_fetch_role_verifies_against_wire_bytes_not_recanonicalised() {
-        let dir = unique_temp_dir("wire_bytes_not_recanon");
+    fn test_fetch_timestamp_signature_over_non_canonical_wire_bytes_is_rejected() {
+        let dir = unique_temp_dir("wire_bytes_rejected");
         let (root1, sks1) = build_test_root(1, 1, 1, "2099-01-01T00:00:00Z");
 
-        // Hand-roll the `signed` wire bytes: pretty-printed with
-        // leading whitespace inside the object. Canonical JSON would
-        // emit no whitespace and sort keys; this form deliberately
-        // does neither.
-        //
-        // Field order here also differs from canonical (which sorts
-        // alphabetically: `_type`, `expires`, `meta`, `spec_version`,
-        // `version`). We put `_type` first by convention, then
-        // `version`, then `spec_version`, then `expires`, then
-        // `meta`. The canonicaliser would re-order; this hand-rolled
-        // form does not.
+        // Non-canonical `signed`: spaces after `:` and `,`, and keys
+        // out of canonical (alphabetical) order.
         let signed_wire = b"{ \"_type\": \"timestamp\", \"version\": 1, \"spec_version\": \"1.0.31\", \"expires\": \"2099-12-31T00:00:00Z\", \"meta\": { \"snapshot.json\": { \"version\": 1 } } }";
 
-        // Sign the EXACT wire bytes (approach (b)).
+        // Sign the EXACT wire bytes (what a non-conforming producer
+        // would do).
         let sig = sks1[0].sign(signed_wire);
         let sig_hex = hex::encode(sig.to_bytes());
 
-        // Build the envelope around those wire bytes verbatim. We
-        // must not let `serde_json::to_vec` re-emit the `signed`
-        // field; if it did, the bytes the verifier sees would be
-        // serde's canonical-ish output, not our hand-rolled form.
         let mut envelope_bytes: Vec<u8> = Vec::new();
         envelope_bytes.extend_from_slice(b"{\"signed\":");
         envelope_bytes.extend_from_slice(signed_wire);
@@ -1673,63 +2005,31 @@ mod tests {
         envelope_bytes.extend_from_slice(sig_hex.as_bytes());
         envelope_bytes.extend_from_slice(b"\"}]}");
 
-        // Sanity: the (b) span parser recovers the EXACT wire bytes
-        // we built. Without this, the test could pass for the wrong
-        // reason (e.g. span parser recovering a different range that
-        // happens to also verify).
-        let spanned: crate::span::SpannedSignedEnvelope<Timestamp> =
-            crate::span::parse_with_signed_span(&envelope_bytes).expect("span parse");
-        assert_eq!(
-            &envelope_bytes[spanned.signed_bytes.clone()],
-            signed_wire,
-            "span parser must recover the wire bytes verbatim",
-        );
-
-        // Drive the migrated client. Approach (b) verifies signature
-        // against the wire bytes — this MUST succeed.
-        let server = LocalServer::start(vec![("timestamp.json".into(), envelope_bytes.clone())]);
-        let client = TufClient::new(&server.base_url, &dir).expect("client");
-        let ts = client
-            .fetch_timestamp(&root1)
-            .expect("(b) wire-bytes verifier must accept producer's exact bytes");
-        assert_eq!(ts.version, 1);
-
-        // Now prove that approach (a) — re-canonicalising — would
-        // have rejected the SAME document. Recover the typed `signed`
-        // value, canonicalise it, and try the verify_role we just
-        // succeeded with against those bytes instead.
+        // The fixture only means something if canonical != wire.
         let v: serde_json::Value =
             serde_json::from_slice(&envelope_bytes).expect("envelope reparse");
-        let signed_value = v.get("signed").expect("envelope has signed").clone();
-        let canonical_bytes = canonicalize(&signed_value).expect("canonicalise");
+        let canonical_bytes = canonicalize(v.get("signed").expect("signed")).expect("canonicalise");
         assert_ne!(
             canonical_bytes.as_slice(),
             signed_wire,
-            "fixture is only meaningful if canonicaliser emits different bytes than the wire",
+            "fixture is only meaningful if the canonical form differs from the wire bytes",
         );
 
-        let signatures: Vec<Signature> = vec![Signature {
-            keyid: "k0".into(),
-            sig: sig_hex.clone(),
-        }];
-        let canonical_verify =
-            crate::root::verify_role(&root1, "timestamp", &canonical_bytes, &signatures);
-        match canonical_verify {
-            Err(TufError::BelowThreshold {
-                required: 1,
-                valid: 0,
-            }) => {
-                // The (a) path rejects, as expected. The (b) path
-                // accepted (above). Migration value proven.
-            }
-            other => panic!(
-                "(a) canonicalise path was expected to reject this fixture (BelowThreshold), \
-                 got {other:?}. If this assertion fails, the test fixture no longer demonstrates \
-                 a divergence between the wire form and the canonical form, so it does not \
-                 prove the (b) migration's value."
+        let server = LocalServer::start(vec![("timestamp.json".into(), envelope_bytes)]);
+        let client = TufClient::new(&server.base_url, &dir).expect("client");
+        let err = client
+            .fetch_timestamp(&root1)
+            .expect_err("a signature over non-canonical wire bytes must not verify");
+        assert!(
+            matches!(
+                err,
+                TufError::BelowThreshold {
+                    required: 1,
+                    valid: 0
+                }
             ),
-        }
-
+            "expected BelowThreshold {{ required: 1, valid: 0 }}, got {err:?}"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -233,6 +233,21 @@ pub enum TufError {
     /// walk: root N+1 must have `version > N`. Defends against an
     /// attacker downgrading the chain by serving an old root.json
     /// from a path the new chain still resolves to.
+    /// A fetched metadata file's own `signed.version` differs from the
+    /// version its referring role pinned. This is the binding that
+    /// stops a mirror serving a stale (rolled-back) or mixed-in file
+    /// when the referrer pins by version only, with no hash (as
+    /// Sigstore's timestamp does for the snapshot).
+    #[error("role {role} version mismatch: pinned {pinned}, file says {actual}")]
+    VersionMismatch {
+        /// Role whose file was checked (`snapshot`, `targets`).
+        role: String,
+        /// Version the referring role pinned.
+        pinned: u32,
+        /// `signed.version` found in the fetched file.
+        actual: u32,
+    },
+
     #[error("root version regressed: previous {previous}, fetched {fetched}")]
     VersionRegression {
         /// Version of the previously-trusted root.
