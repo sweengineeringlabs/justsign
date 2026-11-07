@@ -16,11 +16,11 @@
 //! # Provenance
 //!
 //! The bytes were fetched from
-//! <https://tuf-repo-cdn.sigstore.dev/14.root.json> and cross-checked
+//! <https://tuf-repo-cdn.sigstore.dev/16.root.json> and cross-checked
 //! against the Sigstore root-signing GitHub repository at
 //! <https://raw.githubusercontent.com/sigstore/root-signing/main/metadata/root.json>
 //! and
-//! <https://raw.githubusercontent.com/sigstore/root-signing/main/metadata/root_history/14.root.json>.
+//! <https://raw.githubusercontent.com/sigstore/root-signing/main/metadata/root_history/16.root.json>.
 //! All three sources produced byte-identical content. See the v0.1.0
 //! commit message that landed this asset for the fetch timestamp and
 //! the SHA-256 cross-check.
@@ -73,21 +73,21 @@ pub const SIGSTORE_PRODUCTION_ROOT_BYTES: &[u8] =
 /// CDN AND the Sigstore root-signing GitHub repository before being
 /// committed.
 pub const SIGSTORE_PRODUCTION_ROOT_SHA256: &str =
-    "c8c41ec13f06ccabf5b48541ee2550098b4c7b5349e1d180390c29a7d5c2642c";
+    "27aea7e372aa7864065174f0661784fcf8b0e28b1dbfebeada31a0f1fb19167f";
 
 /// Source URL the embedded bytes were fetched from.
-pub const SIGSTORE_PRODUCTION_ROOT_SOURCE: &str = "https://tuf-repo-cdn.sigstore.dev/14.root.json";
+pub const SIGSTORE_PRODUCTION_ROOT_SOURCE: &str = "https://tuf-repo-cdn.sigstore.dev/16.root.json";
 
 /// UTC ISO 8601 timestamp the bytes were fetched from
 /// [`SIGSTORE_PRODUCTION_ROOT_SOURCE`].
-pub const SIGSTORE_PRODUCTION_ROOT_FETCHED_AT: &str = "2026-04-27T12:05:00Z";
+pub const SIGSTORE_PRODUCTION_ROOT_FETCHED_AT: &str = "2026-11-07T17:47:51Z";
 
 /// Sigstore TUF root version number embedded in the asset.
 ///
 /// Cross-checked against the parsed `signed.version` field by the
 /// runtime test
 /// ([`tests::test_embedded_root_version_matches_metadata`]).
-pub const SIGSTORE_PRODUCTION_ROOT_VERSION: u32 = 14;
+pub const SIGSTORE_PRODUCTION_ROOT_VERSION: u32 = 16;
 
 #[cfg(test)]
 mod tests {
