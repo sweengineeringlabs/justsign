@@ -78,6 +78,16 @@ jobs:
       - name: cargo check
         run: cargo check --workspace --all-features --all-targets
 
+  # Unit tests for the Sigstore root refresh script (scripts/), which the
+  # monthly sigstore_root_watch workflow depends on. Stdlib only.
+  scripts:
+    name: python scripts (unittest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: unittest
+        run: python3 -m unittest discover -s scripts -v
+
   fmt:
     name: cargo fmt --check
     runs-on: ubuntu-latest

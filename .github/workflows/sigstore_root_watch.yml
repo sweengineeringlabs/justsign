@@ -1,0 +1,131 @@
+# Monthly watcher for Sigstore production TUF root rotations (issue #33).
+#
+# justsign bundles a Sigstore root (tuf/assets/sigstore_prod.root.json) as the
+# TUF bootstrap. Roots expire; one did (v14, 2026-06-22) and broke every build
+# because nothing refreshed it. This workflow closes that loop:
+#
+#   1. Find the newest root on the Sigstore CDN (walk <N>.root.json to a 404).
+#   2. Cross-check it byte-for-byte against the sigstore/root-signing GitHub
+#      repo. A mismatch FAILS the run; it is never turned into a PR.
+#   3. Newer than the embedded root? Replace the asset + embedded.rs constants,
+#      prove it (build, tests, and the real client walking the signature chain
+#      from the OLD root to the new one against the live mirror), then open a
+#      PR whose body carries the cross-check evidence.
+#   4. Nothing newer? No-op, but FAIL if the embedded root expires soon: that
+#      means Sigstore has not rotated yet and a human must know.
+#
+# Logic lives in scripts/sigstore_root_refresh.py (unit-tested in ci.yml).
+#
+# Limitation: a PR opened with GITHUB_TOKEN does not trigger other workflows,
+# so CI will not start on it automatically; the PR body says so.
+
+name: Sigstore root watch
+
+on:
+  schedule:
+    - cron: "0 6 1 * *" # 06:00 UTC on the 1st of each month
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+# One run at a time; a second dispatch must not race the first on the branch.
+concurrency:
+  group: sigstore-root-watch
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  watch:
+    name: check for a new Sigstore root
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: unit-test the refresh script
+        run: python3 -m unittest discover -s scripts
+
+      - name: look for a newer root
+        id: refresh
+        run: |
+          python3 scripts/sigstore_root_refresh.py \
+            --apply \
+            --github-output "${GITHUB_OUTPUT}" \
+            --body-file "${RUNNER_TEMP}/pr_body.md" \
+            --old-root-out "${RUNNER_TEMP}/old_root.json"
+
+      - name: fail loudly if the embedded root is about to expire un-rotated
+        if: steps.refresh.outputs.expiring_soon == 'true' && steps.refresh.outputs.update_available != 'true'
+        run: |
+          echo "::error title=Embedded Sigstore root expires soon::v${{ steps.refresh.outputs.embedded_version }} expires ${{ steps.refresh.outputs.embedded_expires }} (${{ steps.refresh.outputs.embedded_days_left }} days) and Sigstore has not published a newer root. Builds fail once it expires."
+          exit 1
+
+      - name: already up to date
+        if: steps.refresh.outputs.update_available != 'true'
+        run: echo "Embedded root v${{ steps.refresh.outputs.embedded_version }} is current; nothing to do."
+
+      # ---- everything below only runs when a newer root was applied ----
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.refresh.outputs.applied == 'true'
+      - uses: Swatinem/rust-cache@v2
+        if: steps.refresh.outputs.applied == 'true'
+
+      - name: build (build.rs integrity + expiry gate)
+        if: steps.refresh.outputs.applied == 'true'
+        run: cargo build --workspace
+
+      - name: tuf unit tests (sha / version / self-signature)
+        if: steps.refresh.outputs.applied == 'true'
+        run: cargo test -p swe_justsign_tuf
+
+      # The real client walks old -> new through TufClient::fetch_root, so the
+      # signature chain is verified by the production code path, not by this
+      # workflow re-implementing TUF.
+      - name: verify the signature chain old root -> new root (live)
+        if: steps.refresh.outputs.applied == 'true'
+        env:
+          JUSTSIGN_TUF_LIVE: "1"
+          JUSTSIGN_TUF_BOOTSTRAP: ${{ runner.temp }}/old_root.json
+        run: |
+          cargo test -p swe_justsign_tuf --test live_sigstore \
+            test_tuf_client_walks_real_sigstore_chain_when_configured -- --nocapture 2>&1 | tee "${RUNNER_TEMP}/chain.log"
+          if grep -q '^SKIP' "${RUNNER_TEMP}/chain.log"; then
+            echo "::error::the live chain check SKIPPED; refusing to open a PR without it"
+            exit 1
+          fi
+
+      - name: open the refresh PR
+        if: steps.refresh.outputs.applied == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NEW_VERSION: ${{ steps.refresh.outputs.latest_version }}
+          OLD_VERSION: ${{ steps.refresh.outputs.embedded_version }}
+          BASE_BRANCH: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          branch="chore/sigstore-root-v${NEW_VERSION}"
+
+          # Idempotent: a branch or open PR for this version already exists.
+          if git ls-remote --exit-code --heads origin "${branch}" >/dev/null 2>&1; then
+            echo "Branch ${branch} already exists; not opening a duplicate."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "${branch}"
+          git add tuf/assets/sigstore_prod.root.json tuf/src/embedded.rs
+          git commit -m "chore(tuf): refresh bundled Sigstore production root v${OLD_VERSION} -> v${NEW_VERSION}" \
+                     -m "Opened by the sigstore_root_watch workflow. CDN and sigstore/root-signing copies were byte-identical; the signature chain v${OLD_VERSION} -> v${NEW_VERSION} was verified by the live client. See the PR body for hashes."
+          git push origin "${branch}"
+
+          gh pr create \
+            --base "${BASE_BRANCH}" \
+            --head "${branch}" \
+            --title "chore(tuf): refresh bundled Sigstore production root v${OLD_VERSION} -> v${NEW_VERSION}" \
+            --body-file "${RUNNER_TEMP}/pr_body.md"

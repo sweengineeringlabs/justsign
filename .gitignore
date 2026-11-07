@@ -11,3 +11,6 @@ fuzz/artifacts/
 # (bundle.json, blob.txt, sign.log, sigstore-go diag tool, etc.).
 # Reproducible on demand; contains operator-bound OIDC identities.
 /roundtrip/
+
+# Python bytecode from scripts/ tests
+__pycache__/
