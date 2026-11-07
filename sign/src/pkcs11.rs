@@ -240,10 +240,37 @@ impl Signer for Pkcs11Signer {
     }
 }
 
+/// Serialises every PKCS#11 module lifecycle in this process.
+///
+/// Each signing call loads the module, `C_Initialize`s it, signs, and
+/// `C_Finalize`s it on drop. A PKCS#11 library keeps process-global
+/// state, so two threads doing that at once let one thread finalize
+/// the library underneath the other; SoftHSM2 then crashes the whole
+/// process with SIGSEGV (seen in the Staging workflow when two
+/// signing tests ran concurrently). `Signer` is `Send + Sync` and is
+/// meant to be shared across threads, so concurrent `sign` calls are
+/// a supported use and must not be able to do that. The lock is held
+/// for the full load -> sign -> finalize span.
+static MODULE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Take [`MODULE_LOCK`]. A poisoned lock (a panic in another signing
+/// call) is recovered rather than propagated: the guarded section
+/// leaves no shared Rust state behind, and the module is fully torn
+/// down by `Drop` during unwinding.
+fn lock_module() -> std::sync::MutexGuard<'static, ()> {
+    MODULE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 impl Pkcs11Signer {
     /// Open a session, find the key, and sign `digest` with raw
     /// `CKM_ECDSA`. Shared by `sign` and `sign_prehash`.
     fn sign_digest(&self, digest: &[u8]) -> Result<Vec<u8>, SignerError> {
+        // Held until return, i.e. past the drop of `session`/`pkcs11`
+        // below (locals drop in reverse order of declaration).
+        let _module_guard = lock_module();
+
         // 1. Load the module. Surface the path on every load failure
         //    — this is the highest-frequency operator error and
         //    losing the path makes diagnosis impossible.
@@ -459,6 +486,7 @@ mod tests {
                 // reassigns slot ids on init, so hardcoding is
                 // fragile. Calling get_slots_with_token here is
                 // the same dance softhsm2-util prints.
+                let _module_guard = lock_module();
                 let pkcs11 = Pkcs11::new(&lib).expect("load module to enumerate slots");
                 pkcs11
                     .initialize(CInitializeArgs::OsThreads)
@@ -497,6 +525,7 @@ mod tests {
     fn read_token_public_key(fx: &SoftHsmFixture) -> p256::ecdsa::VerifyingKey {
         use cryptoki::object::AttributeType;
 
+        let _module_guard = lock_module();
         let pkcs11 = Pkcs11::new(&fx.lib).expect("load module");
         pkcs11
             .initialize(CInitializeArgs::OsThreads)
