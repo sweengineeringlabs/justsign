@@ -164,6 +164,29 @@ A justsign release with a refreshed asset is required only when:
   the long-term fix; see the
   [operator runbook](../../7-operations/sigstore_bootstrap.md).
 
+## Additional integrity gate: cross-verification with cosign and sigstore-go
+
+The CDN and the two paths in `sigstore/root-signing` are all Sigstore-owned
+(issue #27), so one compromised release pipeline could tamper with all of
+them. `tuf/tests/cross_verify_external_roots.rs` (issue #34) adds
+corroboration from pipelines Sigstore does not control: sigstore-go and
+`sigstore/sigstore` (the module cosign pins) each embed their own copy of an
+older Sigstore root.
+
+Neither embeds our version, so the check is not literal byte-identity at our
+version. Each external root is pinned by SHA-256 at an immutable release tag,
+shown to equal Sigstore's published root of the same version (apart from one
+trailing newline, which Go's encoder appends), and then used as the bootstrap
+for the real `TufClient`. The client walks Sigstore's signed root chain
+forward, and the root it reaches at our embedded version must be
+byte-identical to `SIGSTORE_PRODUCTION_ROOT_BYTES`. Our trust anchor is thus
+tied to an independently shipped one by signatures.
+
+It runs in CI (`tuf-cross-verify` job) and in the `sigstore_root_watch`
+workflow before a refresh PR is opened. A skipped run is treated as a
+failure. When cosign or sigstore-go ship a newer embedded root, update the
+pins in the test (tag, root version, SHA-256).
+
 ## Consequences
 
 - **Operators get zero-config trust.** `TufClient::sigstore()` works

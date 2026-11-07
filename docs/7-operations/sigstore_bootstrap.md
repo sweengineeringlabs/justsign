@@ -84,4 +84,4 @@ The new root must itself be unexpired, and an old ancestor will not work: it is 
 
 ## 6. Not yet available
 
-There is no cross-check against cosign's bundled root yet (issue #34). Until it exists, the independent-corroboration step is manual.
+Nothing outstanding. The independent cross-check against the roots cosign and sigstore-go embed runs in CI and in the watcher (see ADR-001, "Additional integrity gate"); to run it yourself: `JUSTSIGN_TUF_CROSSCHECK=1 cargo test -p swe_justsign_tuf --test cross_verify_external_roots -- --nocapture`.

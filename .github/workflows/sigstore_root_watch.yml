@@ -99,6 +99,21 @@ jobs:
             exit 1
           fi
 
+      # The new root must also be reachable from the roots cosign and
+      # sigstore-go embed. PRs opened with GITHUB_TOKEN do not trigger ci.yml,
+      # so the same check runs here, before the PR exists.
+      - name: cross-verify against cosign / sigstore-go roots
+        if: steps.refresh.outputs.applied == 'true'
+        env:
+          JUSTSIGN_TUF_CROSSCHECK: "1"
+        run: |
+          set -o pipefail
+          cargo test -p swe_justsign_tuf --test cross_verify_external_roots -- --nocapture 2>&1 | tee "${RUNNER_TEMP}/crosscheck.log"
+          if grep -q '^SKIP' "${RUNNER_TEMP}/crosscheck.log"; then
+            echo "::error::the cross-verification SKIPPED; refusing to pass without it"
+            exit 1
+          fi
+
       - name: open the refresh PR
         if: steps.refresh.outputs.applied == 'true'
         env:
