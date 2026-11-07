@@ -157,14 +157,29 @@ jobs:
       # the fulcio + rekor jobs above. The integration test no-ops
       # with a SKIP line when this is unset.
       JUSTSIGN_TUF_LIVE: "1"
-      # Path to a trusted Sigstore TUF bootstrap root.json. Stored
-      # as a repo secret (audited out-of-band). The test SKIPs
-      # without this so forks that lack the secret still see a
-      # green box.
-      JUSTSIGN_TUF_BOOTSTRAP: ${{ secrets.JUSTSIGN_TUF_BOOTSTRAP }}
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # The test reads a FILE PATH from JUSTSIGN_TUF_BOOTSTRAP, but a
+      # repo secret holds the file's CONTENTS. Passing the secret
+      # straight through (as this job used to) made the test try to
+      # open a path named after the JSON. Materialise the secret as a
+      # file and export its path. The secret is a trusted Sigstore TUF
+      # root.json, audited out-of-band. Without the secret this step
+      # is skipped, the variable stays unset and the test SKIPs, so
+      # forks lacking the secret still see a green box -- but the log
+      # then says so explicitly (see the notice below).
+      - name: write TUF bootstrap root
+        env:
+          TUF_BOOTSTRAP_ROOT: ${{ secrets.JUSTSIGN_TUF_BOOTSTRAP }}
+        run: |
+          if [ -z "${TUF_BOOTSTRAP_ROOT}" ]; then
+            echo "::warning title=live-tuf not exercised::secret JUSTSIGN_TUF_BOOTSTRAP is not set, so the live TUF test will SKIP"
+            exit 0
+          fi
+          umask 077
+          printf '%s' "${TUF_BOOTSTRAP_ROOT}" > "${RUNNER_TEMP}/tuf-bootstrap.root.json"
+          echo "JUSTSIGN_TUF_BOOTSTRAP=${RUNNER_TEMP}/tuf-bootstrap.root.json" >> "${GITHUB_ENV}"
       - name: cargo test (skip-pass)
         run: cargo test -p swe_justsign_tuf --test live_sigstore test_tuf_client_walks_real_sigstore_chain_when_configured -- --nocapture
