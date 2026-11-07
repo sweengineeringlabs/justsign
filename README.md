@@ -83,8 +83,11 @@ a tracking issue; the README will be updated as they close.
 - **Cert expiry not yet enforced** in `verify_blob_keyless`: the
   `VerifyError::CertExpired` variant is defined but never produced
   because the clock SPI is pending. See [#26][i26].
-- **Sigstore TUF root bootstrap is caller-supplied** — no bundled
-  trust root for the public-good Sigstore instance. See [#27][i27].
+- **Sigstore TUF root is bundled and expires.** justsign embeds a
+  Sigstore production root ([#27][i27]) that must be refreshed when
+  Sigstore rotates; a monthly workflow opens the refresh PR. To confirm,
+  override or recover it, see the
+  [operator runbook](docs/7-operations/sigstore_bootstrap.md).
 - **MSRV stability policy not yet documented**. The workspace declares
   `rust-version = "1.88"` because the active dep graph requires it,
   but the cadence for bumping it is not written down. See [#28][i28].

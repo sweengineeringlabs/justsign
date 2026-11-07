@@ -52,6 +52,7 @@ The docs are organised around a five-phase OSS-slim SDLC (`0-ideation` / `3-desi
 |---|---|
 | [`6-deployment/deployment_guide.md`](6-deployment/deployment_guide.md) | Keyless-CI and static-key-with-PKCS#11 release patterns. |
 | [`6-deployment/production_round_trip_runbook.md`](6-deployment/production_round_trip_runbook.md) | Operator-actionable cosign-against-production-Sigstore regression check. Re-run on every wire-shape change. |
+| [`7-operations/sigstore_bootstrap.md`](7-operations/sigstore_bootstrap.md) | Operator runbook for the bundled Sigstore TUF root: confirm, refresh, override, recover from expiry. |
 
 ### "I hit a term I don't know"
 
@@ -82,5 +83,6 @@ Numbered directories follow the [template-engine framework](../README.md#what-s-
 | 4 | [`4-development/`](4-development/) | How to develop — setup, MSRV, migration. |
 | 5 | [`5-testing/`](5-testing/) | Test strategy — layers, conventions, gaps. |
 | 6 | [`6-deployment/`](6-deployment/) | How to deploy — release patterns, production round-trip runbook. |
+| 7 | [`7-operations/`](7-operations/) | How to operate — Sigstore TUF root runbook. |
 
-Phases 1 (requirements), 2 (planning), and 7 (operation) are intentionally absent — justsign is a library, not a service, and the phases that matter for service-shaped projects don't apply. Add them if a future operational concern demands one.
+Phases 1 (requirements) and 2 (planning) are intentionally absent — justsign is a library, not a service, and the phases that matter for service-shaped projects don't apply. Add them if a future operational concern demands one.

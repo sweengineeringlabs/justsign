@@ -36,3 +36,7 @@
 
 - [Deployment guide](6-deployment/deployment_guide.md)
 - [Production Sigstore round-trip runbook](6-deployment/production_round_trip_runbook.md)
+
+# Operations
+
+- [Sigstore TUF root runbook](7-operations/sigstore_bootstrap.md)

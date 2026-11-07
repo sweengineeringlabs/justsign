@@ -140,7 +140,8 @@ Out of scope for this ADR (filed as follow-up issues): a monthly CI
 watcher that opens a refresh PR when Sigstore rotates, a
 cross-verification with cosign's bundled root at build time, a
 `justsign tuf-root verify` CLI subcommand, and an operator runbook
-at `docs/7-operations/sigstore_bootstrap.md`.
+at [`docs/7-operations/sigstore_bootstrap.md`](../../7-operations/sigstore_bootstrap.md)
+(now written; it also documents the monthly watcher).
 
 ## Rotation policy
 
@@ -159,7 +160,9 @@ A justsign release with a refreshed asset is required only when:
   patch release.
 - The embedded root expires before chain-walking can reach a
   successor. The build-time check warns 30 days out; the monthly CI
-  watcher (component 5, deferred) will be the long-term fix.
+  watcher (component 5, `.github/workflows/sigstore_root_watch.yml`) is
+  the long-term fix; see the
+  [operator runbook](../../7-operations/sigstore_bootstrap.md).
 
 ## Consequences
 
