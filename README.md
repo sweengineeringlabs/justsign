@@ -148,15 +148,14 @@ For real-world flows:
 | `swe_justsign_tuf`     | TUF metadata fetch + verify; establishes Sigstore root of trust via span-preserving JSON.                           |
 | `swe_justsign_rekor`   | Rekor client: submit + Merkle inclusion-proof verification. Independent — works with static keys too.               |
 | `swe_justsign_sign`    | High-level API: `sign_blob`, `verify_blob`, `attest`, `verify_attestation`, `sign_oci`, `verify_oci`.               |
-| `swe_justsign_cli`     | `justsign` operator binary.                                                                                         |
+| `swe_justsign_cli`     | `sign` operator binary (`sign tuf-root show\|verify`, ...).                                                          |
 
 ## Architecture
 
-A standalone architecture document is not yet in the repo. The crate
-table above plus the module-level rustdoc on `sign/src/lib.rs` is the
-current source of truth. A `docs/3-design/architecture.md` is planned
-as part of [#25][i25] (threat model) so the trust boundaries diagram
-lands once, in one place.
+See [`docs/3-design/architecture.md`](docs/3-design/architecture.md) for
+the crate and data-flow diagrams, and the
+[threat model](docs/3-design/threat_model.md) for trust boundaries. The
+module-level rustdoc on `sign/src/lib.rs` documents the API surface.
 
 ## Documentation
 
