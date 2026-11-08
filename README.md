@@ -88,21 +88,18 @@ a tracking issue; the README will be updated as they close.
   Sigstore rotates; a monthly workflow opens the refresh PR. To confirm,
   override or recover it, see the
   [operator runbook](docs/7-operations/sigstore_bootstrap.md).
-- **MSRV stability policy not yet documented**. The workspace declares
-  `rust-version = "1.88"` because the active dep graph requires it,
-  but the cadence for bumping it is not written down. See [#28][i28].
-- **`VerifyingKey` migration guide pending** — `verify_blob`'s
-  `trusted_keys` parameter changed from `&[p256::ecdsa::VerifyingKey]`
-  to `&[VerifyingKey]` of the algorithm-tagged enum. The deprecation
-  path / migration notes haven't been written. See [#29][i29].
+- **MSRV and migration notes exist.** See the
+  [MSRV policy](docs/4-development/guide/msrv_policy.md) ([#28][i28]) and
+  the [migration guide](docs/4-development/guide/migration_guide.md)
+  ([#29][i29]), which covers the `VerifyingKey` enum change.
 - **Bundle JSON shape pinned** — `Bundle::encode_json` emits the
   protobuf-specs v0.3 final singular leaf at
   `verificationMaterial.certificate.rawBytes` (cosign 3.0+ wire
   requirement); decode accepts both the singular shape and the
   deprecated `x509CertificateChain` wrapper for cosign 2.x compat.
   See [#38][i38] (inverts the earlier [#31][i31] pin).
-- **Granular `RekorError` variants pending** — transport vs HTTP
-  status vs decode aren't separated yet. See [#32][i32].
+- **`RekorError` is granular** — transport, HTTP status, decode and
+  already-exists are separate variants ([#32][i32], closed).
 
 ## Quickstart
 
