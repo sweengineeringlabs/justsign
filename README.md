@@ -9,7 +9,7 @@ a Go binary or a network of cosign-shape side processes.
 
 > **Status:** alpha. Ship-stable APIs are `sign_blob`, `verify_blob`,
 > `attest`, `verify_attestation`, `sign_oci`, `verify_oci`. Trust-root
-> handling and the clock SPI are still evolving — see [What's NOT
+> handling is still evolving — see [What's NOT
 > done](#whats-not-done) below.
 
 ---
@@ -76,13 +76,13 @@ a tracking issue; the README will be updated as they close.
   Re-running it on every wire-shape change is currently a manual step
   per the production round-trip runbook in [`docs/README.md`](docs/README.md);
   CI automation lands later.
-- **No fuzzing harness yet** for the wire-decode parsers (Bundle JSON,
-  DSSE envelope, in-toto Statement, TUF metadata). In flight — see
-  [#24][i24].
-- **No threat model document yet**. In flight — see [#25][i25].
-- **Cert expiry not yet enforced** in `verify_blob_keyless`: the
-  `VerifyError::CertExpired` variant is defined but never produced
-  because the clock SPI is pending. See [#26][i26].
+- **Cert validity window is enforced, revocation is not.**
+  `verify_blob_keyless_with_clock` rejects any cert in the chain outside
+  its `notBefore`/`notAfter` (`CertExpired` / `CertNotYetValid`); there
+  is no revocation or SCT check ([#26][i26], closed). Fuzz targets live
+  in [`fuzz/`](fuzz/) ([#24][i24]) and the threat model in
+  [`docs/3-design/threat_model.md`](docs/3-design/threat_model.md)
+  ([#25][i25]).
 - **Sigstore TUF root is bundled and expires.** justsign embeds a
   Sigstore production root ([#27][i27]) that must be refreshed when
   Sigstore rotates; a monthly workflow opens the refresh PR. To confirm,

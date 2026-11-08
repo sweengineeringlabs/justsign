@@ -25,7 +25,8 @@ The verifier trusts:
   `// **Bootstrap.** The caller supplies the trusted initial root.`).
 - **The system clock**, but only inside `TufClient` for TUF role expiry
   (`tuf/src/client.rs:240`: `if is_expired(&current_root.expires, self.now())?`).
-  Cert chain expiry is NOT clocked yet — see Failure modes below.
+  Cert chain validity windows are checked against a caller-injected
+  `spec::Clock` in the keyless verifier (`sign/src/lib.rs:804`).
 
 The verifier explicitly does NOT trust:
 
@@ -86,12 +87,14 @@ body schema or builder identity.
 verifier does NOT check `tlog_entry.integrated_time` against any
 window; the field is wired through (`sign/src/lib.rs:604`:
 `integrated_time: 0,`) but not consulted. A bundle valid on day N
-remains valid on day N+365. Tracked in `#26`.
+remains valid on day N+365 as far as the tlog time goes; the cert
+validity window (#26) is a separate, enforced gate.
 
 **Stolen OIDC token.** The Fulcio leaf is short-lived (Sigstore default
-~10min). Once `#26` lands the cert's `notAfter` will gate verification
-(`sign/src/error.rs:157`: `VerifyError::CertExpired { not_after }`,
-defined but not constructed today).
+~10min). The cert's `notAfter` gates verification
+(`VerifyError::CertExpired { not_after }`, produced at
+`sign/src/lib.rs:811`), so a stolen token is only useful while the
+leaf is valid.
 
 ## Failure modes
 
@@ -121,8 +124,9 @@ defined but not constructed today).
 - **Clock skew.** `TufClient` enforces TUF role expiry against
   `self.now()` (`tuf/src/client.rs:151`:
   `self.now_override.unwrap_or_else(SystemTime::now)`). Cert chain
-  `notBefore`/`notAfter` is NOT enforced (`sign/src/cert_chain.rs:28`:
-  `// **Expiry is NOT enforced.**`). Tracked in `#26`.
+  `notBefore`/`notAfter` is enforced by the keyless verifier against the
+  injected clock (`sign/src/lib.rs:804`, issue #26); the chain walker
+  itself stays IO-free (`sign/src/cert_chain.rs:28`).
 
 ## Out-of-scope
 
@@ -150,9 +154,9 @@ unless the caller passes the relevant policy parameter.
 - [ ] **Pass a `RekorClient`** to `verify_blob` if your policy
       requires transparency. `None` skips re-verification entirely
       (`sign/src/lib.rs:474`).
-- [ ] **Enforce cert expiry caller-side** until `#26` lands.
-      `VerifyError::CertExpired` is defined (`sign/src/error.rs:158`)
-      but not constructed by the v0 verifier.
+- [ ] **Use `verify_blob_keyless_with_clock`** with a trustworthy
+      clock if you need a fixed verification time; the cert validity
+      window is enforced (`CertExpired`, `sign/src/lib.rs:811`).
 - [ ] **Pin Fulcio trust roots from a TUF-validated source.**
       `TufClient` requires a caller-supplied initial root
       (`tuf/src/client.rs:31`); `#27` tracks bundling a default.
